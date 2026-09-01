@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Bootstraps a district edge node into a k3s cluster with GPU scheduling.
+#
+# This is the cloud twin of infra/k3d/cluster.yaml. Both produce the same
+# Kubernetes API, so the Helm charts install unchanged in either place — that
+# is the entire local -> cloud cutover story. If this script has to install
+# anything the charts depend on, the charts are wrong.
+set -euo pipefail
+
+DISTRICT="${district}"
+NODE_INDEX="${node_index}"
+K3S_VERSION="${k3s_version}"
+
+# --- k3s ---------------------------------------------------------------------
+# Pinned version. A floating channel means an upstream release can break a
+# deployment we cannot roll back under time pressure.
+curl -sfL https://get.k3s.io | \
+  INSTALL_K3S_VERSION="$K3S_VERSION" \
+  INSTALL_K3S_EXEC="server \
+    --disable traefik \
+    --disable servicelb \
+    --node-label district=$DISTRICT \
+    --node-label plane=edge \
+    --node-label prahari.gujarat.gov.in/gpu=true" \
+  sh -
+
+until kubectl get nodes >/dev/null 2>&1; do sleep 2; done
+
+# --- GPU runtime -------------------------------------------------------------
+# The AMI ships the NVIDIA driver; k3s needs the container runtime shim and the
+# device plugin before `nvidia.com/gpu` resource requests will schedule.
+# values-gpu.yaml sets runtimeClassName: nvidia, so this RuntimeClass must exist
+# or every inference pod stays Pending with no obvious error.
+curl -sL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -sL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+apt-get update -qq
+apt-get install -y -qq nvidia-container-toolkit
+systemctl restart k3s
+
+cat <<'EOF' | kubectl apply -f -
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: nvidia
+handler: nvidia
+EOF
+
+kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.17.0/deployments/static/nvidia-device-plugin.yml
+
+# --- KEDA --------------------------------------------------------------------
+# Autoscales inference workers on stream-queue depth. Under the gpu profile the
+# chart renders a ScaledObject; without KEDA installed that object is inert and
+# the pool silently never scales — which would look like a working demo right up
+# until load arrives.
+kubectl apply --server-side \
+  -f https://github.com/kedacore/keda/releases/download/v2.16.0/keda-2.16.0.yaml
+
+# --- readiness marker --------------------------------------------------------
+# `terraform apply` returning is not the same as the cluster being ready.
+# Poll this before running `helm upgrade`.
+until kubectl -n kube-system get deploy nvidia-device-plugin-daemonset >/dev/null 2>&1 \
+   || kubectl get ds -A -o name | grep -q nvidia-device-plugin; do sleep 5; done
+
+echo "prahari: node $NODE_INDEX in $DISTRICT ready" > /var/log/prahari-bootstrap.done

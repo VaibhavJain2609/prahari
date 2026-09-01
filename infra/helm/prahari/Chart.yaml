@@ -1,0 +1,6 @@
+apiVersion: v2
+name: prahari
+description: Statewide CCTV integration and video-analytics platform (Gujarat Sentinel 2026)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

@@ -1,0 +1,105 @@
+syntax = "proto3";
+
+package prahari.v1;
+
+import "prahari/v1/camera.proto";
+import "prahari/v1/events.proto";
+
+// ============================================================================
+// The vendor-neutral plugin ABI (Reference Model 3, federation middleware).
+//
+// This file IS the interoperability claim. Any VMS vendor, in any language, can
+// implement CameraAdapterService and be federated without a code change on our
+// side — which is what "open, modular, standards-based and vendor-neutral,
+// avoiding lock-in" means in practice rather than in a slide.
+//
+// Adding a vendor must never require editing this file. If it does, the
+// abstraction is wrong.
+//
+// Conforms to `buf lint` STANDARD, including the request/response wrapper
+// convention — a downstream integrator gets a contract that behaves the way
+// their tooling expects.
+// ============================================================================
+
+service CameraAdapterService {
+  // Enumerate the cameras this adapter can reach.
+  //
+  // The registry calls this on every sync and treats the result as authoritative
+  // for endpoints — the catalogue is the contract, the URL pattern is not.
+  rpc ListCameras(ListCamerasRequest) returns (ListCamerasResponse);
+
+  // Resolve a live endpoint for one camera. Called immediately before connecting
+  // rather than cached, since endpoints rotate.
+  rpc ResolveEndpoints(ResolveEndpointsRequest) returns (ResolveEndpointsResponse);
+
+  // Adapter self-report, so a failing vendor integration is distinguishable from
+  // a failing camera.
+  rpc CheckHealth(CheckHealthRequest) returns (CheckHealthResponse);
+}
+
+message ListCamerasRequest {
+  string department_filter = 1;
+  uint32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListCamerasResponse {
+  repeated Camera cameras = 1;
+  string next_page_token = 2;
+}
+
+message ResolveEndpointsRequest {
+  string camera_id = 1;
+}
+
+message ResolveEndpointsResponse {
+  StreamEndpoints endpoints = 1;
+}
+
+message CheckHealthRequest {}
+
+message CheckHealthResponse {
+  bool healthy = 1;
+  string adapter_version = 2;
+  uint32 reachable_cameras = 3;
+  string detail = 4;
+}
+
+// ============================================================================
+// The high-rate metadata link: inference workers -> match engine.
+//
+// gRPC client-streaming over one multiplexed HTTP/2 connection per worker. At
+// 80,000 cameras this is millions of small messages, and per-message framing
+// overhead is the reason this link is gRPC rather than JSON over HTTP/1.1.
+// ============================================================================
+
+service MetadataIngestService {
+  // Long-lived client stream. Workers keep one open and push detections as they
+  // are produced; the server acknowledges once the stream closes or batches.
+  rpc StreamDetections(stream StreamDetectionsRequest) returns (StreamDetectionsResponse);
+
+  // Health heartbeats, same connection, lower rate.
+  rpc StreamHealth(stream StreamHealthRequest) returns (StreamHealthResponse);
+}
+
+message StreamDetectionsRequest {
+  VehicleDetection detection = 1;
+}
+
+message StreamDetectionsResponse {
+  IngestAck ack = 1;
+}
+
+message StreamHealthRequest {
+  HealthEvent event = 1;
+}
+
+message StreamHealthResponse {
+  IngestAck ack = 1;
+}
+
+message IngestAck {
+  uint64 accepted = 1;
+  uint64 rejected = 2;
+  string detail = 3;
+}

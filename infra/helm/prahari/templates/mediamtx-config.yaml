@@ -1,0 +1,63 @@
+{{- if .Values.mediamtx.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prahari-mediamtx
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+data:
+  mediamtx.yml: |
+    # MediaMTX — the restreaming layer.
+    #
+    # Every client gets its own copy of a source stream, so N consumers opening N
+    # direct connections would exhaust the government feed. MediaMTX pulls each
+    # camera ONCE and fans it out to inference workers and browser previews alike.
+    #
+    # Paths are written here by the registry's catalogue sync, never hand-edited:
+    # the catalogue is the contract, the URL pattern is not.
+
+    logLevel: info
+    logDestinations: [stdout]
+
+    # Read timeouts sized for the reconnect policy: 2s start, 30s cap, jittered.
+    readTimeout: 10s
+    writeTimeout: 10s
+    writeQueueSize: 1024
+
+    # RTSP: TCP only. UDP transport drops silently under load and produces
+    # corrupt frames that look like detections.
+    rtsp: yes
+    rtspAddress: :{{ .Values.mediamtx.rtspPort }}
+    rtspTransports: [tcp]
+    rtspEncryption: "no"
+
+    # HLS: the fallback when port 8554 is blocked on a venue network. Not
+    # optional — it must be tested, not assumed.
+    hls: yes
+    hlsAddress: :{{ .Values.mediamtx.hlsPort }}
+    hlsVariant: lowLatency
+    hlsAlwaysRemux: no
+
+    # WebRTC/WHEP: browser preview ONLY. Never an inference source — the browser
+    # path re-encodes and loses the PTS fidelity that evidence timestamps need.
+    webrtc: yes
+    webrtcAddress: :{{ .Values.mediamtx.whepPort }}
+
+    # We consume only. Never publish to the government gateway, never call its
+    # control API.
+    api: yes
+    apiAddress: :9997
+
+    pathDefaults:
+      # Pull on demand and release when idle, so we hold connections only to
+      # cameras actually in use.
+      sourceOnDemand: yes
+      sourceOnDemandStartTimeout: 15s
+      sourceOnDemandCloseAfter: 30s
+      sourceProtocol: tcp
+
+    paths:
+      # Populated at runtime by the registry from GET /api/ingest.
+      # Intentionally empty here — a hardcoded path would pass locally and fail
+      # on demo day when ids rotate.
+{{- end }}

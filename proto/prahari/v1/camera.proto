@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package prahari.v1;
+
+import "google/protobuf/timestamp.proto";
+import "prahari/v1/common.proto";
+
+// A camera as the registry knows it — Reference Model 1's core entity.
+//
+// INVARIANT: `id` is ours, stable, and internal. Department, vendor and stream
+// identifiers are attributes, not identity: departments renumber and vendors get
+// replaced, and a camera must survive both without losing its history.
+message Camera {
+  string id = 1;
+
+  // Where and whose.
+  GeoPoint location = 2;
+  string site_name = 3;
+  string district = 4;
+  string department = 5;
+  string owner = 6;
+
+  // What it is.
+  CameraType type = 7;
+  string vendor = 8;
+  string vms_platform = 9;
+  string codec = 10;               // H.264 | H.265 — mixed across the estate
+  uint32 native_width = 11;
+  uint32 native_height = 12;
+
+  // How to reach it. Populated from the /api/ingest catalogue.
+  //
+  // INVARIANT: the catalogue is the contract, the URL pattern is not. These are
+  // refreshed from the catalogue on every sync and must never be constructed by
+  // string-formatting a camera id.
+  StreamEndpoints endpoints = 13;
+
+  // Storage and lifecycle. Retention varies by department (7 to 15+ days), and
+  // evidence workflows depend on knowing what still exists before an officer
+  // goes looking for it.
+  string storage_location = 14;
+  uint32 retention_days = 15;
+  google.protobuf.Timestamp commissioned_at = 16;
+  google.protobuf.Timestamp amc_expires_at = 17;
+
+  CameraHealth health = 18;
+}
+
+enum CameraType {
+  CAMERA_TYPE_UNSPECIFIED = 0;
+  CAMERA_TYPE_ANALOG = 1;
+  CAMERA_TYPE_IP = 2;
+  CAMERA_TYPE_PTZ = 3;
+  CAMERA_TYPE_ANPR = 4;
+}
+
+message StreamEndpoints {
+  string rtsp_url = 1;   // primary: force TCP transport
+  string hls_url = 2;    // fallback when port 8554 is blocked
+  string whep_url = 3;   // low-latency browser preview only
+}
+
+// Live health, continuously updated by the ingest workers.
+// A camera that is down is not coverage — gap analysis reads this, not nameplate status.
+message CameraHealth {
+  HealthState state = 1;
+  google.protobuf.Timestamp last_frame_at = 2;
+  float observed_fps = 3;          // measured from PTS, never from reported FPS
+  float black_frame_ratio = 4;
+  bool tamper_suspected = 5;
+  string last_error = 6;
+  uint32 consecutive_failures = 7;
+}
+
+enum HealthState {
+  HEALTH_STATE_UNSPECIFIED = 0;
+  HEALTH_STATE_HEALTHY = 1;
+  HEALTH_STATE_DEGRADED = 2;    // connected, but fps drift or quality loss
+  HEALTH_STATE_UNREACHABLE = 3;
+  HEALTH_STATE_TAMPERED = 4;
+}

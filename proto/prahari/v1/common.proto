@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package prahari.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Geographic point, WGS84. Matches PostGIS geography(Point, 4326).
+message GeoPoint {
+  double latitude = 1;
+  double longitude = 2;
+}
+
+// Axis-aligned bounding box in normalised frame coordinates [0.0, 1.0],
+// so it stays valid regardless of the camera's resolution.
+message BoundingBox {
+  float x_min = 1;
+  float y_min = 2;
+  float x_max = 3;
+  float y_max = 4;
+}
+
+// A timestamp derived from the stream's presentation timestamp (PTS).
+//
+// INVARIANT: `wall_clock` must be computed from `pts_ms`, never by counting
+// frames and dividing by a reported frame rate. Reported FPS is unreliable on
+// these feeds and cadence is not constant. `pts_ms` is retained so any event
+// can be traced back to an exact position in the source stream — which is what
+// makes an export defensible as evidence.
+message StreamTime {
+  int64 pts_ms = 1;
+  google.protobuf.Timestamp wall_clock = 2;
+
+  // Incremented each time the source recording wraps. These feeds loop, and the
+  // wrap produces an abrupt scene cut plus a PTS discontinuity. Downstream
+  // tamper detection and track stitching must treat a boundary crossing as
+  // expected rather than as an event.
+  uint32 loop_epoch = 3;
+}
+
+// How confident the system is, and — where it matters — why.
+enum ConfidenceBand {
+  CONFIDENCE_BAND_UNSPECIFIED = 0;
+  CONFIDENCE_BAND_WEAK = 1;      // worth a look
+  CONFIDENCE_BAND_PROBABLE = 2;  // likely, needs corroboration
+  CONFIDENCE_BAND_CONFIRMED = 3; // act on it
+}
+
+// Provenance for anything that leaves the system as evidence.
+message Provenance {
+  string camera_id = 1;
+  StreamTime observed_at = 2;
+  repeated string processing_chain = 3;  // ordered stage names applied
+  string content_sha256 = 4;             // hash of the exported artifact
+}

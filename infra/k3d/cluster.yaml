@@ -1,0 +1,44 @@
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: prahari
+
+servers: 1
+agents: 2
+
+image: rancher/k3s:v1.31.4-k3s1
+
+ports:
+  # Next.js console
+  - port: 3000:3000
+    nodeFilters: [loadbalancer]
+  # BFF (REST + SSE)
+  - port: 8080:8080
+    nodeFilters: [loadbalancer]
+  # MediaMTX — RTSP restream (TCP only; feeds must never use UDP transport)
+  - port: 8554:8554
+    nodeFilters: [loadbalancer]
+  # MediaMTX — HLS fallback, used when 8554 is blocked on a venue network
+  - port: 8888:8888
+    nodeFilters: [loadbalancer]
+  # MediaMTX — WHEP, browser preview only
+  - port: 8889:8889
+    nodeFilters: [loadbalancer]
+
+options:
+  k3s:
+    extraArgs:
+      # Traefik ships with k3s and fights us for :80/:443; we front everything
+      # through explicit port mappings instead.
+      - arg: --disable=traefik
+        nodeFilters: [server:*]
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: true
+
+registries:
+  # Local registry so Tilt can push images without a round trip to a remote.
+  create:
+    name: prahari-registry
+    host: "0.0.0.0"
+    hostPort: "5555"

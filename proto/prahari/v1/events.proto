@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+package prahari.v1;
+
+import "google/protobuf/timestamp.proto";
+import "prahari/v1/common.proto";
+
+// The metadata plane. These messages are what flows centrally instead of pixels —
+// the entire 80,000-camera argument rests on keeping them small.
+
+// One vehicle observed on one camera at one instant.
+message VehicleDetection {
+  string detection_id = 1;
+  string camera_id = 2;
+  StreamTime observed_at = 3;
+
+  BoundingBox vehicle_box = 4;
+  string vehicle_class = 5;        // car | truck | bus | two-wheeler | auto
+  float vehicle_confidence = 6;
+
+  PlateReading plate = 7;          // absent when no plate was legible
+
+  // Coarse appearance embedding, used by the correlation service to bridge gaps
+  // where the plate is unreadable. Deliberately low-dimensional: this rides the
+  // metadata plane, so its size is a scalability constraint, not a modelling choice.
+  repeated float appearance_embedding = 8;
+
+  string evidence_ref = 9;         // pointer to an edge-held crop; not the pixels
+}
+
+// What OCR saw. Deliberately NOT corrected.
+//
+// INVARIANT: the inference service emits the raw reading plus per-character
+// confidences and never "fixes" a plate. Correction belongs to the match engine,
+// where it is scored and auditable. A silently corrected plate is unexplainable
+// in court.
+message PlateReading {
+  string raw_text = 1;
+  BoundingBox plate_box = 2;
+
+  // Per-character confidence, aligned index-wise with `raw_text`.
+  //
+  // INVARIANT: this must survive to the match engine intact. The confusion-aware
+  // matcher weights substitutions by these values; collapsing them to a single
+  // score is the most common way to accidentally cripple match accuracy.
+  repeated float char_confidence = 3;
+
+  string normalised_text = 4;      // whitespace/hyphen/IND-prefix stripped, uppercased
+  PlateFormat format = 5;
+}
+
+enum PlateFormat {
+  PLATE_FORMAT_UNSPECIFIED = 0;
+  PLATE_FORMAT_STANDARD = 1;       // SS DD LL NNNN
+  PLATE_FORMAT_BH_SERIES = 2;      // YY BH NNNN LL
+  PLATE_FORMAT_MILITARY = 3;
+  PLATE_FORMAT_NONCONFORMING = 4;  // legible but does not parse
+}
+
+// A watchlist hit. Carries its own justification.
+message Alert {
+  string alert_id = 1;
+  google.protobuf.Timestamp raised_at = 2;
+  AlertPriority priority = 3;
+  ConfidenceBand band = 4;
+
+  VehicleDetection detection = 5;
+  WatchlistEntry matched_entry = 6;
+
+  // INVARIANT: every alert records why it matched. Observed string, matched entry,
+  // the per-character edits applied, and the score. Police act on these; an
+  // unexplainable match is worse than no match.
+  MatchExplanation explanation = 7;
+
+  // Dedup key, `(camera, plate, time-bucket)`. A vehicle in frame for 8 seconds at
+  // 3 fps is one alert, not 24 — unbucketed alerting makes the console useless
+  // within a minute.
+  string dedup_key = 8;
+}
+
+enum AlertPriority {
+  ALERT_PRIORITY_UNSPECIFIED = 0;
+  ALERT_PRIORITY_LOW = 1;
+  ALERT_PRIORITY_MEDIUM = 2;
+  ALERT_PRIORITY_HIGH = 3;
+  ALERT_PRIORITY_CRITICAL = 4;
+}
+
+message MatchExplanation {
+  string observed_plate = 1;
+  string matched_plate = 2;
+  repeated CharacterEdit edits = 3;
+  float weighted_distance = 4;
+  float format_plausibility = 5;
+  float final_score = 6;
+}
+
+// One substitution the matcher applied, and what it cost.
+message CharacterEdit {
+  uint32 position = 1;
+  string observed = 2;
+  string matched = 3;
+  bool is_known_confusion = 4;   // e.g. 0↔O, 8↔B, 1↔I, 5↔S
+  float cost = 5;
+}
+
+message WatchlistEntry {
+  string entry_id = 1;
+  string plate = 2;
+  WatchlistReason reason = 3;
+  string case_reference = 4;
+  string source_system = 5;      // VAHAN | SARTHI | eGujCop | manual
+  google.protobuf.Timestamp added_at = 6;
+  google.protobuf.Timestamp expires_at = 7;
+}
+
+enum WatchlistReason {
+  WATCHLIST_REASON_UNSPECIFIED = 0;
+  WATCHLIST_REASON_STOLEN = 1;
+  WATCHLIST_REASON_WANTED = 2;
+  WATCHLIST_REASON_MISSING_PERSON = 3;
+  WATCHLIST_REASON_BLACKLISTED = 4;
+  WATCHLIST_REASON_SUSPECT = 5;
+}
+
+// Camera health heartbeat, emitted continuously by ingest workers.
+message HealthEvent {
+  string camera_id = 1;
+  google.protobuf.Timestamp emitted_at = 2;
+  float observed_fps = 3;
+  float black_frame_ratio = 4;
+  bool tamper_suspected = 5;
+
+  // True when the source recording wrapped. Set so tamper detection can suppress
+  // the abrupt scene cut at a loop point instead of firing on every camera,
+  // every cycle.
+  bool loop_boundary = 6;
+}

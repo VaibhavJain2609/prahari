@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# Generated protobuf stubs
+*_pb2.py
+*_pb2.pyi
+*_pb2_grpc.py
+gen/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+.turbo/
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# Secrets & credentials — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+kubeconfig*
+secrets/
+
+# ML weights (pull at build time, do not vendor)
+*.pt
+*.onnx
+*.engine
+models/
+
+# Media & evidence — large, and may contain real footage.
+# NOTE: no bare `*.ts` here. That pattern is meant for MPEG transport-stream
+# segments, but it also matches every TypeScript file in web/ — the segments
+# only ever land in the directories below, so scope it there instead.
+*.mp4
+*.mkv
+evidence/
+snapshots/
+clips/
+data/streams/
+
+# Load-test raw output (keep summarised results in docs/)
+infra/loadtest/runs/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

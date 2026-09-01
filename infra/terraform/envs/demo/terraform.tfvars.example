@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+#
+# ssh_public_key is the PUBLIC half only. Never put a private key, an AWS
+# access key, or a database password in a tfvars file — Terraform writes
+# variable values into state, and state is not an encrypted store.
+
+region         = "ap-south-1"
+ssh_public_key = "ssh-ed25519 AAAA... you@example.com"

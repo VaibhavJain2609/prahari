@@ -1,0 +1,196 @@
+{{/*
+Stateful dependencies. Deliberately in-chart rather than external subcharts:
+zero network dependency at install time, and the whole platform comes up from
+one `helm install` on a laptop with no registry access.
+
+Under the gpu profile these are still cluster-local — the scale story lives in
+the metadata plane's size, not in a managed database.
+*/}}
+{{- if .Values.postgres.enabled }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: prahari-postgres
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  # Dev-only credential, generated per install. Real deployments source this
+  # from the cloud secret store via Terraform — never from values.yaml, and
+  # never committed.
+  password: {{ randAlphaNum 24 | quote }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: prahari-postgres
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+    app.kubernetes.io/name: postgres
+spec:
+  serviceName: prahari-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "prahari.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        {{- include "prahari.labels" . | nindent 8 }}
+        app.kubernetes.io/name: postgres
+    spec:
+      containers:
+        - name: postgres
+          # PostGIS for the registry's spatial queries; TimescaleDB extension is
+          # created by migration for the detection time-series.
+          image: {{ .Values.postgres.image }}
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.database }}
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.user }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: prahari-postgres
+                  key: password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "{{ .Values.postgres.user }}"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.postgres.storage }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prahari-postgres
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "prahari.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/name: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+{{- end }}
+{{- if .Values.redis.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prahari-redis
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+    app.kubernetes.io/name: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "prahari.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels:
+        {{- include "prahari.labels" . | nindent 8 }}
+        app.kubernetes.io/name: redis
+    spec:
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image }}
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prahari-redis
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "prahari.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/name: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+{{- end }}
+{{- if .Values.mediamtx.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prahari-mediamtx
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+    app.kubernetes.io/name: mediamtx
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "prahari.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/name: mediamtx
+  template:
+    metadata:
+      labels:
+        {{- include "prahari.labels" . | nindent 8 }}
+        app.kubernetes.io/name: mediamtx
+    spec:
+      containers:
+        - name: mediamtx
+          image: {{ .Values.mediamtx.image }}
+          ports:
+            - name: rtsp
+              containerPort: {{ .Values.mediamtx.rtspPort }}
+            - name: hls
+              containerPort: {{ .Values.mediamtx.hlsPort }}
+            - name: whep
+              containerPort: {{ .Values.mediamtx.whepPort }}
+          volumeMounts:
+            - name: config
+              mountPath: /mediamtx.yml
+              subPath: mediamtx.yml
+      volumes:
+        - name: config
+          configMap:
+            name: prahari-mediamtx
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prahari-mediamtx
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "prahari.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/name: mediamtx
+  ports:
+    - name: rtsp
+      port: {{ .Values.mediamtx.rtspPort }}
+    - name: hls
+      port: {{ .Values.mediamtx.hlsPort }}
+    - name: whep
+      port: {{ .Values.mediamtx.whepPort }}
+{{- end }}

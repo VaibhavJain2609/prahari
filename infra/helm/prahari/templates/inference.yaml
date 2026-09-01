@@ -1,0 +1,95 @@
+{{/*
+The inference workers — the only profile-sensitive workload.
+
+Everything that differs between the laptop and the GPU node is a value, not a
+code path: model size, decode backend, sampling rate, batch size, replica count
+and resource requests. If a cutover ever needs a code change, the switch is
+broken.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prahari-inference
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+    app.kubernetes.io/name: inference
+spec:
+  {{- if not .Values.inference.keda.enabled }}
+  replicas: {{ .Values.inference.replicas }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "prahari.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/name: inference
+  template:
+    metadata:
+      labels:
+        {{- include "prahari.labels" . | nindent 8 }}
+        app.kubernetes.io/name: inference
+    spec:
+      containers:
+        - name: inference
+          image: {{ include "prahari.image" (dict "registry" .Values.global.imageRegistry "name" "inference" "tag" .Values.global.imageTag) }}
+          imagePullPolicy: {{ .Values.global.pullPolicy }}
+          env:
+            {{- include "prahari.commonEnv" . | nindent 12 }}
+            - name: PRAHARI_MODEL
+              value: {{ .Values.inference.model | quote }}
+            # cpu | videotoolbox | nvdec — selected here, never sniffed at runtime.
+            - name: PRAHARI_DECODE_BACKEND
+              value: {{ .Values.inference.decodeBackend | quote }}
+            # Never the native rate. Most CCTV frames are static.
+            - name: PRAHARI_SAMPLING_FPS
+              value: {{ .Values.inference.samplingFps | quote }}
+            - name: PRAHARI_MAX_STREAMS
+              value: {{ .Values.inference.maxStreamsPerWorker | quote }}
+            # Batch ACROSS cameras, not within one — worth 3-5x over per-frame.
+            - name: PRAHARI_BATCH_SIZE
+              value: {{ .Values.inference.batchSize | quote }}
+            - name: PRAHARI_MOTION_GATE
+              value: {{ .Values.inference.motionGate | quote }}
+            - name: PRAHARI_MATCH_ENGINE_GRPC
+              value: "prahari-match-engine:{{ .Values.services.matchEngine.grpcPort }}"
+            # All consumers fan out from MediaMTX; workers never connect to the
+            # government feed directly.
+            - name: PRAHARI_MEDIAMTX_RTSP
+              value: "rtsp://prahari-mediamtx:{{ .Values.mediamtx.rtspPort }}"
+            - name: PRAHARI_MEDIAMTX_HLS
+              value: "http://prahari-mediamtx:{{ .Values.mediamtx.hlsPort }}"
+          resources:
+            {{- toYaml .Values.inference.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8003
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      {{- if .Values.inference.gpu }}
+      # GPU profile only. k3d on macOS has no GPU passthrough, so the local
+      # profile must remain genuinely CPU-viable.
+      runtimeClassName: nvidia
+      {{- end }}
+{{- if .Values.inference.keda.enabled }}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: prahari-inference
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: prahari-inference
+  minReplicaCount: {{ .Values.inference.keda.minReplicas }}
+  maxReplicaCount: {{ .Values.inference.keda.maxReplicas }}
+  # Scale down deliberately slowly: thrashing GPU pods costs more than it saves,
+  # and the scale-DOWN curve is part of the elasticity demo. A pool that only
+  # grows is not elasticity.
+  cooldownPeriod: 120
+  triggers:
+    - type: redis
+      metadata:
+        address: prahari-redis:6379
+        listName: prahari:frames:pending
+        listLength: {{ .Values.inference.keda.queueLengthTarget | quote }}
+{{- end }}

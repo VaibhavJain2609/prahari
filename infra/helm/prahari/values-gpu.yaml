@@ -1,0 +1,48 @@
+# Cloud GPU profile — L4/A10G with k3s, Days 4-5.
+#
+# Cutover is `helm upgrade --set profile=gpu`, nothing more. If this requires a
+# code change, the profile switch is broken.
+#
+# This is the ONLY profile whose measurements may be cited in docs/SCALE-80K.md,
+# and every figure there must trace to a recorded run in infra/loadtest/.
+
+profile: gpu
+
+bus:
+  kind: redpanda      # durability, replay and backpressure for the scale test
+  retentionHours: 48
+
+postgres:
+  storage: 50Gi
+
+inference:
+  replicas: 2
+  model: yolov8s.pt
+  decodeBackend: nvdec        # hardware decode — the single biggest lever
+  samplingFps: 4
+  maxStreamsPerWorker: 50     # WORKING ESTIMATE — replace with the measured value
+  batchSize: 16               # batch across cameras: worth 3-5x over per-frame
+  motionGate: true
+  gpu: true
+
+  resources:
+    requests:
+      cpu: "4"
+      memory: 8Gi
+      nvidia.com/gpu: 1
+    limits:
+      cpu: "8"
+      memory: 16Gi
+      nvidia.com/gpu: 1
+
+  keda:
+    # The demo beat: onboard cameras, film the pod count climb 2 -> 20.
+    # It must scale back DOWN too — a pool that only grows is not elasticity,
+    # and a sharp jury will ask.
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 20
+    queueLengthTarget: 100
+
+ingest:
+  maxActiveCameras: 50        # the full government catalogue

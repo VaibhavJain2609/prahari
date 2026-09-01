@@ -1,0 +1,36 @@
+# Laptop profile — k3d on macOS, Days 0-3.
+#
+# k3d on macOS has NO GPU passthrough, so this must be genuinely CPU-viable
+# rather than a degraded GPU path. The goal here is to prove the pipeline is
+# CORRECT on 3-5 streams. Throughput numbers measured under this profile are
+# meaningless and must never reach docs/SCALE-80K.md.
+
+profile: local
+
+bus:
+  kind: redis
+
+postgres:
+  storage: 5Gi
+
+inference:
+  replicas: 1
+  model: yolov8n.pt           # smallest model; accuracy is not the point yet
+  decodeBackend: videotoolbox # macOS hardware decode
+  samplingFps: 2
+  maxStreamsPerWorker: 5
+  batchSize: 4
+  motionGate: true
+  gpu: false
+
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits:   { cpu: "4",  memory: 6Gi }
+
+  keda:
+    enabled: false
+
+# Trim the estate so a laptop can keep up. The registry still onboards and
+# health-tracks the full catalogue — only inference is limited.
+ingest:
+  maxActiveCameras: 5
