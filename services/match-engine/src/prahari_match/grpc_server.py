@@ -31,6 +31,7 @@ from prahari.v1 import adapter_pb2, adapter_pb2_grpc
 from .alerts import AlertBuilder, AlertPublisher
 from .config import MatchSettings
 from .dedup import Deduper
+from .detections import DetectionPublisher, NullDetectionPublisher
 from .matcher import WatchlistStore, match
 
 __all__ = ["MetadataIngestServicer", "serve"]
@@ -46,12 +47,14 @@ class MetadataIngestServicer(adapter_pb2_grpc.MetadataIngestServiceServicer):
         publisher: AlertPublisher,
         settings: MatchSettings,
         alert_builder: AlertBuilder | None = None,
+        detection_publisher: DetectionPublisher | None = None,
     ) -> None:
         self._store = store
         self._deduper = deduper
         self._publisher = publisher
         self._settings = settings
         self._alert_builder = alert_builder or AlertBuilder()
+        self._detection_publisher = detection_publisher or NullDetectionPublisher()
         self._warned_missing_wall_clock = False
 
     def StreamDetections(
@@ -93,6 +96,12 @@ class MetadataIngestServicer(adapter_pb2_grpc.MetadataIngestServiceServicer):
         )
 
     def _handle_detection(self, detection) -> None:  # noqa: ANN001 - adapter_pb2.VehicleDetection-shaped
+        # Every detection reaches the detections bus, watchlist hit or not -- see
+        # detections.py's module docstring for why (DAY3-DESIGN.md §2). This must run
+        # before the plate/match early-returns below, which are about *alerting*, not
+        # about whether the sighting is worth keeping as evidence.
+        self._detection_publisher.publish(detection)
+
         if not detection.HasField("plate"):
             return  # no plate legible on this detection -- nothing to match
 
@@ -129,13 +138,16 @@ def serve(
     deduper: Deduper,
     publisher: AlertPublisher,
     settings: MatchSettings,
+    detection_publisher: DetectionPublisher | None = None,
 ) -> grpc.Server:
     """Build and start the gRPC server. Returns the (already-started) server
     so a caller controls its own shutdown -- this function does not block,
     matching how `app.py`'s lifespan needs to run it alongside uvicorn rather
     than instead of it."""
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=settings.grpc_max_workers))
-    servicer = MetadataIngestServicer(store, deduper, publisher, settings)
+    servicer = MetadataIngestServicer(
+        store, deduper, publisher, settings, detection_publisher=detection_publisher
+    )
     adapter_pb2_grpc.add_MetadataIngestServiceServicer_to_server(servicer, server)
     server.add_insecure_port(f"{settings.grpc_host}:{settings.grpc_port}")
     server.start()

@@ -121,6 +121,19 @@ class MatchSettings(BaseSettings):
     """Bounded in-memory ring buffer backing `/api/v1/alerts` -- a debug/admin
     surface, not the system of record. That is the bus, when configured."""
 
+    # --- detections bus (DAY3-DESIGN.md §2) -----------------------------------
+
+    redis_detection_stream_key: str = "prahari:detections"
+    """Every `VehicleDetection`, watchlist hit or not -- `prahari:alerts` only ever
+    carried matches, which left `services/correlation` nothing to reconstruct a route
+    from for a plate that was never on the watchlist. Reuses `redis_url`: one Redis,
+    two streams, same "no bus fan-out when unset" rule as alerts."""
+
+    detection_stream_maxlen: int = 200_000
+    """`XADD ... MAXLEN ~` cap. This stream carries every detection rather than only
+    watchlist hits, so it is the higher-rate of the two and the one actually at risk of
+    growing without bound on a long-running demo."""
+
 
 @lru_cache(maxsize=1)
 def match_settings() -> MatchSettings:

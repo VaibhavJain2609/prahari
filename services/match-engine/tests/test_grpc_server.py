@@ -24,6 +24,17 @@ from prahari_match.matcher import WatchlistStore
 from prahari_match.watchlist import Watchlist
 
 
+class _RecordingDetectionPublisher:
+    """Records every detection handed to it, in order -- a fake standing in for
+    `RedisDetectionPublisher` so these tests never need a real Redis."""
+
+    def __init__(self) -> None:
+        self.published: list = []
+
+    def publish(self, detection) -> None:  # noqa: ANN001
+        self.published.append(detection)
+
+
 def _store_with(*plates: str) -> WatchlistStore:
     watchlist = Watchlist()
     for i, plate in enumerate(plates):
@@ -49,18 +60,23 @@ def _detection(
     )
 
 
-def _servicer(store: WatchlistStore) -> tuple[MetadataIngestServicer, RecentAlertsPublisher]:
+def _servicer(
+    store: WatchlistStore,
+) -> tuple[MetadataIngestServicer, RecentAlertsPublisher, _RecordingDetectionPublisher]:
     recent = RecentAlertsPublisher(max_size=100)
     deduper = Deduper(bucket_s=8.0, max_entries=1000)
     settings = MatchSettings()
-    servicer = MetadataIngestServicer(store, deduper, recent, settings, AlertBuilder())
-    return servicer, recent
+    detections = _RecordingDetectionPublisher()
+    servicer = MetadataIngestServicer(
+        store, deduper, recent, settings, AlertBuilder(), detection_publisher=detections
+    )
+    return servicer, recent, detections
 
 
 class TestStreamDetections:
     def test_matched_detection_produces_one_alert(self) -> None:
         store = _store_with("GJ01AB1234")
-        servicer, recent = _servicer(store)
+        servicer, recent, detections = _servicer(store)
 
         response = servicer.StreamDetections(
             iter(
@@ -72,10 +88,14 @@ class TestStreamDetections:
         assert response.ack.accepted == 1
         assert response.ack.rejected == 0
         assert len(recent.recent()) == 1
+        assert len(detections.published) == 1  # the raw detection also reaches the bus
 
     def test_non_matching_detection_is_accepted_but_raises_no_alert(self) -> None:
+        # This is the fix DAY3-DESIGN.md §2 exists for: a plate that never hits the
+        # watchlist must still reach the detections bus, or services/correlation has
+        # nothing to reconstruct a route from for a non-watchlist plate.
         store = _store_with("GJ01AB1234")
-        servicer, recent = _servicer(store)
+        servicer, recent, detections = _servicer(store)
 
         response = servicer.StreamDetections(
             iter(
@@ -86,10 +106,12 @@ class TestStreamDetections:
 
         assert response.ack.accepted == 1
         assert len(recent.recent()) == 0
+        assert len(detections.published) == 1
+        assert detections.published[0].plate.normalised_text == "MH12ZZ9999"
 
     def test_detection_with_no_plate_is_accepted_and_ignored(self) -> None:
         store = _store_with("GJ01AB1234")
-        servicer, recent = _servicer(store)
+        servicer, recent, detections = _servicer(store)
 
         detection = events_pb2.VehicleDetection(detection_id="D1", camera_id="CAM-1")
         response = servicer.StreamDetections(
@@ -97,10 +119,13 @@ class TestStreamDetections:
         )
         assert response.ack.accepted == 1
         assert len(recent.recent()) == 0
+        # No plate to match against, but the sighting itself is still evidence --
+        # appearance-only bridging (DAY3-DESIGN.md §3.3) depends on this reaching the bus.
+        assert len(detections.published) == 1
 
     def test_repeat_sighting_in_the_same_bucket_produces_one_alert(self) -> None:
         store = _store_with("GJ01AB1234")
-        servicer, recent = _servicer(store)
+        servicer, recent, detections = _servicer(store)
 
         requests = [
             adapter_pb2.StreamDetectionsRequest(detection=_detection("CAM-1", "GJ01AB1234", t))
@@ -110,6 +135,9 @@ class TestStreamDetections:
 
         assert response.ack.accepted == 3  # every message was processed without error
         assert len(recent.recent()) == 1  # but dedup collapsed it to one alert
+        # Dedup governs alerting only -- the detections bus is evidence, not alerting,
+        # and gets all three sightings so a route can show dwell time honestly.
+        assert len(detections.published) == 3
 
     def test_detection_with_no_wall_clock_falls_back_to_receipt_time_for_dedup(
         self, monkeypatch
@@ -119,7 +147,7 @@ class TestStreamDetections:
         # to one alert ever -- even sightings hours apart. Two receipt times
         # in different 8s buckets must now still produce two alerts.
         store = _store_with("GJ01AB1234")
-        servicer, recent = _servicer(store)
+        servicer, recent, _detections = _servicer(store)
 
         # Replace the module-level `time` name grpc_server closes over, not
         # the real `time.time` -- patching the latter globally also breaks
@@ -186,7 +214,7 @@ class TestStreamHealth:
         # must not derive or expose any health state from these events --
         # there is deliberately no health-state field anywhere in its output.
         store = _store_with("GJ01AB1234")
-        servicer, _recent = _servicer(store)
+        servicer, _recent, _detections = _servicer(store)
 
         events = [
             adapter_pb2.StreamHealthRequest(
@@ -202,6 +230,6 @@ class TestStreamHealth:
 
     def test_empty_health_stream_is_fine(self) -> None:
         store = _store_with("GJ01AB1234")
-        servicer, _recent = _servicer(store)
+        servicer, _recent, _detections = _servicer(store)
         response = servicer.StreamHealth(iter([]), context=None)
         assert response.ack.accepted == 0

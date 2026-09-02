@@ -110,20 +110,20 @@ that will actually go wrong:
 
 ## Day 2 — 3 Sep · detection end-to-end (local, CPU/MPS)
 
-- [ ] Wire `SampleGate` → motion gate → `yolov8n` → plate crop → OCR.
-- [ ] Indian-plate normalisation: `SS-DD-LL-NNNN`, BH-series, military,
+- [x] Wire `SampleGate` → motion gate → `yolov8n` → plate crop → OCR.
+- [x] Indian-plate normalisation: `SS-DD-LL-NNNN`, BH-series, military,
       non-conforming. Formats already modelled in `events.proto`.
 - [x] `make proto` and wire the gRPC client (`MetadataIngestService`).
-- [ ] `services/match-engine/` — confusion-aware fuzzy matcher (`0/O/D`, `8/B`,
+- [x] `services/match-engine/` — confusion-aware fuzzy matcher (`0/O/D`, `8/B`,
       `1/I/L`, `5/S`, `2/Z`, `6/G`), Bloom prefilter, dedup, alert fan-out.
       **Highest-ROI item in the build** — exact match fails the live test silently.
-- [ ] `data/watchlist/` — representative stolen / wanted / missing dataset.
-- [ ] Tamper + black-frame detection. Must not fire at `loop_epoch` changes.
+- [x] `data/watchlist/` — representative stolen / wanted / missing dataset.
+- [x] Tamper + black-frame detection. Must not fire at `loop_epoch` changes.
       The worker currently reports `black_frame_ratio: null` and
       `tamper_suspected: false` — null deliberately, so a console cannot show
       "no tampering detected" for a detector that is not running. Both become
       real values here.
-- [ ] `DetectorSettings` with `env_prefix="PRAHARI_DETECT_"`, matching the names
+- [x] `DetectorSettings` with `env_prefix="PRAHARI_DETECT_"`, matching the names
       the chart already sets (model, decode backend, batch size, motion gate,
       match-engine address).
 - [x] **Gate:** known plate through a clip → detection → fuzzy match → alert in

@@ -11,6 +11,7 @@ resolution-markers = [
 members = [
     "prahari",
     "prahari-common",
+    "prahari-correlation",
     "prahari-inference",
     "prahari-match",
     "prahari-proto",
@@ -981,6 +982,7 @@ source = { virtual = "." }
 [package.dev-dependencies]
 dev = [
     { name = "prahari-common" },
+    { name = "prahari-correlation" },
     { name = "prahari-inference" },
     { name = "prahari-match" },
     { name = "prahari-proto" },
@@ -996,6 +998,7 @@ dev = [
 [package.metadata.requires-dev]
 dev = [
     { name = "prahari-common", editable = "packages/prahari-common" },
+    { name = "prahari-correlation", editable = "services/correlation" },
     { name = "prahari-inference", editable = "services/inference" },
     { name = "prahari-match", editable = "services/match-engine" },
     { name = "prahari-proto", editable = "packages/prahari-proto" },
@@ -1029,6 +1032,50 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
+]
+provides-extras = ["dev"]
+
+[[package]]
+name = "prahari-correlation"
+version = "0.1.0"
+source = { editable = "services/correlation" }
+dependencies = [
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "prahari-common" },
+    { name = "prahari-proto" },
+    { name = "protobuf" },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "redis" },
+    { name = "uvicorn", extra = ["standard"] },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "httpx" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-cov" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.115" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
+    { name = "prahari-common", editable = "packages/prahari-common" },
+    { name = "prahari-proto", editable = "packages/prahari-proto" },
+    { name = "protobuf", specifier = ">=5.28" },
+    { name = "pydantic", specifier = ">=2.9" },
+    { name = "pydantic-settings", specifier = ">=2.5" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
+    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
+    { name = "redis", specifier = ">=5.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
 provides-extras = ["dev"]
 

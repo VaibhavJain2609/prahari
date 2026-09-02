@@ -22,6 +22,7 @@ from .alerts import FanOutPublisher, RecentAlertsPublisher, RedisStreamPublisher
 from .bloom import BloomFilter
 from .config import MatchSettings, match_settings
 from .dedup import Deduper
+from .detections import DetectionPublisher, NullDetectionPublisher, RedisDetectionPublisher
 from .grpc_server import serve
 from .matcher import WatchlistStore
 from .watchlist import Watchlist
@@ -87,13 +88,23 @@ async def lifespan(app: FastAPI):
         log.warning("PRAHARI_MATCH_REDIS_URL not set; alerts fan out only to /api/v1/alerts")
     fan_out = FanOutPublisher(publishers) if len(publishers) > 1 else recent
 
+    detection_publisher: DetectionPublisher
+    if settings.redis_url:
+        detection_publisher = RedisDetectionPublisher(
+            settings.redis_url,
+            settings.redis_detection_stream_key,
+            settings.detection_stream_maxlen,
+        )
+    else:
+        detection_publisher = NullDetectionPublisher()
+
     app.state.settings = settings
     app.state.store = store
     app.state.deduper = deduper
     app.state.recent_alerts = recent
     app.state.publisher = fan_out
 
-    grpc_server = serve(store, deduper, fan_out, settings)
+    grpc_server = serve(store, deduper, fan_out, settings, detection_publisher=detection_publisher)
     app.state.grpc_server = grpc_server
     try:
         yield

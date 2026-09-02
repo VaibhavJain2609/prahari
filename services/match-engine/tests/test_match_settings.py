@@ -56,6 +56,14 @@ _DELIBERATELY_INTERNAL = {
     "dedup_max_entries": "a memory-bound safety cap, not something a profile tunes",
     "redis_stream_key": "channel name is a code-level contract with consumers, not per-profile",
     "recent_alerts_size": "bounds a debug/admin ring buffer, not the system of record",
+    "redis_detection_stream_key": (
+        "channel name is a code-level contract with consumers (services/correlation), "
+        "not per-profile -- same reasoning as redis_stream_key"
+    ),
+    "detection_stream_maxlen": (
+        "a memory/retention safety cap on the higher-rate stream, not something a "
+        "profile tunes -- same reasoning as dedup_max_entries"
+    ),
 }
 
 

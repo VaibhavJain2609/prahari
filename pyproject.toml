@@ -21,6 +21,7 @@ members = [
     "services/inference",
     "services/match-engine",
     "services/registry",
+    "services/correlation",
 ]
 
 [tool.uv.sources]
@@ -29,6 +30,7 @@ prahari-proto = { workspace = true }
 prahari-inference = { workspace = true }
 prahari-match = { workspace = true }
 prahari-registry = { workspace = true }
+prahari-correlation = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -37,6 +39,7 @@ dev = [
     "prahari-inference",
     "prahari-match",
     "prahari-registry",
+    "prahari-correlation",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "pytest-cov>=5.0",
@@ -53,6 +56,12 @@ asyncio_mode = "auto"
 # Service .venv directories contain their own vendored copies of the test
 # suites; collecting them runs every test twice and reports phantom failures.
 norecursedirs = [".venv", ".git", "*.egg-info", "node_modules"]
+# Two services can legitimately both have a `tests/test_app.py` (each testing
+# its own FastAPI surface) since none of the tests/ dirs are packages
+# (no __init__.py). Default rootdir-relative import mode collides on the
+# resulting duplicate module name; importlib mode keys each test file by its
+# own path instead, which is what a multi-service workspace needs.
+addopts = ["--import-mode=importlib"]
 
 [tool.ruff]
 line-length = 100
