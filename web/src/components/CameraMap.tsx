@@ -54,7 +54,11 @@ export default function CameraMap() {
     map.addControl(new NavigationControl(), "top-right");
     mapRef.current = map;
 
-    map.on("load", () => {
+    // "style.load" fires once the style spec is parsed and ready to accept
+    // custom sources/layers. "load" waits for every tile of every basemap
+    // layer to finish too, which can lag well behind — our markers don't
+    // need to wait on that.
+    map.on("style.load", () => {
       map.addSource(SOURCE_ID, {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -132,8 +136,18 @@ export default function CameraMap() {
         const geojson = await res.json();
         if (cancelled) return;
 
-        const source = mapRef.current?.getSource(SOURCE_ID) as GeoJSONSource | undefined;
-        source?.setData(geojson);
+        const map = mapRef.current;
+        const source = map?.getSource(SOURCE_ID) as GeoJSONSource | undefined;
+        if (source) {
+          source.setData(geojson);
+        } else if (map) {
+          // Source isn't ready yet (style still parsing) — apply this
+          // fetch's data as soon as it is, instead of dropping it and
+          // waiting for the next 20s tick.
+          map.once("style.load", () => {
+            (map.getSource(SOURCE_ID) as GeoJSONSource | undefined)?.setData(geojson);
+          });
+        }
         setCameraCount(geojson.features?.length ?? 0);
         setStatus("ok");
       } catch {
@@ -141,8 +155,6 @@ export default function CameraMap() {
       }
     }
 
-    // First poll needs the map's "load" handler to have created the source;
-    // a short delay covers the common case without coupling the two effects.
     const initial = setTimeout(poll, 300);
     const interval = setInterval(poll, POLL_INTERVAL_MS);
     return () => {

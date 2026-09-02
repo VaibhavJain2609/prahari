@@ -135,27 +135,37 @@ class CameraEntry(BaseModel):
         )
 
     def rtsp_url(self, settings: GatewaySettings) -> str:
-        """Prefer the catalogue's URL; fall back to the documented pattern."""
+        """Prefer the catalogue's URL; fall back to the documented pattern.
+
+        Served directly from `direct_host` (a public IP or dedicated
+        subdomain), never the password-gated CDN `host` — a CDN cannot proxy
+        raw RTSP. Confirmed against the live integrator's guide.
+        """
         if self.catalogue_rtsp_url:
             return self.catalogue_rtsp_url
-        return f"rtsp://{settings.host}:{settings.rtsp_port}/stream/{self.id}"
+        return f"rtsp://{settings.direct_host_or_host}:{settings.rtsp_port}/stream/{self.id}"
 
     def hls_url(self, settings: GatewaySettings) -> str:
         """HLS fallback for when port 8554 is blocked (§3).
 
-        Note the path shape: /live/stream/<id>/index.m3u8 — it is NOT the RTSP
-        path with a different port, and it is not MediaMTX's default layout.
+        Path shape is /<id>/index.m3u8 off the CDN host, confirmed against the
+        live integrator's guide — NOT /live/stream/<id>/... and not MediaMTX's
+        default layout. Password-gated, same as the catalogue.
         """
         if self.catalogue_hls_url:
             return self.catalogue_hls_url
-        return f"{settings.base_url}/live/stream/{self.id}/index.m3u8"
+        return f"{settings.base_url}/{self.id}/index.m3u8"
 
     def whep_url(self, settings: GatewaySettings) -> str:
         """Browser preview only. Never an inference source — the WebRTC path
-        loses the PTS fidelity that evidence timestamps depend on."""
+        loses the PTS fidelity that evidence timestamps depend on.
+
+        Served plain HTTP directly from `direct_host`, not the CDN's TLS
+        `scheme` — confirmed against the live integrator's guide.
+        """
         if self.catalogue_whep_url:
             return self.catalogue_whep_url
-        return f"{settings.base_url}:{settings.whep_port}/stream/{self.id}/whep"
+        return f"http://{settings.direct_host_or_host}:{settings.whep_port}/stream/{self.id}/whep"
 
 
 class Catalogue(BaseModel):
@@ -191,25 +201,37 @@ class CatalogueClient:
         self._s = settings or gateway_settings()
 
     def _client(self) -> httpx.Client:
-        return httpx.Client(
+        # The CDN/catalogue host authenticates by session cookie, not a header
+        # or Basic auth: POST the password as a form field, then reuse the
+        # Set-Cookie httpx's own cookie jar keeps for every request after.
+        # Confirmed against a real 200 from the live gateway.
+        client = httpx.Client(
             timeout=self._s.request_timeout_s,
             verify=self._s.verify_tls,
             follow_redirects=True,
-            # The access password. The exact scheme the gateway expects is not
-            # documented in the integrator's guide, so both the common forms are
-            # presented and the unused one is ignored by the server. Replace
-            # this with the single correct mechanism once confirmed against a
-            # real 200 — leaving both in place permanently means sending the
-            # credential somewhere it was not needed.
-            auth=("", self._s.password.get_secret_value()),
-            headers={"X-Access-Password": self._s.password.get_secret_value()},
         )
+        login = client.post(
+            self._s.login_url,
+            data={"password": self._s.password.get_secret_value()},
+        )
+        if login.status_code >= 400 or not client.cookies:
+            client.close()
+            raise RuntimeError(
+                f"gateway login failed: POST {self._s.login_url} -> {login.status_code}"
+            )
+        return client
 
     def fetch(self) -> Catalogue:
-        with self._client() as client:
+        # _client() already sends the login POST, which puts httpx.Client past
+        # its "unopened" state — entering it again via `with` raises. Close it
+        # by hand instead.
+        client = self._client()
+        try:
             resp = client.get(self._s.catalogue_url)
             resp.raise_for_status()
             payload = resp.json()
+        finally:
+            client.close()
         return Catalogue(cameras=_parse_entries(payload), fetched_at=datetime.now(UTC))
 
     def snapshot(self, catalogue: Catalogue, directory: str | Path) -> Path:

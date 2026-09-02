@@ -29,8 +29,17 @@ class GatewaySettings(BaseSettings):
     )
 
     host: str = Field(
-        description="Gateway hostname, no scheme. Supplied at deploy time; the "
-        "repo never carries the real value."
+        description="CDN/catalogue hostname, no scheme. Password-gated; serves "
+        "the catalogue and HLS. Supplied at deploy time; the repo never "
+        "carries the real value."
+    )
+    direct_host: str | None = Field(
+        default=None,
+        description="Public IP or dedicated subdomain that serves RTSP/WHEP "
+        "directly — a CDN cannot proxy raw TCP/UDP media. Unauthenticated by "
+        "the gateway's own design (§1 of the integrator's guide: 'no Tailscale "
+        "or device registration required'). Falls back to `host` when unset, "
+        "for a gateway that happens to serve both from the same place.",
     )
     password: SecretStr = Field(
         description="Access password. SecretStr so it cannot land in a log line "
@@ -41,21 +50,29 @@ class GatewaySettings(BaseSettings):
     whep_port: int = 8889
 
     scheme: str = "https"
-    """The gateway is reachable over TLS. RTSP is separate and unencrypted on
-    8554 — that is the gateway's design, not ours, and is a point to raise in
-    SECURITY.md rather than to work around."""
+    """The CDN/catalogue host is reachable over TLS. RTSP and WHEP are served
+    directly, unencrypted (§1 of the integrator's guide) — that is the
+    gateway's design, not ours, and is a point to raise in SECURITY.md rather
+    than to work around."""
 
     verify_tls: bool = True
 
-    catalogue_path: str = "/api/ingest"
+    catalogue_path: str = "/cameras.json"
+    login_path: str = "/auth/login"
+    """The catalogue and HLS host authenticates by session cookie, not a
+    header or Basic auth: POST the access password here as form field
+    `password`, then reuse the `Set-Cookie` on every subsequent request.
+    Confirmed against a real 200 from the live gateway."""
 
     request_timeout_s: float = 15.0
 
-    @field_validator("host")
+    @field_validator("host", "direct_host")
     @classmethod
-    def _reject_scheme_in_host(cls, v: str) -> str:
+    def _reject_scheme_in_host(cls, v: str | None) -> str | None:
         # Pasting the full URL into the host var is the obvious mistake, and it
         # produces a confusing "https://https://..." far from the cause.
+        if v is None:
+            return v
         if "://" in v:
             raise ValueError(
                 "host must be a bare hostname without a scheme "
@@ -70,6 +87,14 @@ class GatewaySettings(BaseSettings):
     @property
     def catalogue_url(self) -> str:
         return f"{self.base_url}{self.catalogue_path}"
+
+    @property
+    def login_url(self) -> str:
+        return f"{self.base_url}{self.login_path}"
+
+    @property
+    def direct_host_or_host(self) -> str:
+        return self.direct_host or self.host
 
 
 @lru_cache(maxsize=1)
