@@ -78,6 +78,7 @@ registry  correlation  BFF ──── Next.js console
 
 ```
 proto/          the vendor-neutral contract (buf-linted, STANDARD)
+packages/       prahari-common — catalogue client, shared by registry + workers
 services/       registry · inference · match-engine · correlation · bff
 web/            Next.js console
 infra/
@@ -95,9 +96,16 @@ is spent.
 ```bash
 make cluster          # k3d cluster + local registry
 make proto            # generate protobuf stubs
+make images           # build service images into the k3d registry
 make up               # helm upgrade --install, profile: local
+make gateway-secret   # load .env into the cluster (never into values.yaml)
 make verify           # render both profiles and diff them
+make test             # pytest across the workspace
 ```
+
+`make dev` runs Tilt against the same chart, with live-reload on the registry.
+Tilt applies no YAML of its own — Helm and Terraform in `infra/` are the only
+source of truth, in the inner loop as much as on demo day.
 
 `make up PROFILE=gpu` is the entire cloud cutover. The `profile` value swaps
 model size, decode backend (VideoToolbox → NVDEC), sampling rate, stream cap,

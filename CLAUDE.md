@@ -50,9 +50,55 @@ These come from the portal's own Integrator's Guide. Violating them costs hours 
 - **One upstream pull per camera.** Every client gets its own copy of the stream, so all
   consumers fan out from MediaMTX. Connect only to cameras actually in use.
 
+**Camera health**
+- **Workers observe; the registry decides.** An ingest worker reports
+  connected/not, `measured_fps`, decode counts and its last error. It never
+  computes a health state: two workers on the same camera would publish
+  contradictory verdicts, and a worker cannot see that its own heartbeats have
+  stopped arriving.
+- **Staleness is computed at read time**, in the `camera_current` SQL view. No
+  code runs when heartbeats stop, so nothing that runs on receipt can detect it.
+- Drift is measured against the camera's **own** recent median rate, never
+  against `declared_fps`. The declared rate is recorded and never used to judge.
+
+**Detection & matching**
+- **Inference never corrects a plate.** It emits `raw_text`, per-character
+  confidences, `normalised_text` and a format. Correction belongs to the match
+  engine, where it is scored and carries a `MatchExplanation`. A silently
+  corrected plate is unexplainable in court.
+- **`char_confidence` must reach the match engine intact.** The matcher prices
+  each substitution by the confidence of the character it replaces. Collapsing
+  it to one scalar does not fail — it just makes matching quietly worse.
+- **Plate grammar lives in `prahari-common`, once.** Inference and the match
+  engine must agree exactly on what a plate looks like; if they normalise
+  differently every lookup misses and nothing raises. Tolerance (confusion
+  classes, edit costs) belongs to the match engine, grammar to the shared
+  package. Never duplicate either.
+- **Never exact-match a plate against the watchlist.** OCR reliably confuses
+  `0/O/D/Q`, `8/B`, `1/I/L`, `5/S`, `2/Z`, `6/G`. Exact matching fails the live
+  test *silently*: the vehicle was seen, the lookup missed, nothing surfaced.
+- **Every alert carries its justification** and is deduped on
+  `(camera, plate, time-bucket)`. A vehicle in frame for 8 s at 3 fps is one
+  alert, not 24.
+- **Model backends are imported lazily**, inside `_load()`, never at module
+  import — `import prahari_inference` must not pull in torch. Every stage is
+  exercisable with no weights installed, or the test suite stops being run.
+- **The device/decode backend is selected from settings, never sniffed.** No
+  `torch.cuda.is_available()` branching: that is a code path the `profile`
+  switch cannot see, on a machine no values file describes.
+- **Batch across cameras, never within one.** One camera at 2 fps cannot fill a
+  batch without adding half a second of latency. Flush on batch size *or* a
+  deadline, whichever comes first.
+- **Motion gate and tamper detector are scoped to `loop_epoch`** and reset
+  across it. The background model is invalid after a scene cut, and a tamper
+  detector that fires on every loop gets switched off on day one.
+
 **Contracts**
 - All inter-service messages are protobuf, defined in `proto/`. Regenerate stubs with
-  `make proto`; never hand-edit generated code.
+  `make proto`; never hand-edit generated code. Python stubs land in
+  `packages/prahari-proto/` as an installable workspace package (generated imports are
+  absolute, so the tree has to *be* a package) and are gitignored — the contract is the
+  `.proto`, not the stub. A fresh clone must run `make proto` before the imports resolve.
 - gRPC for the high-rate worker→match-engine link and the `CameraAdapter` plugin ABI.
   REST/JSON + SSE for anything the browser touches.
 - The same protobuf messages go on the bus. One schema, two transports.
@@ -65,6 +111,10 @@ These come from the portal's own Integrator's Guide. Violating them costs hours 
   No local disk state outside a PVC.
 - The `profile` Helm value (`local` | `gpu`) is the **only** thing that differs between the
   laptop and the cloud. If a cutover needs a code change, the switch is wrong — fix the switch.
+- **Every `PRAHARI_*` env the chart sets must exist as a settings field**, asserted by a
+  test that parses the template. A knob the chart writes and the code never reads is a
+  profile switch that silently does not switch: the GPU profile looks applied, is not,
+  and the number it was meant to change ends up on a slide.
 
 **Privacy & evidence**
 - Video never leaves the edge except as an explicit, audited evidence request.
@@ -78,10 +128,21 @@ These come from the portal's own Integrator's Guide. Violating them costs hours 
 
 ```
 proto/prahari/v1/     the vendor-neutral contract — start here
+packages/
+  prahari-common/     catalogue client + gateway settings + plate grammar. Shared
+                      because the registry and the ingest workers reach the same
+                      gateway, and because inference and the match engine must
+                      agree exactly on what a plate looks like. Deliberately has
+                      no OpenCV dependency, so a service that only reads the
+                      catalogue does not inherit a decoder.
+  prahari-proto/      generated protobuf/gRPC stubs. `make proto` writes here;
+                      gitignored except the package __init__ files.
 services/
   registry/           FastAPI + PostGIS · catalogue sync · gap analysis · camera health
-  inference/          YOLO + OCR workers · decode · motion gating · batching · gRPC client
-  match-engine/       fuzzy watchlist match · dedup · alert fan-out
+  inference/          decode · motion gating · YOLO + OCR · batching · gRPC client
+    detect/types.py     the cascade's stage contracts — Protocols + dataclasses.
+                        Every backend has a scripted fake beside it.
+  match-engine/       confusion-aware fuzzy match · Bloom prefilter · dedup · alert fan-out
   correlation/        cross-camera track stitching · feasibility gating · route reconstruction
   bff/                auth · RBAC · hash-chained audit · SSE to the browser
 web/                  Next.js · MapLibre · WHEP live preview · alert console
@@ -103,11 +164,23 @@ Redpanda (scale test) · Next.js 15 + MapLibre GL · k3s/k3d + Helm + Terraform 
 ## Commands
 
 ```
-make proto        regenerate protobuf stubs
-make up           k3d cluster + helm install, profile=local
-make dev          tilt up (inner loop)
-make test         pytest across services
-make down         tear down the local cluster
+make proto            regenerate protobuf stubs
+make images           build service images into the k3d registry
+make up               k3d cluster + helm install, profile=local
+make gateway-secret   load .env into the cluster as the credential Secret
+make dev              tilt up (inner loop)
+make test             pytest across the workspace
+make lint             ruff + helm lint + buf lint
+make verify           render both profiles and check the switch
+make down             tear down the local cluster
+```
+
+Services are built from the **workspace root**, not their own directory —
+each depends on `packages/prahari-common`, which a narrower Docker build
+context would exclude:
+
+```
+docker build -f services/registry/Dockerfile .
 ```
 
 ---
@@ -124,3 +197,31 @@ make down         tear down the local cluster
   not compensate for failing it. When time is short, cut breadth, never that path.
 - Mock-ups, animations and simulated interfaces are disqualifying. If it is in a demo video,
   it is running code.
+
+### How features get built
+
+Plan, then build in a team, then verify in loops. Not one pass.
+
+1. **Design before code.** A feature gets a written design first — what it is, what
+   breaks without it, and what it deliberately excludes. `docs/DAY2-DESIGN.md` is the
+   worked example. The design exists so the reviews in step 3 have something to review
+   *against*, rather than reviewing code against taste.
+
+2. **Contracts are written centrally, before the team is dispatched.** Shared types,
+   Protocols, settings classes and proto stubs are fixed first, by one hand. Then owning
+   agents implement behind them in parallel with **disjoint file sets** — an explicit list
+   of files each owns and an explicit list it must not touch. Two agents editing one file
+   is a lost edit, not a merge conflict.
+
+3. **Cross-verification, always by someone who did not write it.** Each feature is
+   reviewed by an independent domain reviewer *and* an independent language reviewer.
+   Reviewers check against the hard invariants above, not preference. Findings go back to
+   the owner; the loop repeats until a full pass produces nothing new. A feature that
+   passed because only its author looked at it has not been verified.
+
+4. **Integration loop.** `make proto`, `make test`, `make lint`, `make verify` — run
+   together, to convergence, not once. Then the day's gate as an executable test.
+
+Loops are the deliverable as much as the code is. The failure mode this exists to prevent
+is the one this whole system is designed around: something that returns an answer, looks
+healthy, and is quietly wrong.

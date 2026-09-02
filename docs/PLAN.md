@@ -133,6 +133,7 @@ Written and `terraform validate`-clean. **Not applied** — that happens Day 4.
 |---|---|---|---|
 | 0 | 1 Sep | Scaffold, contracts, infra, ingest layer | **done** |
 | 1 | 2 Sep | Registry + PostGIS + GIS + catalogue sync + health | all cameras visible, health-tracked |
+
 | 2 | 3 Sep | Detection → OCR → gRPC → match → alert | plate → alert < 5 s |
 | 3 | 4 Sep | Correlation, BFF, console, report export | **vertical slice works on a laptop — go/no-go for cloud** |
 | 4 | 5 Sep | `terraform apply`, `profile=gpu`, **measure** | real streams-per-GPU recorded |
@@ -144,7 +145,7 @@ take a registration number, return a timestamped location-wise route. Bonus
 features do not compensate for failing it. When time is short, cut breadth,
 never that path.
 
-## 8. What is already built (1 Sep)
+## 8. What is already built (2 Sep)
 
 - `proto/prahari/v1/` — vendor-neutral contract, `buf lint` STANDARD clean.
   `char_confidence` survives to the match engine; `loop_epoch` /
@@ -153,10 +154,25 @@ never that path.
 - `infra/k3d/` — local cluster, same Kubernetes API as the cloud node.
 - `infra/terraform/modules/district/` + `envs/demo` — validate-clean, unapplied.
 - `services/inference/` — ingest layer: PTS-driven timing, GOP-replay-burst
-  detection, loop-cut epochs, supervised reconnect with jittered backoff,
-  alias-tolerant catalogue client. 11 tests, no network required.
+  detection, loop-cut epochs, supervised reconnect with jittered backoff.
+  Plus the Day 1 worker: pulls its assigned cameras from the MediaMTX fan-out
+  and heartbeats the registry. Detection lands Day 2.
+- `services/registry/` — FastAPI + PostGIS + TimescaleDB. Catalogue sync
+  (idempotent, absence-tolerant, never destructive of curated data), camera
+  CRUD, live health, district coverage and dark-zone analysis, MediaMTX path
+  reconciliation. Migrations applied on startup under an advisory lock and
+  checksummed, so an edited applied migration is rejected rather than ignored.
+- `packages/prahari-common/` — catalogue client and gateway settings, shared
+  between the registry and the workers so the alias-tolerant parsing gets
+  tightened once rather than twice.
+- `Tiltfile` — inner loop against the same chart `make up` installs. Tilt
+  applies no YAML of its own.
 - `.claude/agents/` — nine domain agents; `settings.json` gates `terraform
   apply`, `helm install` and `git push` behind confirmation.
+
+**66 tests, no network and no database required.** Nothing has yet run against
+the live gateway or a real Postgres — that is the first thing the catalogue
+capture unblocks.
 
 ## 9. Known risks
 
@@ -168,6 +184,8 @@ never that path.
 | 50 streams/GPU is an estimate | Measured Day 4; the Terraform arithmetic updates with it. |
 | Port 8554 blocked at the venue | HLS fallback implemented — **must be tested, not assumed.** |
 | Reconnect never met a real disconnect | Day 1: restart a feed and watch it recover. |
+| Registry never met a real Postgres | Migrations, PostGIS queries and the sync are unit-tested against fakes only. First `make up` is the test; do it before Day 2 depends on it. |
+| TimescaleDB absent from `postgis/postgis` | Migration 003 degrades to a plain table and the registry prunes heartbeats itself. The hypertable is a nicety; bounded growth is not, and it does not depend on the extension. |
 | Loop cut fires the tamper detector | `loop_epoch` in the contract; a scene cut alone is never an alert — tamper requires a *sustained* anomaly, which a loop does not produce. |
 | GPU spend before the slice works | Day 3 is an explicit go/no-go. |
 | Mock-ups are disqualifying | If it is in the video, it is running code. No exceptions. |

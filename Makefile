@@ -13,6 +13,10 @@ help: ## Show this help
 
 .PHONY: proto
 proto: ## Regenerate protobuf stubs from proto/
+	# Python stubs land in packages/prahari-proto/ (an installable workspace
+	# package, because generated protobuf imports are absolute); TypeScript in
+	# gen/ts for the Next.js build. Both are gitignored — the contract is the
+	# .proto file. A fresh clone must run this before the imports resolve.
 	cd proto && buf generate
 
 .PHONY: proto-lint
@@ -41,6 +45,26 @@ up: ## Install the platform locally (profile=local)
 dev: ## Inner dev loop (tilt up)
 	tilt up
 
+.PHONY: images
+images: ## Build the service images into the k3d registry
+	# Built from the workspace root: every service depends on
+	# packages/prahari-common, which a narrower build context would exclude.
+	docker build -f services/registry/Dockerfile     -t localhost:5555/prahari-registry:dev     .
+	docker build -f services/inference/Dockerfile    -t localhost:5555/prahari-inference:dev    .
+	docker build -f services/match-engine/Dockerfile -t localhost:5555/prahari-match-engine:dev .
+	docker push localhost:5555/prahari-registry:dev
+	docker push localhost:5555/prahari-inference:dev
+	docker push localhost:5555/prahari-match-engine:dev
+
+.PHONY: gateway-secret
+gateway-secret: ## Load .env into the cluster as the gateway credential Secret
+	# The credential never enters values.yaml, tfvars or a commit. This reads
+	# the gitignored .env and nothing else.
+	@test -f .env || { echo "no .env — copy .env.example and fill it in"; exit 1; }
+	kubectl create secret generic prahari-gateway \
+	  --namespace $(NAMESPACE) --from-env-file=.env \
+	  --dry-run=client -o yaml | kubectl apply -f -
+
 .PHONY: down
 down: ## Uninstall the platform
 	helm uninstall prahari --namespace $(NAMESPACE)
@@ -53,13 +77,17 @@ nuke: ## Delete the local cluster entirely
 
 .PHONY: lint
 lint: ## Lint everything that can be linted without a cluster
+	uv run ruff check .
+	uv run ruff format --check .
 	helm lint $(CHART) --values $(CHART)/values-local.yaml
 	terraform -chdir=infra/terraform/envs/dev fmt -check -recursive || true
 	cd proto && buf lint
 
 .PHONY: test
-test: ## Run the test suite across services
-	uv run pytest services -q
+test: ## Run the test suite across the workspace
+	# `pytest` with no path, so packages/ is collected too. A service missing
+	# from the run is how a broken service reaches demo day looking green.
+	uv run pytest -q
 
 .PHONY: verify
 verify: ## Render the chart under both profiles and diff-check the switch
