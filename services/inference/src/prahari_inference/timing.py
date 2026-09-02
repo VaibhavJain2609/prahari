@@ -219,9 +219,5 @@ class PTSClock:
             return None
         ordered = sorted(self._recent_deltas)
         mid = len(ordered) // 2
-        median = (
-            ordered[mid]
-            if len(ordered) % 2
-            else (ordered[mid - 1] + ordered[mid]) / 2.0
-        )
+        median = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
         return 1000.0 / median if median > 0 else None

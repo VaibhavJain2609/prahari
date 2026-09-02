@@ -23,9 +23,10 @@ from dataclasses import dataclass
 from types import TracebackType
 
 import numpy as np
+from prahari_common.catalogue import CameraEntry
+from prahari_common.config import GatewaySettings, gateway_settings
 
-from .catalogue import CameraEntry
-from .config import GatewaySettings, IngestSettings, gateway_settings, ingest_settings
+from .config import IngestSettings, ingest_settings
 from .rtsp_env import capture_options, cv2
 from .timing import FrameTiming, PTSClock
 
@@ -62,24 +63,55 @@ class StreamCapture:
         gateway: GatewaySettings | None = None,
         ingest: IngestSettings | None = None,
         use_hls: bool = False,
+        url: str | None = None,
     ) -> None:
         self.camera = camera
-        self._g = gateway or gateway_settings()
         self._i = ingest or ingest_settings()
         self._use_hls = use_hls
+        self._url_override = url
+        # Gateway credentials are resolved lazily and only when a URL has to be
+        # derived. A worker handed a MediaMTX fan-out URL has no business
+        # holding the government feed's password, and requiring one here would
+        # mean the credential has to be mounted into every inference pod.
+        self._gateway = gateway
         self._cap: cv2.VideoCapture | None = None
         self._clock = PTSClock()
         self._closed = False
         self._backoff_s = self._i.backoff_initial_s
+        # I3/I4: public, read from any thread. The worker's reporter thread
+        # heartbeats on its own timer, independent of whether the pump thread
+        # is currently blocked inside `frames()` (mid read, mid backoff sleep)
+        # -- if these lived only as locals inside the generator, or were only
+        # ever pushed onto CameraStats from inside the frame loop, a stalled
+        # reconnect (up to 30s per attempt, indefinitely) would mean nothing
+        # updates them for as long as the stall lasts, and the LAST value
+        # (typically connected=True) keeps being reported as current.
+        self.connected = False
+        self.consecutive_failures = 0
+        self.last_error: str | None = None
 
     @property
     def url(self) -> str:
-        """HLS is the documented fallback when port 8554 is blocked. It is a
-        genuine fallback, not a preference: HLS segments add several seconds of
-        latency, which the alerting path pays for directly."""
-        return (
-            self.camera.hls_url(self._g) if self._use_hls else self.camera.rtsp_url(self._g)
-        )
+        """Where to pull this camera from.
+
+        `url` overrides everything, and in the cluster it always wins: it is the
+        MediaMTX fan-out URL the registry assigned. Every client that connects to
+        a source gets its own copy of the stream, so workers must pull from the
+        restreamer — N workers connecting to the gateway directly is N upstream
+        pulls on a shared government feed.
+
+        Falling back to the catalogue URL keeps a single worker runnable against
+        the gateway with nothing else deployed, which is how the first
+        connectivity test gets done.
+
+        HLS is the documented fallback when port 8554 is blocked. It is a genuine
+        fallback, not a preference: HLS segments add several seconds of latency,
+        which the alerting path pays for directly.
+        """
+        if self._url_override:
+            return self._url_override
+        g = self._gateway or gateway_settings()
+        return self.camera.hls_url(g) if self._use_hls else self.camera.rtsp_url(g)
 
     def __enter__(self) -> StreamCapture:
         return self
@@ -92,9 +124,34 @@ class StreamCapture:
     ) -> None:
         self.close()
 
+    def request_stop(self) -> None:
+        """Ask the frame loop to finish, without touching the capture handle.
+
+        Safe to call from any thread — and it is the only thing that is.
+        `close()` releases the underlying VideoCapture, and releasing one while
+        another thread is blocked inside `read()` is a crash in OpenCV, not an
+        exception. Since every pod takes a SIGTERM eventually, a shutdown path
+        that races the decoder is a segfault on an ordinary rescheduling.
+
+        The owning thread sees the flag, leaves `frames()`, and releases the
+        capture itself.
+        """
+        self._closed = True
+
     def close(self) -> None:
+        """Stop and release. Call from the thread that drives `frames()`."""
         self._closed = True
         self._release()
+        # I3: `frames()` can be sitting mid-stream (connected=True) when
+        # `close()` runs -- the generator's own bookkeeping only clears
+        # `connected` on a read failure or a fresh reconnect, neither of which
+        # necessarily fires before the owning thread tears the capture down
+        # (an exception elsewhere in the pump loop, or `request_stop()`
+        # noticed inside `frames()` before the next read failure would have).
+        # `close()` is the one call every exit path funnels through, so it is
+        # the one place that can promise `connected` is false once this
+        # capture is done, not just usually false.
+        self.connected = False
 
     def _release(self) -> None:
         if self._cap is not None:
@@ -142,6 +199,10 @@ class StreamCapture:
             # Opening a capture against a camera the catalogue reports as down
             # spends a connection slot on a feed that cannot deliver.
             log.warning("camera=%s not live per catalogue; not connecting", self.camera.id)
+            # I4: without this, a not-live camera reports connected=false,
+            # last_error=null, frames_decoded=0 forever -- indistinguishable
+            # from one still starting up.
+            self.last_error = "camera not live per catalogue"
             return
 
         while not self._closed:
@@ -150,32 +211,39 @@ class StreamCapture:
                 continue
 
             connected_at = time.monotonic()
-            consecutive_failures = 0
+            self.consecutive_failures = 0
 
             while not self._closed:
                 assert self._cap is not None
                 ok, image = self._cap.read()
 
                 if not ok:
-                    consecutive_failures += 1
+                    self.consecutive_failures += 1
                     in_grace = (time.monotonic() - connected_at) < self._i.join_grace_s
 
                     # Attaching mid-stream produces decoder errors until the
                     # first IDR arrives. These self-correct. Aborting here is
                     # exactly the mistake that makes a pipeline "bounce on those
                     # streams" — so during the grace window we simply wait.
-                    if in_grace or consecutive_failures < self._i.read_failure_threshold:
+                    if in_grace or self.consecutive_failures < self._i.read_failure_threshold:
                         time.sleep(_READ_FAILURE_SLEEP_S)
                         continue
 
                     log.warning(
                         "camera=%s read failed %d consecutive times; reconnecting",
                         self.camera.id,
-                        consecutive_failures,
+                        self.consecutive_failures,
                     )
+                    # I3/I4: cleared the instant the read loop gives up, not
+                    # whenever the pump thread next happens to run code -- the
+                    # pump is about to be blocked inside `_sleep_backoff()`
+                    # for up to 30s, during which nothing else would clear it.
+                    self.connected = False
+                    self.last_error = f"read failed {self.consecutive_failures} consecutive times"
                     break
 
-                consecutive_failures = 0
+                self.consecutive_failures = 0
+                self.last_error = None
 
                 if time.monotonic() - connected_at >= _HEALTHY_CONNECTION_S:
                     self._backoff_s = self._i.backoff_initial_s
@@ -187,8 +255,14 @@ class StreamCapture:
                         self.camera.id,
                         timing.loop_epoch,
                     )
+                self.connected = True
                 yield Frame(image=image, timing=timing, camera_id=self.camera.id)
 
+            # I3: covers the path the failure-break above does not -- `_closed`
+            # flips true (request_stop() from another thread) while a read
+            # streak is still healthy, so the inner loop exits without ever
+            # reaching the failure branch that would otherwise clear this.
+            self.connected = False
             self._release()
             if not self._closed:
                 # A reconnect replays a fresh GOP and may restart PTS, so

@@ -15,7 +15,7 @@ from prahari_inference.timing import PTSClock
 
 
 class TestGOPReplayBurst:
-    """"The first second or two of frames may arrive faster than real time.
+    """ "The first second or two of frames may arrive faster than real time.
     A tracker that timestamps by arrival will compute impossible velocities
     immediately after every connection.\""""
 
@@ -25,8 +25,7 @@ class TestGOPReplayBurst:
 
         # 2s of buffered GOP delivered in ~40ms of wall time.
         burst = [
-            clock.observe(pts, now=wall + i * 0.002)
-            for i, pts in enumerate(range(0, 2000, 40))
+            clock.observe(pts, now=wall + i * 0.002) for i, pts in enumerate(range(0, 2000, 40))
         ]
 
         assert all(f.replaying for f in burst[1:]), "burst frames must be flagged"
@@ -64,7 +63,7 @@ class TestGOPReplayBurst:
 
 
 class TestLoopCut:
-    """"Each feed is a continuous recording that loops. At the loop point the
+    """ "Each feed is a continuous recording that loops. At the loop point the
     scene cuts abruptly, similar to a camera reboot.\""""
 
     def test_pts_regression_advances_the_loop_epoch(self):
@@ -102,7 +101,7 @@ class TestLoopCut:
 
 
 class TestMeasuredRate:
-    """"CAP_PROP_FPS often does not match the actual delivery rate ... Measure
+    """ "CAP_PROP_FPS often does not match the actual delivery rate ... Measure
     the real rate yourself.\""""
 
     def test_measures_rate_from_pts_not_declared_fps(self):
