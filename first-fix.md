@@ -2,7 +2,28 @@
 
 Handoff from the Day 2 cross-verification pass (loop 2), written 2 Sep 2026.
 The session that produced this was stopped on a CRITICAL cost flag before the
-fixes were applied. **Nothing here has been fixed yet** except where noted.
+fixes were applied.
+
+**Status update, 2 Sep 2026 (later the same day): all 20 findings below (M1-M6,
+V1-V4, P1-P7, I1-I4) are fixed in the working tree.** Verified by re-reading
+every file/line cited below against current source, not by trusting comments:
+M1's bloom funnel is built from `Watchlist.bloom_keys()` and probed with
+`bloom_probes()` in `matcher.py`; V1's pairing carries `vehicle_index` from
+`process_batch` instead of reconstructing it positionally; M4/M5 project
+`char_confidence` through `project_confidences` and re-derive `observed` from
+`raw_text`; P5's `WatchlistStore` swaps one `WatchlistSnapshot`; M6 checks
+`HasField("wall_clock")`; M2/M3 renamed the settings fields and added
+`test_match_settings.py`'s bidirectional chart-parity check; P1-P4, P6, P7,
+I1-I4 and V4 each have an inline comment citing their finding ID at the fix
+site. `uv run pytest -q` -> 290 passed, `uv run ruff check .` clean, both
+confirmed 2 Sep 2026 in the same session that added the Day 2 gate test
+(`tests/test_day2_gate.py`, which exercises the real, now-fixed matcher).
+
+Kept below verbatim as the record of what the review found and why each fix
+looks the way it does -- the fix-site comments (`M1`, `V1`, `P5`, ...) refer
+back to the sections here. Do not re-open any of these without re-reading the
+current code first: several fixes changed the file's structure enough that
+the original line numbers below no longer point at the described code.
 
 Findings came from four independent reviewers, each reviewing code it did not
 write, per `CLAUDE.md` > "How features get built" step 3. Three seams were
@@ -450,17 +471,18 @@ Items 1-7 are what I would do before anything else. 8-10 can follow.
 
 ---
 
-## 4. Still open from TODO.md, Day 2
+## 4. Still open from TODO.md, Day 2 (as of the original review)
 
-Not defects — work never started:
+Not defects — work never started at review time. **Both now done**, in the
+same later session that closed out section 2's findings:
 
-- Wire the gRPC `MetadataIngestService` **client** in the inference worker to the
-  match-engine server. The server side exists; the worker does not call it.
-- The Day 2 gate as an executable test: known plate -> detection -> fuzzy match
-  -> alert in < 5 s.
-- Tick the completed Day 2 / Day 1-gap items in `TODO.md`. Deliberately **not**
-  ticked yet — `TODO.md` says "tick only what has been *observed*", and ticking
-  an item this review just invalidated is the exact failure mode.
+- ~~Wire the gRPC `MetadataIngestService` **client** in the inference worker~~
+  -- done: `grpc_client.py` + `worker.py` wiring, tested in
+  `test_grpc_client.py` and `test_worker_pipeline.py`.
+- ~~The Day 2 gate as an executable test~~ -- done: `tests/test_day2_gate.py`,
+  passing, under the 5 s budget, against the real (fixed) matcher.
+- `TODO.md` now ticks both lines, since both are backed by a passing test, not
+  just written code -- the condition the original note held out for.
 
 ---
 
