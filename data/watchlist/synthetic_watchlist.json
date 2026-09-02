@@ -1,0 +1,67 @@
+[
+  {
+    "entry_id": "WL-2026-000101",
+    "plate": "GJ01AB1234",
+    "reason": "stolen",
+    "case_reference": "FIR/2026/AHMD/00417",
+    "source_system": "eGujCop",
+    "added_at": "2026-06-02T09:15:00+00:00"
+  },
+  {
+    "entry_id": "WL-2026-000102",
+    "plate": "GJ05CD5678",
+    "reason": "wanted",
+    "case_reference": "FIR/2026/SURAT/01122",
+    "source_system": "eGujCop",
+    "added_at": "2026-07-14T11:40:00+00:00"
+  },
+  {
+    "entry_id": "WL-2026-000103",
+    "plate": "GJ18EF9012",
+    "reason": "missing_person",
+    "case_reference": "MP/2026/RAJKOT/00089",
+    "source_system": "manual",
+    "added_at": "2026-08-01T06:05:00+00:00"
+  },
+  {
+    "entry_id": "WL-2026-000104",
+    "plate": "GJ27GH3456",
+    "reason": "blacklisted",
+    "case_reference": "BL/2026/VADODARA/00033",
+    "source_system": "VAHAN",
+    "added_at": "2026-05-20T14:00:00+00:00"
+  },
+  {
+    "entry_id": "WL-2026-000105",
+    "plate": "GJ01AB0007",
+    "reason": "suspect",
+    "case_reference": "FIR/2026/AHMD/00512",
+    "source_system": "eGujCop",
+    "added_at": "2026-08-20T18:30:00+00:00"
+  },
+  {
+    "entry_id": "WL-2026-000106",
+    "plate": "23BH1234AB",
+    "reason": "stolen",
+    "case_reference": "FIR/2026/GNAGAR/00201",
+    "source_system": "VAHAN",
+    "added_at": "2026-08-10T08:00:00+00:00"
+  },
+  {
+    "entry_id": "WL-2026-000107",
+    "plate": "GJ12AB4321",
+    "reason": "wanted",
+    "case_reference": "FIR/2025/BHAVNAGAR/00944",
+    "source_system": "eGujCop",
+    "added_at": "2025-09-01T10:00:00+00:00",
+    "expires_at": "2026-03-01T00:00:00+00:00"
+  },
+  {
+    "entry_id": "WL-2026-000108",
+    "plate": "TRAC7788",
+    "reason": "blacklisted",
+    "case_reference": "BL/2026/KUTCH/00019",
+    "source_system": "manual",
+    "added_at": "2026-04-11T12:00:00+00:00"
+  }
+]
