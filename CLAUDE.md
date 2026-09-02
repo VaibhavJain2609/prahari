@@ -225,3 +225,21 @@ Plan, then build in a team, then verify in loops. Not one pass.
 Loops are the deliverable as much as the code is. The failure mode this exists to prevent
 is the one this whole system is designed around: something that returns an answer, looks
 healthy, and is quietly wrong.
+
+### Git workflow
+
+- **Commit after every change.** Once a change is made and passes the loop above (or is
+  otherwise a coherent, working unit — a design doc, a config fix, a test), commit it.
+  Don't let work accumulate uncommitted across a session; an uncommitted change is not yet
+  part of the project. Commit messages follow the existing log's style: what changed and
+  why, not a restatement of the diff.
+- **One feature, one branch, one worktree.** Each feature or fix gets its own branch, and
+  that branch is checked out in its own `git worktree` — `git worktree add
+  ../prahari-<feature> -b <feature-branch>` — rather than switching branches in place in
+  this checkout. This is what lets more than one feature be in flight without one agent's
+  half-finished edit landing in another's diff, and keeps `main` always in the state Day
+  N's gate expects. Merge (or open a PR) back to `main` when the feature's loop converges;
+  remove the worktree once it's merged.
+- Origin is `github.com/VaibhavJain2609/prahari`, public. Nothing that fails the secrets
+  scan (`.env`, real gateway hosts/passwords, captured `/api/ingest` snapshots — see
+  `.gitignore`) ever gets committed, public repo or not.
