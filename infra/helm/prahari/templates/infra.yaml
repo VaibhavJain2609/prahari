@@ -167,6 +167,8 @@ spec:
               containerPort: {{ .Values.mediamtx.hlsPort }}
             - name: whep
               containerPort: {{ .Values.mediamtx.whepPort }}
+            - name: api
+              containerPort: {{ .Values.mediamtx.apiPort }}
           volumeMounts:
             - name: config
               mountPath: /mediamtx.yml
@@ -193,4 +195,9 @@ spec:
       port: {{ .Values.mediamtx.hlsPort }}
     - name: whep
       port: {{ .Values.mediamtx.whepPort }}
+    # The registry reaches this to write camera paths from the catalogue. Not
+    # mapped to a host port: reconfiguring the restreamer is an in-cluster
+    # operation only.
+    - name: api
+      port: {{ .Values.mediamtx.apiPort }}
 {{- end }}

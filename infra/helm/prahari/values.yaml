@@ -23,6 +23,16 @@ bus:
 
 postgres:
   enabled: true
+  # PostGIS is mandatory: the registry's coverage and dark-zone queries are
+  # ST_Distance / KNN on geography(Point, 4326), and there is no fallback.
+  #
+  # TimescaleDB is NOT in this image, and migration 003 degrades to a plain
+  # table when the extension is absent — heartbeat retention then falls to the
+  # registry's own pruner. Swapping in a Timescale-bearing image (the
+  # `timescale/timescaledb-ha` line carries PostGIS too) gets the hypertable
+  # back. UNVERIFIED: the exact tag has not been pulled or tested here, so it is
+  # not the default; verify it on Day 4 alongside the GPU cutover rather than
+  # discovering it on demo morning.
   image: postgis/postgis:16-3.4
   database: prahari
   user: prahari
@@ -43,11 +53,50 @@ mediamtx:
   rtspPort: 8554
   hlsPort: 8888
   whepPort: 8889
+  # The control API the registry writes paths to. Cluster-internal only — it is
+  # deliberately absent from infra/k3d/cluster.yaml's host port mappings, because
+  # nothing outside the cluster has any business reconfiguring the restreamer.
+  apiPort: 9997
+
+# --- registry: the control plane ---------------------------------------------
+
+registry:
+  # Which catalogue these cameras came from. Stored per camera, so a Model 2
+  # direct-connect camera and a gateway camera are distinguishable forever —
+  # and so a second gateway can be added without either one adopting the
+  # other's cameras when ids collide.
+  catalogueSource: gujarat-sentinel
+
+  sync:
+    enabled: true
+    # Ids rotate and cameras come and go. Five minutes is frequent enough that
+    # the map is never far wrong and infrequent enough to stay a courteous
+    # consumer of a shared government gateway.
+    intervalSeconds: 300
+    onStartup: true
+
+  health:
+    # Roughly 4x the worker heartbeat interval, so one dropped report is not an
+    # outage.
+    staleAfterSeconds: 45
+    heartbeatRetentionDays: 14
+
+  # Name of the Secret holding the gateway credentials. Created out of band:
+  #   kubectl create secret generic prahari-gateway --from-env-file=.env
+  # NEVER in this file, never in tfvars, never in a commit. Mounted into the
+  # registry Deployment only — no other service needs it.
+  gatewaySecret: prahari-gateway
 
 # --- services ----------------------------------------------------------------
 
+# `enabled` exists because the chart is written ahead of the services. A
+# Deployment for an image that has not been built yet leaves `make up --wait`
+# hanging on a pod that will never start, which reads as "the platform is
+# broken" rather than "Day 3 has not happened yet". Flip each one on with the
+# service it deploys.
 services:
   registry:
+    enabled: true
     replicas: 1
     port: 8000
     resources:
@@ -55,6 +104,7 @@ services:
       limits:   { cpu: "1",  memory: 1Gi }
 
   matchEngine:
+    enabled: true
     replicas: 1
     port: 8001
     grpcPort: 9001
@@ -63,6 +113,7 @@ services:
       limits:   { cpu: "2",  memory: 2Gi }
 
   correlation:
+    enabled: false
     replicas: 1
     port: 8002
     resources:
@@ -70,6 +121,7 @@ services:
       limits:   { cpu: "2",  memory: 2Gi }
 
   bff:
+    enabled: false
     replicas: 1
     port: 8080
     resources:
@@ -77,11 +129,33 @@ services:
       limits:   { cpu: "1",  memory: 1Gi }
 
   web:
+    enabled: false
     replicas: 1
     port: 3000
     resources:
       requests: { cpu: 100m, memory: 256Mi }
       limits:   { cpu: "1",  memory: 1Gi }
+
+# --- match engine: watchlist decisions ---------------------------------------
+
+matchEngine:
+  # Mounted read-only from a ConfigMap or PVC. The real watchlist is police
+  # data; what ships in data/watchlist/ is synthetic.
+  watchlistPath: /var/lib/prahari/watchlist
+
+  # Accuracy thresholds, deliberately values rather than constants: they are
+  # tuned against measured precision/recall, and a tuning change must not be a
+  # code change.
+  #
+  # minScore is the floor for surfacing anything at all. Set it too high and the
+  # system fails the live test silently — the plate was seen, scored 0.82, and
+  # nobody was told. Set it too low and the console fills with noise and gets
+  # ignored, which fails the same test more slowly.
+  minScore: 0.72
+  confirmScore: 0.90
+
+  # One alert per (camera, plate, bucket).
+  dedupBucketSeconds: 30
 
 # --- inference: the profile-sensitive service --------------------------------
 
@@ -96,6 +170,11 @@ inference:
   batchSize: 4                # batch ACROSS cameras, not within one
   motionGate: true
   gpu: false
+
+  # Matches PRAHARI_INGEST_HEARTBEAT_INTERVAL_S. The registry's staleAfterSeconds
+  # is derived from this — about 4x — so one dropped report does not read as an
+  # outage. Change one and the other must move with it.
+  heartbeatIntervalSeconds: 10
 
   resources:
     requests: { cpu: "1", memory: 2Gi }

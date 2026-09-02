@@ -2,12 +2,18 @@ version: v2
 managed:
   enabled: true
 plugins:
+  # Python stubs land inside the `prahari-proto` workspace package rather than a
+  # loose gen/ directory. Generated protobuf imports are absolute
+  # (`from prahari.v1 import common_pb2`), so the package root must literally
+  # contain `prahari/v1/` — which means the generated tree has to BE an
+  # installable package, not a directory some service adds to sys.path.
   - remote: buf.build/protocolbuffers/python
-    out: ../gen/python
+    out: ../packages/prahari-proto/src
   - remote: buf.build/protocolbuffers/pyi
-    out: ../gen/python
+    out: ../packages/prahari-proto/src
   - remote: buf.build/grpc/python
-    out: ../gen/python
+    out: ../packages/prahari-proto/src
+  # TypeScript stays in gen/, consumed directly by the Next.js build on Day 3.
   - remote: buf.build/bufbuild/es
     out: ../gen/ts
     opt:

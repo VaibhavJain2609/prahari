@@ -260,9 +260,7 @@ def _parse_entries(payload: Any) -> list[CameraEntry]:
                 payload = payload[key]
                 break
         else:
-            raise ValueError(
-                f"unrecognised catalogue envelope, top-level keys: {sorted(payload)}"
-            )
+            raise ValueError(f"unrecognised catalogue envelope, top-level keys: {sorted(payload)}")
     if not isinstance(payload, list):
         raise ValueError(f"expected a list of cameras, got {type(payload).__name__}")
     return [CameraEntry.parse(c) for c in payload]

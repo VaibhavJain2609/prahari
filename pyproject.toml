@@ -1,0 +1,61 @@
+# Workspace root. Not a package — it exists so `uv run pytest` resolves one
+# environment across every service, and so a change to the shared contract is
+# type-checked and tested against its consumers in the same command.
+[project]
+name = "prahari"
+version = "0.1.0"
+description = "PRAHARI — statewide CCTV integration and video analytics"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+# Add each service here as it comes up. A service missing from this list still
+# builds, but its tests do not run in `make test` — which is how a broken
+# service reaches demo day looking green.
+members = [
+    "packages/prahari-common",
+    "packages/prahari-proto",
+    "services/inference",
+    "services/match-engine",
+    "services/registry",
+]
+
+[tool.uv.sources]
+prahari-common = { workspace = true }
+prahari-proto = { workspace = true }
+prahari-inference = { workspace = true }
+prahari-match = { workspace = true }
+prahari-registry = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "prahari-common",
+    "prahari-proto",
+    "prahari-inference",
+    "prahari-match",
+    "prahari-registry",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+]
+
+[tool.pytest.ini_options]
+# `tests/` (workspace root) holds integration tests that span more than one
+# service -- e.g. the Day 2 gate, which drives inference's cascade over a
+# real gRPC socket into the match engine. Anything that fits inside one
+# service's own boundary still lives under that service's `tests/`.
+testpaths = ["packages", "services", "tests"]
+asyncio_mode = "auto"
+# Service .venv directories contain their own vendored copies of the test
+# suites; collecting them runs every test twice and reports phantom failures.
+norecursedirs = [".venv", ".git", "*.egg-info", "node_modules"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "TID"]

@@ -33,37 +33,59 @@ spec:
           imagePullPolicy: {{ .Values.global.pullPolicy }}
           env:
             {{- include "prahari.commonEnv" . | nindent 12 }}
-            - name: PRAHARI_MODEL
+            # PRAHARI_INGEST_* is the env_prefix of IngestSettings. The names
+            # must match the settings class exactly: a knob the chart sets and
+            # the code never reads is a profile switch that silently does not
+            # switch, which is worse than no knob at all.
+            - name: PRAHARI_INGEST_MAX_ACTIVE_CAMERAS
+              value: {{ .Values.inference.maxStreamsPerWorker | quote }}
+            # Never the native rate. Most CCTV frames are static.
+            - name: PRAHARI_INGEST_SAMPLE_FPS
+              value: {{ .Values.inference.samplingFps | quote }}
+            - name: PRAHARI_INGEST_REGISTRY_URL
+              value: "http://prahari-registry:{{ .Values.services.registry.port }}"
+            - name: PRAHARI_INGEST_HEARTBEAT_INTERVAL_S
+              value: {{ .Values.inference.heartbeatIntervalSeconds | quote }}
+            # PRAHARI_DETECT_* is read by the detector settings landing on Day 2.
+            # Set now so the profile switch is complete on the day the code
+            # arrives, rather than needing a chart change alongside it.
+            - name: PRAHARI_DETECT_MODEL
               value: {{ .Values.inference.model | quote }}
             # cpu | videotoolbox | nvdec — selected here, never sniffed at runtime.
-            - name: PRAHARI_DECODE_BACKEND
+            - name: PRAHARI_DETECT_DECODE_BACKEND
               value: {{ .Values.inference.decodeBackend | quote }}
-            # Never the native rate. Most CCTV frames are static.
-            - name: PRAHARI_SAMPLING_FPS
-              value: {{ .Values.inference.samplingFps | quote }}
-            - name: PRAHARI_MAX_STREAMS
-              value: {{ .Values.inference.maxStreamsPerWorker | quote }}
             # Batch ACROSS cameras, not within one — worth 3-5x over per-frame.
-            - name: PRAHARI_BATCH_SIZE
+            - name: PRAHARI_DETECT_BATCH_SIZE
               value: {{ .Values.inference.batchSize | quote }}
-            - name: PRAHARI_MOTION_GATE
+            - name: PRAHARI_DETECT_MOTION_GATE
               value: {{ .Values.inference.motionGate | quote }}
-            - name: PRAHARI_MATCH_ENGINE_GRPC
+            - name: PRAHARI_DETECT_MATCH_ENGINE_GRPC
               value: "prahari-match-engine:{{ .Values.services.matchEngine.grpcPort }}"
-            # All consumers fan out from MediaMTX; workers never connect to the
-            # government feed directly.
+            # Workers never connect to the government feed directly; the registry
+            # hands out MediaMTX fan-out URLs and these are the fallback bases.
             - name: PRAHARI_MEDIAMTX_RTSP
               value: "rtsp://prahari-mediamtx:{{ .Values.mediamtx.rtspPort }}"
             - name: PRAHARI_MEDIAMTX_HLS
               value: "http://prahari-mediamtx:{{ .Values.mediamtx.hlsPort }}"
           resources:
             {{- toYaml .Values.inference.resources | nindent 12 }}
-          readinessProbe:
-            httpGet:
-              path: /healthz
-              port: 8003
-            initialDelaySeconds: 10
-            periodSeconds: 10
+          # No HTTP probe: a worker serves no traffic and has no port to GET.
+          # The failure worth catching is the process alive with every pump
+          # thread dead, which an HTTP-less pod cannot express and a port probe
+          # against a closed port would report as a permanent outage.
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - >-
+                  test $(( $(date +%s) - $(stat -c %Y /tmp/prahari-worker-alive) ))
+                  -lt {{ mul .Values.inference.heartbeatIntervalSeconds 4 | int }}
+            # Generous: the first pass waits out one full heartbeat interval, and
+            # a restart loop on a healthy worker costs more than a late restart.
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
       {{- if .Values.inference.gpu }}
       # GPU profile only. k3d on macOS has no GPU passthrough, so the local
       # profile must remain genuinely CPU-viable.

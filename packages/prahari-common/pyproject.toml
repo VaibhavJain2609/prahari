@@ -1,0 +1,34 @@
+[project]
+name = "prahari-common"
+version = "0.1.0"
+description = "PRAHARI shared contract: gateway settings and the /api/ingest catalogue client"
+# Matches the inference service's pin so the workspace resolves a single
+# interpreter. Nothing here needs 3.12 specifically; see services/inference.
+requires-python = ">=3.12,<3.13"
+
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "ruff>=0.6"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/prahari_common"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "TID"]

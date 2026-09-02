@@ -1,6 +1,7 @@
 {{- $svcNames := dict "registry" "registry" "matchEngine" "match-engine" "correlation" "correlation" "bff" "bff" "web" "web" -}}
 {{- range $key, $cfg := .Values.services }}
 {{- $name := index $svcNames $key }}
+{{- if $cfg.enabled }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -34,11 +35,24 @@ spec:
             {{- end }}
           env:
             {{- include "prahari.commonEnv" $ | nindent 12 }}
+            {{- if eq $name "registry" }}
+            {{- include "prahari.registryEnv" $ | nindent 12 }}
+            {{- end }}
+            {{- if eq $name "match-engine" }}
+            {{- include "prahari.matchEngineEnv" $ | nindent 12 }}
+            {{- end }}
           resources:
             {{- toYaml $cfg.resources | nindent 12 }}
+          # Readiness and liveness are DIFFERENT endpoints on purpose.
+          #
+          # /readyz checks the database; /healthz does not. A liveness probe that
+          # fails when Postgres is unreachable restarts every pod during a
+          # database blip — turning a recoverable outage into a rolling restart
+          # that guarantees a longer one. Readiness is the probe that should
+          # notice: take the pod out of the Service, leave the process alone.
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: {{ $cfg.port }}
             initialDelaySeconds: 5
             periodSeconds: 10
@@ -48,6 +62,17 @@ spec:
               port: {{ $cfg.port }}
             initialDelaySeconds: 15
             periodSeconds: 20
+          startupProbe:
+            # The registry applies its own migrations on startup under an
+            # advisory lock. On a cold cluster that waits for Postgres to accept
+            # connections, which is comfortably longer than the liveness probe
+            # would allow — hence a startup probe rather than a larger
+            # initialDelaySeconds, which would also delay every later restart.
+            httpGet:
+              path: /healthz
+              port: {{ $cfg.port }}
+            periodSeconds: 5
+            failureThreshold: 24
 ---
 apiVersion: v1
 kind: Service
@@ -69,4 +94,5 @@ spec:
       port: {{ $cfg.grpcPort }}
       targetPort: {{ $cfg.grpcPort }}
     {{- end }}
+{{- end }}
 {{- end }}
