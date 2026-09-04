@@ -131,7 +131,7 @@ export default function CameraMap() {
 
     async function poll() {
       try {
-        const res = await fetch("/api/cameras/geojson", { cache: "no-store" });
+        const res = await fetch("/api/bff/cameras/geojson", { cache: "no-store" });
         if (!res.ok) throw new Error(`status ${res.status}`);
         const geojson = await res.json();
         if (cancelled) return;

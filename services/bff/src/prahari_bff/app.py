@@ -244,6 +244,30 @@ async def create_api_key(
     return ApiKeyCreated(**key.model_dump(), plaintext=plaintext)
 
 
+# --- orgs --------------------------------------------------------------------
+#
+# The console's board switch needs to know its own org's `kind`
+# (state | organization | local_body) and, for the org-admin screen, the
+# rest of its subtree — both are the registry's own `/api/v1/orgs`, scoped
+# here exactly like any other read. Creating a sub-org reuses
+# `_check_target_org` on `parent_id`: the same rule camera writes already
+# apply to `org_id` — default to the caller's own org, and anything given
+# explicitly must already be within the caller's own subtree.
+
+
+@app.get("/api/v1/orgs", tags=["orgs"])
+async def list_orgs(principal: PrincipalDep, registry: RegistryDep) -> list:
+    return _forward_json(await registry.get("/api/v1/orgs", {"scope": principal.org_path}))
+
+
+@app.post("/api/v1/orgs", status_code=status.HTTP_201_CREATED, tags=["orgs"])
+async def create_org(principal: AdminDep, registry: RegistryDep, request: Request) -> dict:
+    body = await request.json()
+    body["parent_id"] = await _check_target_org(request, principal, body.get("parent_id"))
+    response = await registry.post("/api/v1/orgs", json=body)
+    return _forward_json(response)
+
+
 # --- Stage 3 dependency accessors -------------------------------------------
 
 
