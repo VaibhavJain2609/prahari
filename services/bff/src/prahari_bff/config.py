@@ -47,6 +47,52 @@ class BFFSettings(BaseSettings):
     which is the local/dev default; every real profile's chart sets a real
     shared value."""
 
+    registry_timeout_s: float = 5.0
+
+    state_root_org_path: str = "gj"
+    """Used only for this service's own internal "which org owns camera X"
+    lookups (the camera-detail 403 boundary and the SSE alert filter) — never
+    as a caller's own request scope. Those two call sites need to see a
+    camera regardless of who is asking, in order to then decide whether the
+    *caller* may see it; querying the registry with the caller's own scope
+    would just turn every out-of-scope camera into an unconditional 404, and
+    the design explicitly wants 403 there instead. See docs/ORG-TIERS-DESIGN.
+    md §4.2's gate test: "Zone-4 user requests a camera outside their subtree
+    → 403"."""
+
+    camera_org_cache_ttl_s: float = 300.0
+    """How long a camera_id → org_path resolution is trusted before the BFF
+    asks the registry again. Org reassignment is rare; asking on every alert
+    on the SSE relay is not affordable."""
+
+    # --- correlation ---------------------------------------------------------
+
+    correlation_base_url: str = "http://prahari-correlation:8003"
+    correlation_timeout_s: float = 10.0
+    """Route reconstruction walks more rows than a camera lookup; the plate
+    export endpoint (the mandatory submission path) gets a longer budget."""
+
+    # --- audit -----------------------------------------------------------
+
+    audit_db_path: str = "audit.db"
+    """Append-only SQLite file for the hash-chained audit log — deliberately
+    not the shared Postgres (docs/ORG-TIERS-DESIGN.md §4, mirroring DAY3-
+    DESIGN.md §4.2's reasoning: single-writer, append-only, never joined).
+    Stage 6's Helm chart mounts a PVC here; the bare filename is the
+    local/dev default, resolved relative to the working directory."""
+
+    # --- alerts ------------------------------------------------------------
+
+    redis_url: str | None = None
+    """`None` means the SSE relay never starts a consumer and `/api/v1/alerts
+    /stream` reports 503 rather than hanging — the same "unset means honestly
+    off" convention `prahari_correlation.config` uses for its own Redis
+    setting."""
+
+    alert_stream_key: str = "prahari:alerts"
+    """Must match `MatchSettings.redis_stream_key` on the publishing side —
+    one bus, two ends, same key."""
+
     # --- bootstrap -----------------------------------------------------------
 
     bootstrap_admin_username: str | None = None

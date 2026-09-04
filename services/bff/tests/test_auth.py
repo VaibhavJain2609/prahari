@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-from prahari_bff.auth import get_principal, require_admin
+from prahari_bff.auth import get_principal, require_admin, require_purpose_code
 from prahari_bff.models import ApiKey, ApiKeyPurpose, Principal, Role, User
 
 SOME_USER = User(id="u1", username="ops.zone4", org_id="org-zone4", role=Role.OPERATOR)
@@ -140,3 +140,19 @@ def test_require_admin_rejects_non_admin_role():
     with pytest.raises(HTTPException) as exc:
         require_admin(principal)
     assert exc.value.status_code == 403
+
+
+def test_require_purpose_code_accepts_a_present_header():
+    assert require_purpose_code("case-2026-0417") == "case-2026-0417"
+
+
+def test_require_purpose_code_rejects_absent_header():
+    with pytest.raises(HTTPException) as exc:
+        require_purpose_code(None)
+    assert exc.value.status_code == 400
+
+
+def test_require_purpose_code_rejects_empty_header():
+    with pytest.raises(HTTPException) as exc:
+        require_purpose_code("")
+    assert exc.value.status_code == 400

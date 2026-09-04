@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, Header, HTTPException, Request, status
 
 from .models import Principal, Role
 from .repository import ApiKeyRepository, SessionRepository
@@ -70,3 +70,21 @@ def require_admin(principal: PrincipalDep) -> Principal:
 
 
 AdminDep = Annotated[Principal, Depends(require_admin)]
+
+
+def require_purpose_code(
+    x_purpose_code: str | None = Header(default=None, alias="X-Purpose-Code"),
+) -> str:
+    """Mandatory on every evidence-adjacent read — a route, a camera detail,
+    an export (docs/ORG-TIERS-DESIGN.md §4.2 / DAY3-DESIGN.md §4.2). Absent
+    is `400`, never a silently-assumed default: a purpose code that the
+    caller did not actually choose is not a purpose code, it is decoration on
+    an audit entry that looks accountable and is not. Camera *listing* and
+    the map/gaps views do not take this dependency — browsing the estate is
+    not evidence access."""
+    if not x_purpose_code:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "X-Purpose-Code header required")
+    return x_purpose_code
+
+
+PurposeCodeDep = Annotated[str, Depends(require_purpose_code)]
