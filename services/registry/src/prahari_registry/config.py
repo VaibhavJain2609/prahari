@@ -58,6 +58,23 @@ class RegistrySettings(BaseSettings):
     mediamtx_hls_port: int = 8888
     mediamtx_whep_port: int = 8889
 
+    # --- access ----------------------------------------------------------
+
+    internal_token: str = ""
+    """Required as `X-Internal-Token` on every `/api/*` request when set —
+    see docs/ORG-TIERS-DESIGN.md §3.3. This is what makes the BFF's org-scope
+    check meaningful rather than decorative: a scope predicate enforced only
+    at the BFF is worth nothing if the registry it fronts is still reachable
+    directly. Must match `BFFSettings.registry_internal_token` (and every
+    other internal caller's own copy) exactly.
+
+    Empty disables enforcement — the local/dev default, since k3d has no
+    ingress separating "browser-reachable" from "cluster-internal" the way a
+    real profile's NetworkPolicy does. Every real profile's chart sets a real
+    shared value; leaving it empty in the cloud profile would be the same
+    silent-no-op failure `CLAUDE.md`'s hard invariant on `PRAHARI_*` env
+    already warns about."""
+
     # --- health policy -------------------------------------------------------
 
     health_stale_after_s: int = 45

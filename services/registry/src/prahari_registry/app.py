@@ -131,6 +131,28 @@ app = FastAPI(
 )
 
 
+@app.middleware("http")
+async def require_internal_token(request: Request, call_next):
+    """Makes the registry cluster-internal-only once `internal_token` is set
+    — see `RegistrySettings.internal_token` and docs/ORG-TIERS-DESIGN.md §3.3.
+    Without this, the BFF's org-scope check is decorative: a browser (or
+    anything else) could simply call the registry directly and read the
+    whole estate unscoped.
+
+    `/healthz` and `/readyz` are exempt — a liveness/readiness probe carries
+    no data and must not depend on a secret being wired correctly to answer.
+    Everything else under `/api/*` (and, deliberately, everything not yet
+    under `/api/*`) requires the header when a token is configured.
+    """
+    settings: RegistrySettings = request.app.state.settings
+    if settings.internal_token and request.url.path not in ("/healthz", "/readyz"):
+        if request.headers.get("x-internal-token") != settings.internal_token:
+            return Response(
+                status_code=status.HTTP_401_UNAUTHORIZED, content="internal token required"
+            )
+    return await call_next(request)
+
+
 # --- dependencies ------------------------------------------------------------
 
 
