@@ -13,6 +13,8 @@ asked for.
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -485,6 +487,114 @@ async def probe_camera(
         action="probe",
     )
     return _forward_json(response)
+
+
+# --- cameras: bulk CSV import -------------------------------------------------
+#
+# Stage 4d. How a ward actually onboards 200 analog cameras behind DVRs —
+# one CSV, not 200 individual requests. Every row goes through the exact
+# same org-scope check and registry create call as `create_camera` above;
+# this is not a second, looser path. Row failures are collected rather than
+# aborting the batch, so one bad row does not cost the other 199.
+
+_IMPORT_STRING_FIELDS = (
+    "external_id",
+    "site_name",
+    "district",
+    "department",
+    "owner",
+    "org_id",
+    "camera_type",
+    "vendor",
+    "vms_platform",
+    "codec",
+    "rtsp_url",
+    "hls_url",
+    "whep_url",
+    "storage_location",
+    "stream_username",
+    "stream_password",
+)
+_IMPORT_INT_FIELDS = ("native_width", "native_height", "retention_days", "stale_after_s")
+_IMPORT_FLOAT_FIELDS = ("declared_fps",)
+
+
+def _row_to_camera_payload(row: dict[str, str]) -> dict:
+    payload: dict = {}
+    for field in _IMPORT_STRING_FIELDS:
+        value = (row.get(field) or "").strip()
+        if value:
+            payload[field] = value
+    for field in _IMPORT_INT_FIELDS:
+        value = (row.get(field) or "").strip()
+        if value:
+            payload[field] = int(value)
+    for field in _IMPORT_FLOAT_FIELDS:
+        value = (row.get(field) or "").strip()
+        if value:
+            payload[field] = float(value)
+    latitude = (row.get("latitude") or "").strip()
+    longitude = (row.get("longitude") or "").strip()
+    if latitude and longitude:
+        payload["location"] = {"latitude": float(latitude), "longitude": float(longitude)}
+    return payload
+
+
+@app.post("/api/v1/cameras/import", tags=["cameras"])
+async def import_cameras(
+    principal: OperatorDep, registry: RegistryDep, request: Request
+) -> dict:
+    raw = (await request.body()).decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(raw))
+    if not reader.fieldnames or "external_id" not in reader.fieldnames:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "CSV must have an external_id column")
+
+    results: list[dict] = []
+    for line_no, row in enumerate(reader, start=2):  # header occupies line 1
+        external_id = (row.get("external_id") or "").strip()
+        if not external_id:
+            results.append({"row": line_no, "ok": False, "error": "external_id is required"})
+            continue
+        try:
+            payload = _row_to_camera_payload(row)
+            payload["org_id"] = await _check_target_org(request, principal, payload.get("org_id"))
+            response = await registry.post("/api/v1/cameras", json=payload)
+        except HTTPException as exc:
+            results.append(
+                {"row": line_no, "external_id": external_id, "ok": False, "error": exc.detail}
+            )
+            continue
+        except (ValueError, KeyError) as exc:
+            results.append(
+                {"row": line_no, "external_id": external_id, "ok": False, "error": str(exc)}
+            )
+            continue
+
+        if response.status_code >= 400:
+            results.append(
+                {
+                    "row": line_no,
+                    "external_id": external_id,
+                    "ok": False,
+                    "error": _upstream_detail(response),
+                }
+            )
+        else:
+            results.append(
+                {
+                    "row": line_no,
+                    "external_id": external_id,
+                    "ok": True,
+                    "id": response.json().get("id"),
+                }
+            )
+
+    return {
+        "total": len(results),
+        "succeeded": sum(1 for r in results if r["ok"]),
+        "failed": sum(1 for r in results if not r["ok"]),
+        "rows": results,
+    }
 
 
 # --- routes: the mandatory path ----------------------------------------------
