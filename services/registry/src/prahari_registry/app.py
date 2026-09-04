@@ -26,6 +26,7 @@ from .mediamtx import MediaMTXClient
 from .models import (
     Camera,
     CameraCreate,
+    CameraProbeRequest,
     CameraUpdate,
     DarkZone,
     DistrictCoverage,
@@ -38,6 +39,7 @@ from .models import (
     OrgCreate,
     SyncResult,
 )
+from .probe import ProbeError, ProbeResult, SSRFBlockedError, probe_rtsp
 from .repository import CameraRepository, OrgRepository
 from .sync import CatalogueSync
 
@@ -369,6 +371,24 @@ async def create_camera(
         return await repo.create(payload)
     except CredentialKeyError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
+
+@app.post("/api/v1/cameras/probe", response_model=ProbeResult, tags=["cameras"])
+async def probe_camera(payload: CameraProbeRequest) -> ProbeResult:
+    """SSRF-hardened connectivity check — see `probe.py` for the guard. No
+    scope/role check here: this touches no camera or org data, it is a
+    bare network probe of a caller-supplied URL. The BFF proxy is where
+    operator role + purpose code are actually enforced, since this service
+    has no principal concept at all (by design — see the module docstring
+    on any of the camera write handlers below)."""
+    try:
+        return await probe_rtsp(
+            payload.rtsp_url, username=payload.username, password=payload.password
+        )
+    except SSRFBlockedError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except ProbeError as exc:
+        return ProbeResult(reachable=False, status_message=str(exc))
 
 
 @app.get("/api/v1/cameras/{camera_id}", response_model=Camera, tags=["cameras"])

@@ -461,6 +461,32 @@ async def decommission_camera(
     return _forward_json(response)
 
 
+@app.post("/api/v1/cameras/probe", tags=["cameras"])
+async def probe_camera(
+    principal: OperatorDep,
+    purpose_code: PurposeCodeDep,
+    registry: RegistryDep,
+    audit: AuditDep,
+    request: Request,
+) -> dict:
+    """Proxies to the registry's SSRF-hardened probe (Stage 4c). Gated and
+    audited here, not in the registry: this is a server-side fetch of an
+    operator-supplied URL, so it needs the same `operator`-plus-purpose-code
+    bar as any other camera write, even though it touches no stored camera or
+    org — the registry endpoint itself has no principal concept to enforce
+    that with."""
+    body = await request.json()
+    response = await registry.post("/api/v1/cameras/probe", json=body)
+    await audit.append(
+        actor=principal.subject,
+        org_path=principal.org_path,
+        purpose_code=purpose_code,
+        resource=f"camera-probe:{body.get('rtsp_url', '')}",
+        action="probe",
+    )
+    return _forward_json(response)
+
+
 # --- routes: the mandatory path ----------------------------------------------
 #
 # Deliberately NOT filtered by org scope, unlike everything above. A route is

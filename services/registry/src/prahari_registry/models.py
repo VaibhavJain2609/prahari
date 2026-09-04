@@ -276,6 +276,18 @@ class CameraUpdate(BaseModel):
     stale_after_s: int | None = None
 
 
+class CameraProbeRequest(BaseModel):
+    """Stage 4c — a connectivity check for an operator filling in the manual
+    registration form, before anything is saved. `rtsp_url` is required;
+    `username`/`password` are optional and used only for this one probe
+    request — they are never persisted here (registration, separately,
+    persists them encrypted via `CameraCreate.stream_password`)."""
+
+    rtsp_url: str
+    username: str | None = None
+    password: str | None = None
+
+
 class Heartbeat(BaseModel):
     """One health report from an ingest worker.
 
