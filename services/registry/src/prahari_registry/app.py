@@ -19,6 +19,7 @@ from pydantic import ValidationError
 
 from . import gaps
 from .config import RegistrySettings, registry_settings
+from .crypto import CredentialKeyError
 from .db import apply_migrations, create_pool, timescale_available
 from .health import HealthPolicy, derive_state
 from .mediamtx import MediaMTXClient
@@ -364,7 +365,10 @@ async def create_camera(
             status.HTTP_409_CONFLICT,
             f"camera {payload.source}/{payload.external_id} already registered as {existing.id}",
         )
-    return await repo.create(payload)
+    try:
+        return await repo.create(payload)
+    except CredentialKeyError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
 
 @app.get("/api/v1/cameras/{camera_id}", response_model=Camera, tags=["cameras"])
@@ -379,7 +383,10 @@ async def get_camera(camera_id: str, repo: RepoDep, scope: ScopeDep) -> Camera:
 async def update_camera(
     camera_id: str, payload: CameraUpdate, repo: RepoDep, scope: ScopeDep
 ) -> Camera:
-    camera = await repo.update(camera_id, payload, scope=scope)
+    try:
+        camera = await repo.update(camera_id, payload, scope=scope)
+    except CredentialKeyError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     if camera is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no camera {camera_id}")
     return camera

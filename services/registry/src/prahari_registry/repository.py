@@ -12,10 +12,12 @@ import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import asyncpg
 
 from .config import RegistrySettings
+from .crypto import decrypt_credential, encrypt_credential
 from .health import HealthVerdict
 from .mediamtx import fanout_endpoints
 from .models import (
@@ -44,6 +46,23 @@ def _point(location: GeoPoint | None) -> str | None:
     if location is None:
         return None
     return f"SRID=4326;POINT({location.longitude} {location.latitude})"
+
+
+def _with_credentials(url: str, username: str | None, password: str) -> str:
+    """Inject decrypted userinfo into an RTSP URL for the MediaMTX source
+    config — `rtsp://host:port/path` becomes `rtsp://user:pass@host:port/path`.
+    Any userinfo already on the URL is replaced, not merged, so a stored
+    credential is always the one actually used."""
+    parts = urlsplit(url)
+    # A password may itself contain `@` or `:` (an operator does not choose
+    # a DVR's factory-set credential); left unescaped, either character
+    # breaks netloc parsing and MediaMTX silently connects to the wrong
+    # host or fails auth. `safe=""` quotes both.
+    userinfo = f"{quote(username or '', safe='')}:{quote(password, safe='')}"
+    netloc = f"{userinfo}@{parts.hostname or ''}"
+    if parts.port is not None:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def camera_from_row(row: asyncpg.Record, settings: RegistrySettings) -> Camera:
@@ -277,22 +296,27 @@ class CameraRepository:
 
     async def create(self, payload: CameraCreate) -> Camera:
         org_id, org_path = await self._resolve_org(payload.org_id)
+        stream_secret = (
+            encrypt_credential(payload.stream_password, self._s.credential_key)
+            if payload.stream_password is not None
+            else None
+        )
         row = await self._pool.fetchrow(
             """
             INSERT INTO cameras (
                 source, external_id, location, site_name, district, department, owner,
-                org_id, adapter,
+                org_id, adapter, stream_username, stream_secret,
                 camera_type, vendor, vms_platform, codec, native_width, native_height,
                 declared_fps, rtsp_url, hls_url, whep_url,
                 storage_location, retention_days, commissioned_at, amc_expires_at,
                 stale_after_s, present_in_catalogue
             ) VALUES (
                 $1, $2, $3::geography, $4, $5, $6, $7,
-                $8::uuid, $9,
-                $10, $11, $12, $13, $14, $15,
-                $16, $17, $18, $19,
-                $20, $21, $22, $23,
-                COALESCE($24::integer, $25::integer), false
+                $8::uuid, $9, $10, $11,
+                $12, $13, $14, $15, $16, $17,
+                $18, $19, $20, $21,
+                $22, $23, $24, $25,
+                COALESCE($26::integer, $27::integer), false
             )
             RETURNING id
             """,
@@ -305,6 +329,8 @@ class CameraRepository:
             payload.owner,
             org_id,
             payload.adapter,
+            payload.stream_username,
+            stream_secret,
             payload.camera_type.value,
             payload.vendor,
             payload.vms_platform,
@@ -346,6 +372,12 @@ class CameraRepository:
             elif key in {"camera_type", "lifecycle"}:
                 args.append(value.value if hasattr(value, "value") else value)
                 sets.append(f"{key} = ${len(args)}")
+            elif key == "stream_password":
+                # No 1:1 column: the plaintext field name intentionally
+                # differs from `stream_secret` so nothing outside this
+                # branch can accidentally write a credential unencrypted.
+                args.append(encrypt_credential(value, self._s.credential_key))
+                sets.append(f"stream_secret = ${len(args)}")
             else:
                 args.append(value)
                 sets.append(f"{key} = ${len(args)}")
@@ -659,14 +691,27 @@ class CameraRepository:
         confirm live status in `/api/ingest` before reporting a camera down, and
         the corollary is that configuring a pull against a known-dead feed only
         buys reconnect noise.
+
+        A locally-registered camera's credential is decrypted here and only
+        here: this is the one place the raw upstream URL is assembled, and it
+        goes to the MediaMTX API, never back out to an HTTP caller —
+        `fanout_endpoints()` in `mediamtx.py` hands callers only the
+        MediaMTX-fronted public URL, never this one.
         """
         rows = await self._pool.fetch(
             """
-            SELECT id, rtsp_url FROM cameras
+            SELECT id, rtsp_url, stream_username, stream_secret FROM cameras
             WHERE lifecycle = 'active' AND catalogue_live AND rtsp_url IS NOT NULL
             """
         )
-        return {f"cam-{row['id']}": row["rtsp_url"] for row in rows}
+        paths: dict[str, str] = {}
+        for row in rows:
+            url = row["rtsp_url"]
+            if row["stream_secret"] is not None:
+                password = decrypt_credential(bytes(row["stream_secret"]), self._s.credential_key)
+                url = _with_credentials(url, row["stream_username"], password)
+            paths[f"cam-{row['id']}"] = url
+        return paths
 
 
 def _org_from_row(row: asyncpg.Record) -> Org:

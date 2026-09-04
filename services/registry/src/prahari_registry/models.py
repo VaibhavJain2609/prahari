@@ -215,6 +215,14 @@ class CameraCreate(BaseModel):
     same way an operator is never trusted to type their own scope."""
     adapter: str = "manual"
 
+    stream_username: str | None = None
+    stream_password: str | None = None
+    """Credentials for `rtsp_url`, when the DVR/NVR requires auth. Encrypted
+    (AES-GCM, `crypto.py`) into `cameras.stream_secret` on write; never
+    stored or echoed as plaintext, and absent from every response model —
+    `Camera` has no field for either. Decrypted only server-side, when
+    building the upstream URL MediaMTX pulls from."""
+
     camera_type: CameraType = CameraType.UNSPECIFIED
     vendor: str | None = None
     vms_platform: str | None = None
@@ -250,6 +258,13 @@ class CameraUpdate(BaseModel):
     """Reassignment — e.g. a local body claiming a camera the catalogue sync
     placed at the state root. Like every other field here, sent only when
     changing it; omitted means untouched."""
+    stream_username: str | None = None
+    stream_password: str | None = None
+    """Same handling as `CameraCreate.stream_password` — encrypted into
+    `stream_secret` on write, never read back. Sending `stream_username`
+    without `stream_password` (or vice versa) updates only the field sent;
+    the repository does not require them together, since rotating just the
+    password is the common case."""
     camera_type: CameraType | None = None
     vendor: str | None = None
     vms_platform: str | None = None

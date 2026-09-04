@@ -75,6 +75,14 @@ class RegistrySettings(BaseSettings):
     silent-no-op failure `CLAUDE.md`'s hard invariant on `PRAHARI_*` env
     already warns about."""
 
+    credential_key: str = ""
+    """32-byte AES-256 key, urlsafe-base64-encoded, for `cameras.stream_secret`
+    (see `crypto.py`). Empty by default — only raises (`CredentialKeyError`)
+    the moment a locally-registered camera's credential is actually written
+    or read, never at settings-parse time, so a deployment with no analog
+    cameras carrying credentials never needs this configured. Every real
+    profile that onboards analog/DVR cameras must set a real value."""
+
     # --- health policy -------------------------------------------------------
 
     health_stale_after_s: int = 45
