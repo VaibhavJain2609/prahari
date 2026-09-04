@@ -34,5 +34,14 @@ class RegistryClient:
     async def get(self, path: str, params: dict | None = None) -> httpx.Response:
         return await self._client.get(path, params=params)
 
+    async def post(self, path: str, json: dict | None = None) -> httpx.Response:
+        return await self._client.post(path, json=json)
+
+    async def patch(self, path: str, json: dict | None = None) -> httpx.Response:
+        return await self._client.patch(path, json=json)
+
+    async def delete(self, path: str) -> httpx.Response:
+        return await self._client.delete(path)
+
     async def aclose(self) -> None:
         await self._client.aclose()

@@ -26,7 +26,7 @@ from prahari.v1 import events_pb2
 from prahari_common.bus import RedisStreamConsumer
 
 from .audit import AuditLog
-from .auth import AdminDep, PrincipalDep, PurposeCodeDep
+from .auth import AdminDep, OperatorDep, PrincipalDep, PurposeCodeDep
 from .config import BFFSettings, bff_settings
 from .correlation_client import CorrelationClient
 from .db import create_pool
@@ -379,6 +379,85 @@ async def get_camera(
         resource=f"camera:{camera_id}",
         action="read",
     )
+    return _forward_json(response)
+
+
+# --- cameras: registration, edit, decommission -------------------------------
+#
+# Stage 4b. The registry's own create/update/decommission handlers have no
+# principal concept at all (services/registry/src/prahari_registry/app.py) —
+# they take org_id/scope from the payload at face value. So org-scoping for
+# camera writes lives here, mirroring create_user/create_api_key above: an
+# operator may only write cameras at or below their own org, and a reassign
+# (org_id in the body) is itself checked against the caller's subtree, not
+# just the camera's current org.
+
+
+async def _check_target_org(
+    request: Request, principal: Principal, org_id: str | None
+) -> str:
+    """Resolve `org_id` (or the caller's own org, when the body omits one) to
+    a path, and 403 if it falls outside the caller's own subtree. Shared by
+    create (where a missing org_id must default to the caller's own org, not
+    to no scope check at all) and update (where org_id is an optional
+    reassignment)."""
+    if org_id is None:
+        return principal.org_id
+    target_path = await org_path_for_id(request.app.state.pool, org_id)
+    if target_path is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no org {org_id}")
+    if not in_scope(target_path, principal.org_path):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "org is outside your own org subtree")
+    return org_id
+
+
+@app.post(
+    "/api/v1/cameras",
+    status_code=status.HTTP_201_CREATED,
+    tags=["cameras"],
+)
+async def create_camera(
+    principal: OperatorDep, registry: RegistryDep, request: Request
+) -> dict:
+    body = await request.json()
+    body["org_id"] = await _check_target_org(request, principal, body.get("org_id"))
+    response = await registry.post("/api/v1/cameras", json=body)
+    return _forward_json(response)
+
+
+@app.patch("/api/v1/cameras/{camera_id}", tags=["cameras"])
+async def update_camera(
+    camera_id: str,
+    principal: OperatorDep,
+    registry: RegistryDep,
+    scope_resolver: ScopeResolverDep,
+    request: Request,
+) -> dict:
+    org_path = await scope_resolver.org_path_for_camera(camera_id)
+    if org_path is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no camera {camera_id}")
+    if not in_scope(org_path, principal.org_path):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "camera is outside your org subtree")
+    body = await request.json()
+    if "org_id" in body:
+        body["org_id"] = await _check_target_org(request, principal, body["org_id"])
+    response = await registry.patch(f"/api/v1/cameras/{camera_id}", json=body)
+    return _forward_json(response)
+
+
+@app.delete("/api/v1/cameras/{camera_id}", tags=["cameras"])
+async def decommission_camera(
+    camera_id: str,
+    principal: OperatorDep,
+    registry: RegistryDep,
+    scope_resolver: ScopeResolverDep,
+) -> dict:
+    org_path = await scope_resolver.org_path_for_camera(camera_id)
+    if org_path is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no camera {camera_id}")
+    if not in_scope(org_path, principal.org_path):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "camera is outside your org subtree")
+    response = await registry.delete(f"/api/v1/cameras/{camera_id}")
     return _forward_json(response)
 
 

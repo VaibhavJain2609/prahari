@@ -72,6 +72,19 @@ def require_admin(principal: PrincipalDep) -> Principal:
 AdminDep = Annotated[Principal, Depends(require_admin)]
 
 
+def require_operator(principal: PrincipalDep) -> Principal:
+    """Route-level gate for camera registration/edit/decommission. `operator`
+    and `admin` both qualify — role is a floor, not an exact match, since
+    `Role` is ordered viewer < operator < admin and admin is a strict
+    superset of what operator can do."""
+    if principal.role not in (Role.OPERATOR, Role.ADMIN):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "operator role required")
+    return principal
+
+
+OperatorDep = Annotated[Principal, Depends(require_operator)]
+
+
 def require_purpose_code(
     x_purpose_code: str | None = Header(default=None, alias="X-Purpose-Code"),
 ) -> str:

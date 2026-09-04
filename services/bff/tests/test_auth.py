@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-from prahari_bff.auth import get_principal, require_admin, require_purpose_code
+from prahari_bff.auth import get_principal, require_admin, require_operator, require_purpose_code
 from prahari_bff.models import ApiKey, ApiKeyPurpose, Principal, Role, User
 
 SOME_USER = User(id="u1", username="ops.zone4", org_id="org-zone4", role=Role.OPERATOR)
@@ -139,6 +139,39 @@ def test_require_admin_rejects_non_admin_role():
     )
     with pytest.raises(HTTPException) as exc:
         require_admin(principal)
+    assert exc.value.status_code == 403
+
+
+def test_require_operator_allows_operator_role():
+    principal = Principal(
+        id="u1",
+        subject="ops",
+        org_id="org-zone4",
+        org_path="gj.ahmedabad_city.zone_4",
+        role=Role.OPERATOR,
+        kind="session",
+    )
+    assert require_operator(principal) is principal
+
+
+def test_require_operator_allows_admin_role_too():
+    principal = Principal(
+        id="u1", subject="root", org_id="org-root", org_path="gj", role=Role.ADMIN, kind="session"
+    )
+    assert require_operator(principal) is principal
+
+
+def test_require_operator_rejects_viewer_role():
+    principal = Principal(
+        id="u2",
+        subject="viewer",
+        org_id="org-root",
+        org_path="gj",
+        role=Role.VIEWER,
+        kind="session",
+    )
+    with pytest.raises(HTTPException) as exc:
+        require_operator(principal)
     assert exc.value.status_code == 403
 
 
