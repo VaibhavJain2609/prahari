@@ -33,9 +33,11 @@ from .models import (
     HeartbeatAck,
     Lifecycle,
     NearestCamera,
+    Org,
+    OrgCreate,
     SyncResult,
 )
-from .repository import CameraRepository
+from .repository import CameraRepository, OrgRepository
 from .sync import CatalogueSync
 
 log = logging.getLogger(__name__)
@@ -96,6 +98,7 @@ async def lifespan(app: FastAPI):
         )
 
     repo = CameraRepository(pool, settings)
+    org_repo = OrgRepository(pool)
     gateway = _gateway_settings_or_none()
     mediamtx = MediaMTXClient(settings)
     sync = CatalogueSync(
@@ -105,6 +108,7 @@ async def lifespan(app: FastAPI):
     app.state.pool = pool
     app.state.settings = settings
     app.state.repo = repo
+    app.state.org_repo = org_repo
     app.state.sync = sync
     app.state.mediamtx = mediamtx
     app.state.gateway_configured = gateway is not None
@@ -134,6 +138,10 @@ def get_repo(request: Request) -> CameraRepository:
     return request.app.state.repo
 
 
+def get_org_repo(request: Request) -> OrgRepository:
+    return request.app.state.org_repo
+
+
 def get_pool(request: Request) -> asyncpg.Pool:
     return request.app.state.pool
 
@@ -147,9 +155,40 @@ def get_sync(request: Request) -> CatalogueSync:
 
 
 RepoDep = Annotated[CameraRepository, Depends(get_repo)]
+OrgRepoDep = Annotated[OrgRepository, Depends(get_org_repo)]
 PoolDep = Annotated[asyncpg.Pool, Depends(get_pool)]
 SettingsDep = Annotated[RegistrySettings, Depends(get_settings)]
 SyncDep = Annotated[CatalogueSync, Depends(get_sync)]
+
+
+def get_scope(
+    request: Request,
+    org_scope: str | None = Query(
+        None,
+        description="ltree org path to scope this read/write to. "
+        "Provisional: Stage 2 replaces this with the caller's own org, "
+        "resolved from their session or API key, so a client cannot simply "
+        "widen its own scope by editing a query parameter.",
+    ),
+) -> str:
+    """Where scope comes from until there is a `Principal`.
+
+    Every repository/gaps call now *requires* a scope argument — that
+    invariant is real starting today. What is provisional is only where the
+    value comes from: an unauthenticated query parameter, defaulting to the
+    state root, rather than a verified identity. Stage 2 (BFF) swaps this
+    dependency for one that reads a session or API key and ignores anything
+    the client claims about its own scope. Nothing downstream changes when
+    that happens — `list`, `get`, `district_coverage` etc. take the same
+    `scope: str` either way.
+    """
+    if org_scope:
+        return org_scope
+    settings: RegistrySettings = request.app.state.settings
+    return settings.sync_default_org_path
+
+
+ScopeDep = Annotated[str, Depends(get_scope)]
 
 
 def _parse_bbox(bbox: str | None) -> tuple[float, float, float, float] | None:
@@ -196,12 +235,38 @@ async def readyz(pool: PoolDep, response: Response) -> dict:
     return {"status": "ready", "database": "ok"}
 
 
+# --- orgs ----------------------------------------------------------------
+
+
+@app.post("/api/v1/orgs", response_model=Org, status_code=status.HTTP_201_CREATED, tags=["orgs"])
+async def create_org(payload: OrgCreate, org_repo: OrgRepoDep) -> Org:
+    try:
+        return await org_repo.create(payload)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+
+@app.get("/api/v1/orgs", response_model=list[Org], tags=["orgs"])
+async def list_orgs(org_repo: OrgRepoDep, scope: ScopeDep) -> list[Org]:
+    """Every org at or below `scope` — the org-admin screen's tree."""
+    return await org_repo.list_subtree(scope)
+
+
+@app.get("/api/v1/orgs/{org_id}", response_model=Org, tags=["orgs"])
+async def get_org(org_id: str, org_repo: OrgRepoDep) -> Org:
+    org = await org_repo.get(org_id)
+    if org is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no org {org_id}")
+    return org
+
+
 # --- cameras -----------------------------------------------------------------
 
 
 @app.get("/api/v1/cameras", response_model=list[Camera], tags=["cameras"])
 async def list_cameras(
     repo: RepoDep,
+    scope: ScopeDep,
     district: str | None = None,
     department: str | None = None,
     state: HealthState | None = None,
@@ -212,6 +277,7 @@ async def list_cameras(
     offset: int = Query(0, ge=0),
 ) -> list[Camera]:
     return await repo.list(
+        scope=scope,
         district=district,
         department=department,
         state=state,
@@ -224,13 +290,13 @@ async def list_cameras(
 
 
 @app.get("/api/v1/cameras/summary", tags=["cameras"])
-async def camera_summary(repo: RepoDep) -> dict:
+async def camera_summary(repo: RepoDep, scope: ScopeDep) -> dict:
     """Headline counts for the console's status bar."""
     return {
-        "active": await repo.count(lifecycle=Lifecycle.ACTIVE),
-        "absent": await repo.count(lifecycle=Lifecycle.ABSENT),
-        "decommissioned": await repo.count(lifecycle=Lifecycle.DECOMMISSIONED),
-        "health": await repo.health_summary(),
+        "active": await repo.count(scope=scope, lifecycle=Lifecycle.ACTIVE),
+        "absent": await repo.count(scope=scope, lifecycle=Lifecycle.ABSENT),
+        "decommissioned": await repo.count(scope=scope, lifecycle=Lifecycle.DECOMMISSIONED),
+        "health": await repo.health_summary(scope=scope),
     }
 
 
@@ -239,10 +305,11 @@ async def camera_summary(repo: RepoDep) -> dict:
 @app.get("/api/v1/cameras/geojson", tags=["cameras"])
 async def cameras_geojson(
     pool: PoolDep,
+    scope: ScopeDep,
     bbox: str | None = Query(None, description="min_lon,min_lat,max_lon,max_lat"),
     limit: int = Query(20_000, ge=1, le=100_000),
 ) -> dict:
-    return await gaps.cameras_geojson(pool, bbox=_parse_bbox(bbox), limit=limit)
+    return await gaps.cameras_geojson(pool, scope=scope, bbox=_parse_bbox(bbox), limit=limit)
 
 
 @app.post(
@@ -251,7 +318,9 @@ async def cameras_geojson(
     status_code=status.HTTP_201_CREATED,
     tags=["cameras"],
 )
-async def create_camera(payload: CameraCreate, repo: RepoDep) -> Camera:
+async def create_camera(
+    payload: CameraCreate, repo: RepoDep, org_repo: OrgRepoDep, settings: SettingsDep
+) -> Camera:
     """Register a camera by hand.
 
     Reference Model 2 (direct connect) and the large analog estate behind DVRs
@@ -259,7 +328,15 @@ async def create_camera(payload: CameraCreate, repo: RepoDep) -> Camera:
     downstream, which is what "vendor-neutral registry" has to mean to be worth
     claiming.
     """
-    existing = await repo.get_by_external(payload.source, payload.external_id)
+    if payload.org_id is not None:
+        target_org = await org_repo.get(payload.org_id)
+        if target_org is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"no org {payload.org_id}")
+        target_scope = target_org.path
+    else:
+        target_scope = settings.sync_default_org_path
+
+    existing = await repo.get_by_external(payload.source, payload.external_id, scope=target_scope)
     if existing is not None:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -269,26 +346,28 @@ async def create_camera(payload: CameraCreate, repo: RepoDep) -> Camera:
 
 
 @app.get("/api/v1/cameras/{camera_id}", response_model=Camera, tags=["cameras"])
-async def get_camera(camera_id: str, repo: RepoDep) -> Camera:
-    camera = await repo.get(camera_id)
+async def get_camera(camera_id: str, repo: RepoDep, scope: ScopeDep) -> Camera:
+    camera = await repo.get(camera_id, scope=scope)
     if camera is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no camera {camera_id}")
     return camera
 
 
 @app.patch("/api/v1/cameras/{camera_id}", response_model=Camera, tags=["cameras"])
-async def update_camera(camera_id: str, payload: CameraUpdate, repo: RepoDep) -> Camera:
-    camera = await repo.update(camera_id, payload)
+async def update_camera(
+    camera_id: str, payload: CameraUpdate, repo: RepoDep, scope: ScopeDep
+) -> Camera:
+    camera = await repo.update(camera_id, payload, scope=scope)
     if camera is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no camera {camera_id}")
     return camera
 
 
 @app.delete("/api/v1/cameras/{camera_id}", response_model=Camera, tags=["cameras"])
-async def decommission_camera(camera_id: str, repo: RepoDep) -> Camera:
+async def decommission_camera(camera_id: str, repo: RepoDep, scope: ScopeDep) -> Camera:
     """Retire a camera. This is a soft delete and always will be: its detections
     are evidence, and evidence pointing at a deleted camera cannot be defended."""
-    camera = await repo.decommission(camera_id)
+    camera = await repo.decommission(camera_id, scope=scope)
     if camera is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no camera {camera_id}")
     return camera
@@ -299,7 +378,7 @@ async def decommission_camera(camera_id: str, repo: RepoDep) -> Camera:
 
 @app.post("/api/v1/cameras/{camera_id}/heartbeat", response_model=HeartbeatAck, tags=["health"])
 async def post_heartbeat(
-    camera_id: str, heartbeat: Heartbeat, repo: RepoDep, settings: SettingsDep
+    camera_id: str, heartbeat: Heartbeat, repo: RepoDep, settings: SettingsDep, scope: ScopeDep
 ) -> HeartbeatAck:
     """Accept one health report from an ingest worker.
 
@@ -312,7 +391,7 @@ async def post_heartbeat(
     10 s is ~8k writes/s). At demo scale HTTP is honest and debuggable, and the
     protobuf message is already defined for the day it moves.
     """
-    camera = await repo.get(camera_id)
+    camera = await repo.get(camera_id, scope=scope)
     if camera is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no camera {camera_id}")
 
@@ -389,13 +468,16 @@ async def reconcile_streams(repo: RepoDep, request: Request) -> dict:
 
 
 @app.get("/api/v1/gaps/districts", response_model=list[DistrictCoverage], tags=["gaps"])
-async def district_coverage(pool: PoolDep) -> list[DistrictCoverage]:
-    return await gaps.district_coverage(pool)
+async def district_coverage(pool: PoolDep, scope: ScopeDep) -> list[DistrictCoverage]:
+    return await gaps.district_coverage(pool, scope=scope)
 
 
 @app.get("/api/v1/gaps/dark-zones", response_model=list[DarkZone], tags=["gaps"])
 async def dark_zones(
-    pool: PoolDep, settings: SettingsDep, radius_m: float | None = Query(None, gt=0)
+    pool: PoolDep,
+    settings: SettingsDep,
+    scope: ScopeDep,
+    radius_m: float | None = Query(None, gt=0),
 ) -> list[DarkZone]:
     """Cameras that are down with no healthy camera nearby.
 
@@ -403,17 +485,19 @@ async def dark_zones(
     hundred metres in a city centre, several kilometres on a highway corridor
     where cameras are sparse by design and a gap is not a fault.
     """
-    return await gaps.dark_zones(pool, radius_m=radius_m or settings.gap_dark_zone_radius_m)
+    radius = radius_m or settings.gap_dark_zone_radius_m
+    return await gaps.dark_zones(pool, scope=scope, radius_m=radius)
 
 
 @app.get("/api/v1/gaps/nearest", response_model=list[NearestCamera], tags=["gaps"])
 async def nearest(
     pool: PoolDep,
+    scope: ScopeDep,
     lat: float = Query(..., ge=-90, le=90),
     lon: float = Query(..., ge=-180, le=180),
     limit: int = Query(5, ge=1, le=50),
     healthy_only: bool = True,
 ) -> list[NearestCamera]:
     return await gaps.nearest_cameras(
-        pool, latitude=lat, longitude=lon, limit=limit, healthy_only=healthy_only
+        pool, scope=scope, latitude=lat, longitude=lon, limit=limit, healthy_only=healthy_only
     )

@@ -71,6 +71,13 @@ class FakeRepo:
     async def start_sync_run(self, source: str) -> int:
         return 1
 
+    async def org_id_for_path(self, path: str) -> str | None:
+        """Stands in for the seeded `gj` root (migrations/005_orgs.sql). Every
+        sync pass resolves this once before the per-camera loop; a repo with
+        no orgs at all would make `run_once` raise, which is exactly what
+        should happen against a real database missing its seed row."""
+        return f"org-{path}"
+
     async def finish_sync_run(self, run_id: int, result: SyncResult) -> None:
         self.runs.append(result)
 
@@ -193,6 +200,31 @@ async def test_resolution_string_is_parsed_into_dimensions(snapshot: Catalogue):
     by_id = {u["external_id"]: u for u in repo.upserts}
     assert (by_id["101"]["native_width"], by_id["101"]["native_height"]) == (1920, 1080)
     assert (by_id["102"]["native_width"], by_id["102"]["native_height"]) == (2560, 1440)
+
+
+async def test_synced_cameras_land_in_the_configured_default_org(snapshot: Catalogue):
+    """Every camera this pass inserts carries the resolved default org id, so a
+    fresh sync onto an empty registry does not leave `org_id` for the caller
+    to guess at."""
+    repo = FakeRepo()
+    await make_sync(repo).run_once(snapshot)
+    assert all(u["default_org_id"] == "org-gj" for u in repo.upserts)
+
+
+async def test_missing_default_org_fails_the_run_without_raising(snapshot: Catalogue):
+    """A registry whose seed row (migrations/005_orgs.sql) was somehow removed
+    must fail the pass loudly rather than upsert cameras into nowhere."""
+
+    class NoOrgRepo(FakeRepo):
+        async def org_id_for_path(self, path: str) -> str | None:
+            return None
+
+    repo = NoOrgRepo()
+    result = await make_sync(repo).run_once(snapshot)
+
+    assert not result.ok
+    assert "sync_default_org_path" in result.error
+    assert repo.upserts == []
 
 
 async def test_a_missing_gateway_fails_the_run_without_raising():

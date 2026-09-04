@@ -89,6 +89,18 @@ class CatalogueSync:
             result.codec_mix = catalogue.codec_mix()
             seen_ids: list[str] = []
 
+            # Resolved once per pass, not per camera: every camera this sync
+            # inserts lands at the same default org (see
+            # RegistrySettings.sync_default_org_path). A camera already
+            # claimed by a local body is untouched — upsert_from_catalogue
+            # writes org_id on INSERT only.
+            default_org_id = await self._repo.org_id_for_path(self._s.sync_default_org_path)
+            if default_org_id is None:
+                raise RuntimeError(
+                    f"sync_default_org_path {self._s.sync_default_org_path!r} does not "
+                    "exist — was migration 005's seed row removed?"
+                )
+
             async with self._pool.acquire() as conn, conn.transaction():
                 for entry in catalogue.cameras:
                     location = (
@@ -117,6 +129,7 @@ class CatalogueSync:
                         catalogue_live=entry.live,
                         raw=entry.raw,
                         seen_at=started,
+                        default_org_id=default_org_id,
                     )
                     seen_ids.append(camera_id)
                     if inserted:

@@ -60,6 +60,41 @@ PROTO_CAMERA_TYPE = {
 }
 
 
+class OrgKind(StrEnum):
+    STATE = "state"
+    ORGANIZATION = "organization"
+    LOCAL_BODY = "local_body"
+    """A label on the node, not a structural constraint — the tree is
+    arbitrary-depth, and nothing stops a `local_body` from parenting another
+    `local_body`. `kind` is for the console to pick a board, not for the
+    scope predicate, which only ever looks at `path`."""
+
+
+class Org(BaseModel):
+    id: str
+    parent_id: str | None = None
+    path: str
+    """Dotted ltree label, e.g. `gj.ahmedabad_city.zone_4`. A camera or a user
+    is in scope for a principal at path P iff its own org's path is `<@ P`
+    (P and everything under it)."""
+    kind: OrgKind
+    name: str
+    created_at: datetime | None = None
+
+
+class OrgCreate(BaseModel):
+    parent_id: str | None = None
+    """None only for the root — the seeded state node already exists, so in
+    practice this is always set. Enforced at the repository, not here: a
+    Pydantic model has no query access to check the parent exists."""
+    label: str = Field(pattern=r"^[a-z0-9_]+$")
+    """One ltree segment, appended to the parent's path. Lowercase and
+    underscores only — ltree's own label alphabet — so a label round-trips
+    through `path <@` without escaping."""
+    kind: OrgKind
+    name: str
+
+
 class GeoPoint(BaseModel):
     latitude: float = Field(ge=-90.0, le=90.0)
     longitude: float = Field(ge=-180.0, le=180.0)
@@ -120,6 +155,15 @@ class Camera(BaseModel):
     department: str | None = None
     owner: str | None = None
 
+    org_id: str | None = None
+    """The org-tree scope this camera is visible under. Nullable only in the
+    type — the column is NOT NULL from migration 005 onward, so this is None
+    solely as defensive typing against a row the model has not yet learned
+    every field of, never as an observed state."""
+    adapter: str = "manual"
+    """Which `CameraAdapterService` implementation fronts this camera:
+    gateway | rtsp-direct | onvif | manual. See proto/prahari/v1/adapter.proto."""
+
     camera_type: CameraType = CameraType.UNSPECIFIED
     vendor: str | None = None
     vms_platform: str | None = None
@@ -163,6 +207,14 @@ class CameraCreate(BaseModel):
     department: str | None = None
     owner: str | None = None
 
+    org_id: str | None = None
+    """Which org this camera belongs to. Left optional here because Stage 1
+    has no principal yet to force it from — the repository falls back to
+    `RegistrySettings.sync_default_org_path`. Stage 2 (BFF) makes this
+    non-optional in practice by always supplying the caller's own org_id, the
+    same way an operator is never trusted to type their own scope."""
+    adapter: str = "manual"
+
     camera_type: CameraType = CameraType.UNSPECIFIED
     vendor: str | None = None
     vms_platform: str | None = None
@@ -194,6 +246,10 @@ class CameraUpdate(BaseModel):
     district: str | None = None
     department: str | None = None
     owner: str | None = None
+    org_id: str | None = None
+    """Reassignment — e.g. a local body claiming a camera the catalogue sync
+    placed at the state root. Like every other field here, sent only when
+    changing it; omitted means untouched."""
     camera_type: CameraType | None = None
     vendor: str | None = None
     vms_platform: str | None = None

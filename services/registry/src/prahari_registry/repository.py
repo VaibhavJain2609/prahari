@@ -28,6 +28,9 @@ from .models import (
     HealthState,
     Heartbeat,
     Lifecycle,
+    Org,
+    OrgCreate,
+    OrgKind,
     StreamEndpoints,
     SyncResult,
 )
@@ -69,6 +72,8 @@ def camera_from_row(row: asyncpg.Record, settings: RegistrySettings) -> Camera:
         district=row["district"],
         department=row["department"],
         owner=row["owner"],
+        org_id=str(row["org_id"]) if row["org_id"] is not None else None,
+        adapter=row["adapter"],
         camera_type=CameraType(row["camera_type"]),
         vendor=row["vendor"],
         vms_platform=row["vms_platform"],
@@ -108,24 +113,49 @@ class CameraRepository:
         self._s = settings
 
     # --- reads ---------------------------------------------------------------
+    #
+    # `scope` is a required, non-defaulted keyword on every read below — an
+    # ltree path (see orgs.path in migrations/005_orgs.sql). It is never
+    # optional the way `district`/`department` are: a caller that forgets to
+    # narrow the *board* still narrows the *scope*, because the parameter
+    # cannot be omitted and still type-check. The predicate itself is one
+    # join: `o.path <@ $scope::ltree` reads camera + everything under it.
+    #
+    # This is deliberately not Postgres row-level security — see
+    # docs/ORG-TIERS-DESIGN.md §7. Every caller of this repository is trusted
+    # to pass the *correct* scope; what this buys is that it cannot pass none.
 
-    async def get(self, camera_id: str) -> Camera | None:
+    async def get(self, camera_id: str, *, scope: str) -> Camera | None:
         row = await self._pool.fetchrow(
-            "SELECT * FROM camera_current WHERE id = $1::uuid", camera_id
+            """
+            SELECT cc.* FROM camera_current cc
+            JOIN orgs o ON o.id = cc.org_id
+            WHERE cc.id = $1::uuid AND o.path <@ $2::ltree
+            """,
+            camera_id,
+            scope,
         )
         return camera_from_row(row, self._s) if row else None
 
-    async def get_by_external(self, source: str, external_id: str) -> Camera | None:
+    async def get_by_external(
+        self, source: str, external_id: str, *, scope: str
+    ) -> Camera | None:
         row = await self._pool.fetchrow(
-            "SELECT * FROM camera_current WHERE source = $1 AND external_id = $2",
+            """
+            SELECT cc.* FROM camera_current cc
+            JOIN orgs o ON o.id = cc.org_id
+            WHERE cc.source = $1 AND cc.external_id = $2 AND o.path <@ $3::ltree
+            """,
             source,
             external_id,
+            scope,
         )
         return camera_from_row(row, self._s) if row else None
 
     async def list(
         self,
         *,
+        scope: str,
         district: str | None = None,
         department: str | None = None,
         state: HealthState | None = None,
@@ -136,7 +166,8 @@ class CameraRepository:
         offset: int = 0,
     ) -> list[Camera]:
         clauses: list[str] = []
-        args: list[Any] = []
+        args: list[Any] = [scope]
+        clauses.append("o.path <@ $1::ltree")
 
         def add(clause_template: str, value: Any) -> None:
             args.append(value)
@@ -170,50 +201,98 @@ class CameraRepository:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         args.extend([limit, offset])
         sql = (
-            f"SELECT * FROM camera_current {where} "
+            f"SELECT cc.* FROM camera_current cc JOIN orgs o ON o.id = cc.org_id {where} "
             f"ORDER BY district NULLS LAST, site_name NULLS LAST, external_id "
             f"LIMIT ${len(args) - 1} OFFSET ${len(args)}"
         )
         rows = await self._pool.fetch(sql, *args)
         return [camera_from_row(r, self._s) for r in rows]
 
-    async def count(self, *, lifecycle: Lifecycle | None = Lifecycle.ACTIVE) -> int:
+    async def count(self, *, scope: str, lifecycle: Lifecycle | None = Lifecycle.ACTIVE) -> int:
         if lifecycle is None:
-            return await self._pool.fetchval("SELECT count(*) FROM cameras")
+            return await self._pool.fetchval(
+                """
+                SELECT count(*) FROM cameras c JOIN orgs o ON o.id = c.org_id
+                WHERE o.path <@ $1::ltree
+                """,
+                scope,
+            )
         return await self._pool.fetchval(
-            "SELECT count(*) FROM cameras WHERE lifecycle = $1", lifecycle.value
+            """
+            SELECT count(*) FROM cameras c JOIN orgs o ON o.id = c.org_id
+            WHERE o.path <@ $1::ltree AND c.lifecycle = $2
+            """,
+            scope,
+            lifecycle.value,
         )
 
-    async def health_summary(self) -> dict[str, int]:
+    async def health_summary(self, *, scope: str) -> dict[str, int]:
         rows = await self._pool.fetch(
             """
-            SELECT effective_health_state AS state, count(*) AS n
-            FROM camera_current WHERE lifecycle = 'active'
+            SELECT cc.effective_health_state AS state, count(*) AS n
+            FROM camera_current cc JOIN orgs o ON o.id = cc.org_id
+            WHERE cc.lifecycle = 'active' AND o.path <@ $1::ltree
             GROUP BY 1
-            """
+            """,
+            scope,
         )
         summary = {s.value: 0 for s in HealthState}
         for row in rows:
             summary[row["state"]] = row["n"]
         return summary
 
+    # --- org resolution --------------------------------------------------------
+
+    async def org_id_for_path(self, path: str) -> str | None:
+        row = await self._pool.fetchval("SELECT id FROM orgs WHERE path = $1::ltree", path)
+        return str(row) if row is not None else None
+
+    async def org_path_for_id(self, org_id: str) -> str | None:
+        row = await self._pool.fetchval(
+            "SELECT path::text FROM orgs WHERE id = $1::uuid", org_id
+        )
+        return row
+
+    async def _resolve_org(self, org_id: str | None) -> tuple[str, str]:
+        """(org_id, org_path) for a create — the payload's own org_id if it
+        named one, otherwise `sync_default_org_path`. Raises if neither
+        resolves, rather than silently falling through to no org: a camera
+        that fails to get an org must fail to be created, not become
+        invisible to every scoped read the moment it lands."""
+        if org_id is not None:
+            path = await self.org_path_for_id(org_id)
+            if path is None:
+                raise ValueError(f"no org {org_id!r}")
+            return org_id, path
+        path = self._s.sync_default_org_path
+        resolved_id = await self.org_id_for_path(path)
+        if resolved_id is None:
+            raise ValueError(
+                f"sync_default_org_path {path!r} does not exist — "
+                "was migration 005's seed row removed?"
+            )
+        return resolved_id, path
+
     # --- writes --------------------------------------------------------------
 
     async def create(self, payload: CameraCreate) -> Camera:
+        org_id, org_path = await self._resolve_org(payload.org_id)
         row = await self._pool.fetchrow(
             """
             INSERT INTO cameras (
                 source, external_id, location, site_name, district, department, owner,
+                org_id, adapter,
                 camera_type, vendor, vms_platform, codec, native_width, native_height,
                 declared_fps, rtsp_url, hls_url, whep_url,
                 storage_location, retention_days, commissioned_at, amc_expires_at,
                 stale_after_s, present_in_catalogue
             ) VALUES (
                 $1, $2, $3::geography, $4, $5, $6, $7,
-                $8, $9, $10, $11, $12, $13,
-                $14, $15, $16, $17,
-                $18, $19, $20, $21,
-                COALESCE($22::integer, $23::integer), false
+                $8::uuid, $9,
+                $10, $11, $12, $13, $14, $15,
+                $16, $17, $18, $19,
+                $20, $21, $22, $23,
+                COALESCE($24::integer, $25::integer), false
             )
             RETURNING id
             """,
@@ -224,6 +303,8 @@ class CameraRepository:
             payload.district,
             payload.department,
             payload.owner,
+            org_id,
+            payload.adapter,
             payload.camera_type.value,
             payload.vendor,
             payload.vms_platform,
@@ -241,14 +322,20 @@ class CameraRepository:
             payload.stale_after_s,
             self._s.health_stale_after_s,
         )
-        created = await self.get(str(row["id"]))
+        created = await self.get(str(row["id"]), scope=org_path)
         assert created is not None
         return created
 
-    async def update(self, camera_id: str, payload: CameraUpdate) -> Camera | None:
+    async def update(self, camera_id: str, payload: CameraUpdate, *, scope: str) -> Camera | None:
+        """`scope` gates which camera the caller may touch, exactly as it
+        gates reads — a WHERE clause, not a client-side check. Reassigning
+        `org_id` outside the caller's own scope is allowed (it is how a camera
+        moves between orgs) but the post-update read below then uses the
+        *original* scope, so a reassignment that moves the camera out of the
+        caller's own subtree correctly reports back as no-longer-visible."""
         fields = payload.model_dump(exclude_unset=True, exclude_none=True)
         if not fields:
-            return await self.get(camera_id)
+            return await self.get(camera_id, scope=scope)
 
         sets: list[str] = []
         args: list[Any] = []
@@ -264,14 +351,20 @@ class CameraRepository:
                 sets.append(f"{key} = ${len(args)}")
         sets.append("updated_at = now()")
         args.append(camera_id)
+        args.append(scope)
 
         row = await self._pool.fetchrow(
-            f"UPDATE cameras SET {', '.join(sets)} WHERE id = ${len(args)}::uuid RETURNING id",
+            f"""
+            UPDATE cameras SET {', '.join(sets)}
+            WHERE id = ${len(args) - 1}::uuid
+              AND org_id IN (SELECT id FROM orgs WHERE path <@ ${len(args)}::ltree)
+            RETURNING id
+            """,
             *args,
         )
-        return await self.get(camera_id) if row else None
+        return await self.get(camera_id, scope=scope) if row else None
 
-    async def decommission(self, camera_id: str) -> Camera | None:
+    async def decommission(self, camera_id: str, *, scope: str) -> Camera | None:
         """Retire a camera. Never a DELETE.
 
         Its detections are evidence, and evidence with a dangling camera
@@ -280,11 +373,14 @@ class CameraRepository:
         row = await self._pool.fetchrow(
             """
             UPDATE cameras SET lifecycle = 'decommissioned', updated_at = now()
-            WHERE id = $1::uuid RETURNING id
+            WHERE id = $1::uuid
+              AND org_id IN (SELECT id FROM orgs WHERE path <@ $2::ltree)
+            RETURNING id
             """,
             camera_id,
+            scope,
         )
-        return await self.get(camera_id) if row else None
+        return await self.get(camera_id, scope=scope) if row else None
 
     async def upsert_from_catalogue(
         self,
@@ -304,6 +400,7 @@ class CameraRepository:
         catalogue_live: bool,
         raw: dict,
         seen_at: datetime,
+        default_org_id: str,
     ) -> tuple[str, bool]:
         """Insert or refresh one catalogue entry. Returns (camera_id, inserted).
 
@@ -314,6 +411,11 @@ class CameraRepository:
 
         `lifecycle` is deliberately not reset for a decommissioned camera —
         a stale gateway entry must not put a retired camera back in service.
+
+        `default_org_id` is written on INSERT only, exactly like district and
+        department already are — once a local body reassigns a synced camera
+        to its own org, no future sync moves it back. `org_id` is therefore
+        absent from the ON CONFLICT SET list on purpose, not by oversight.
         """
         row = await conn.fetchrow(
             """
@@ -321,12 +423,14 @@ class CameraRepository:
                 source, external_id, site_name, location, codec,
                 native_width, native_height, declared_fps,
                 rtsp_url, hls_url, whep_url,
-                catalogue_live, present_in_catalogue, last_seen_in_catalogue, raw
+                catalogue_live, present_in_catalogue, last_seen_in_catalogue, raw,
+                org_id
             ) VALUES (
                 $1, $2, $3, $4::geography, $5,
                 $6, $7, $8,
                 $9, $10, $11,
-                $12, true, $13, $14::jsonb
+                $12, true, $13, $14::jsonb,
+                $15::uuid
             )
             ON CONFLICT (source, external_id) DO UPDATE SET
                 site_name              = COALESCE(EXCLUDED.site_name, cameras.site_name),
@@ -364,6 +468,7 @@ class CameraRepository:
             catalogue_live,
             seen_at,
             raw,
+            default_org_id,
         )
         return str(row["id"]), row["inserted"]
 
@@ -562,3 +667,74 @@ class CameraRepository:
             """
         )
         return {f"cam-{row['id']}": row["rtsp_url"] for row in rows}
+
+
+def _org_from_row(row: asyncpg.Record) -> Org:
+    return Org(
+        id=str(row["id"]),
+        parent_id=str(row["parent_id"]) if row["parent_id"] is not None else None,
+        path=row["path"],
+        kind=OrgKind(row["kind"]),
+        name=row["name"],
+        created_at=row["created_at"],
+    )
+
+
+class OrgRepository:
+    """The org tree itself — separate from `CameraRepository` because it has
+    its own identity (an org is not a camera attribute, cameras merely
+    reference one) and its own callers: the admin surface Stage 2 adds to the
+    BFF, plus the seed step any gate test needs to set up a scope to test
+    against.
+    """
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+
+    async def create(self, payload: OrgCreate) -> Org:
+        if payload.parent_id is None:
+            path = payload.label
+        else:
+            parent = await self.get(payload.parent_id)
+            if parent is None:
+                raise ValueError(f"no org {payload.parent_id!r}")
+            path = f"{parent.path}.{payload.label}"
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO orgs (parent_id, path, kind, name)
+            VALUES ($1::uuid, $2::ltree, $3, $4)
+            RETURNING id, parent_id, path::text AS path, kind, name, created_at
+            """,
+            payload.parent_id,
+            path,
+            payload.kind.value,
+            payload.name,
+        )
+        return _org_from_row(row)
+
+    async def get(self, org_id: str) -> Org | None:
+        row = await self._pool.fetchrow(
+            "SELECT id, parent_id, path::text AS path, kind, name, created_at "
+            "FROM orgs WHERE id = $1::uuid",
+            org_id,
+        )
+        return _org_from_row(row) if row else None
+
+    async def get_by_path(self, path: str) -> Org | None:
+        row = await self._pool.fetchrow(
+            "SELECT id, parent_id, path::text AS path, kind, name, created_at "
+            "FROM orgs WHERE path = $1::ltree",
+            path,
+        )
+        return _org_from_row(row) if row else None
+
+    async def list_subtree(self, scope: str) -> list[Org]:
+        """Every org at or below `scope` — what a console's org-admin screen
+        renders for a principal, and what Stage 2's user-management endpoints
+        validate a target `org_id` against before granting a role there."""
+        rows = await self._pool.fetch(
+            "SELECT id, parent_id, path::text AS path, kind, name, created_at "
+            "FROM orgs WHERE path <@ $1::ltree ORDER BY path",
+            scope,
+        )
+        return [_org_from_row(r) for r in rows]

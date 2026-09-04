@@ -38,6 +38,13 @@ class RegistrySettings(BaseSettings):
 
     sync_on_startup: bool = True
 
+    sync_default_org_path: str = "gj"
+    """The org a synced camera lands in on first insert (`orgs.path`, an ltree
+    label — see migrations/005_orgs.sql, which seeds this exact root). Applied
+    on INSERT only: once a local body reassigns a synced camera to itself, no
+    future sync moves it back, the same way district/department/owner already
+    survive a sync once an operator has curated them."""
+
     # --- MediaMTX ------------------------------------------------------------
 
     mediamtx_api_url: str = "http://prahari-mediamtx:9997"
