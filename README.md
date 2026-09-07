@@ -132,8 +132,25 @@ cannot drift apart. Nothing district-specific is hardcoded in the module body.
 
 ## Status
 
-Day 0 scaffold. Protobuf contract, Helm chart with a verified profile switch,
-k3d cluster config and the Terraform district module are in place; services are
-not yet implemented. See `CLAUDE.md` for the hard invariants — several of them
-(RTSP over TCP, never trust `CAP_PROP_FPS`, feeds loop) come straight from the
-portal's Integrator's Guide and will otherwise cost real debugging hours.
+Through Day 3's gate, local-first on k3d: the full vertical slice runs on a
+laptop. `services/registry` (FastAPI + PostGIS, org-scoped RBAC, catalogue
+sync, live camera health) and `services/inference` (decode → motion gate →
+YOLO → OCR, lazily-loaded backends) landed Day 1/2, alongside the confusion-aware
+`match-engine` and its watchlist gate test. Day 3 added `services/correlation`
+(cross-camera stitching with spatio-temporal feasibility gating), `services/bff`
+(auth, sessions, API keys, org-scoped proxying, SSRF-hardened RTSP probing, bulk
+CSV import, hash-chained audit log, SSE), and the `web/` Next.js console
+(auth-gated board, MapLibre camera health map, plate trace, alert console,
+onboarding and admin panels) — gated by an executable test: plate in, a
+timestamped route out, with an injected impossible hop rejected and a
+non-watchlist plate correctly producing no alert.
+
+Not yet done: the Day 4 cloud cutover (`profile=gpu` Helm switch is written and
+`terraform apply` for a district is `validate`-clean, but neither has been run
+against rented GPU hardware), the measured streams-per-GPU figure that
+`docs/SCALE-80K.md` and the Terraform module's node-count math both depend on,
+and the Day 5/6 load test, cost/security docs, and demo submission artifacts.
+See `TODO.md` for the day-by-day checklist and `CLAUDE.md` for the hard
+invariants — several of them (RTSP over TCP, never trust `CAP_PROP_FPS`, feeds
+loop) come straight from the portal's Integrator's Guide and will otherwise
+cost real debugging hours.
