@@ -119,6 +119,47 @@ k3d on macOS has no GPU passthrough, so local runs are CPU/MPS with `yolov8n` at
 2 fps over ~5 streams. That proves pipeline **correctness**; it cannot produce
 the scaling curve. The curve comes from Day 4 on real hardware.
 
+### Quick local run, no cluster
+
+For iterating on the registry, BFF, or console without paying for a k3d
+cluster, run the three services that back the web console directly. This is
+what actually gets a browser to `http://localhost:3000` today — the steps
+below are verified against a real login, not aspirational.
+
+```bash
+make proto   # protobuf stubs — imports fail without this
+
+# Postgres: the registry and BFF share one database, credentials below.
+docker run -d --name prahari-postgres -p 5432:5432 \
+  -e POSTGRES_USER=prahari -e POSTGRES_PASSWORD=prahari -e POSTGRES_DB=prahari \
+  postgis/postgis:16-3.4
+
+# registry — applies its own migrations at startup, including the seed
+# org "gj" (Gujarat) that the bootstrap admin below needs to already exist
+cd services/registry && uv run uvicorn prahari_registry.app:app --port 8000 &
+
+# bff — plain-HTTP session cookie and a bootstrap admin for the very
+# first login (see BFFSettings.bootstrap_admin_*: a no-op once any user
+# exists, so it's safe to leave set)
+cd services/bff && \
+  PRAHARI_SESSION_COOKIE_SECURE=false \
+  PRAHARI_REGISTRY_BASE_URL=http://127.0.0.1:8000 \
+  PRAHARI_BOOTSTRAP_ADMIN_USERNAME=admin \
+  PRAHARI_BOOTSTRAP_ADMIN_PASSWORD=<pick one> \
+  uv run uvicorn prahari_bff.app:app --port 8001 &
+
+# console — proxies to the BFF at PRAHARI_BFF_URL, defaulting to :8001
+cd web && npm run dev
+```
+
+Sign in at `http://localhost:3000/login` with the bootstrap username/password.
+`PRAHARI_REDIS_URL` is left unset above, so the SSE alert stream reports 503
+("alert stream not configured for this deployment") — expected, not a
+failure. Catalogue sync will also log a warning if `.env`'s gateway
+credentials aren't set; the registry runs fine without it. This path skips
+Helm/Terraform entirely and is for local dev only — it is not the deployment
+story (see "Deployment" in `CLAUDE.md`).
+
 ## Statewide rollout
 
 ```bash
