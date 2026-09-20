@@ -170,8 +170,32 @@ class MatchSettings(BaseSettings):
     already deduped), so the cap sits a quarter of `detection_stream_maxlen`."""
 
     recent_alerts_size: int = 500
-    """Bounded in-memory ring buffer backing `/api/v1/alerts` -- a debug/admin
-    surface, not the system of record. That is the bus, when configured."""
+    """Bound on the in-memory alert store backing `/api/v1/alerts` when
+    `database_url` is unset -- the degraded path, not the system of record.
+    That is Postgres when configured, the bus for live relay either way."""
+
+    # --- alert persistence ---------------------------------------------------
+
+    database_url: str | None = None
+    """`None` means "no durable alert history" -- alerts are still built,
+    deduped, published to the Redis stream and served from the in-memory
+    store, but a restart loses them and `?since=` can reach back only as far
+    as the ring buffer. Set (typically the same Postgres the registry uses)
+    for history that survives restarts. Deliberately optional, mirroring
+    `redis_url`: the test suite and a laptop run must not require Postgres,
+    and a Postgres outage must not take the live relay down -- a failed
+    connect at startup degrades to the in-memory store and is reported on
+    `/readyz`, not crashed."""
+
+    db_pool_min: int = 1
+    """asyncpg pool floor. The alert write path is low-rate (deduped watchlist
+    hits only) and reads are operator-driven, so one warm connection is the
+    right floor."""
+
+    db_pool_max: int = 4
+    """asyncpg pool ceiling. Exists so a wedged Postgres cannot hold unbounded
+    connections from one pod; alerts never need more than a handful of
+    concurrent history queries."""
 
     # --- detections bus (DAY3-DESIGN.md §2) -----------------------------------
 

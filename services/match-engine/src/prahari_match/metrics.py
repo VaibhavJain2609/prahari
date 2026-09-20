@@ -18,8 +18,10 @@ import threading
 from collections import defaultdict
 
 __all__ = [
+    "ALERT_PERSIST_FAILURES",
     "ALERT_PUBLISH_FAILURES",
     "ALERTS_EMITTED",
+    "ALERTS_PERSISTED",
     "BLOOM_FP_RATE",
     "BLOOM_REJECTED",
     "CANDIDATES_SCORED",
@@ -48,6 +50,8 @@ ALERTS_EMITTED = "prahari_match_alerts_emitted_total"
 DEDUP_SUPPRESSED = "prahari_match_dedup_suppressed_total"
 ALERT_PUBLISH_FAILURES = "prahari_match_alert_publish_failures_total"
 DETECTION_PUBLISH_FAILURES = "prahari_match_detection_publish_failures_total"
+ALERTS_PERSISTED = "prahari_match_alerts_persisted_total"
+ALERT_PERSIST_FAILURES = "prahari_match_alert_persist_failures_total"
 
 # Gauges (point-in-time).
 WATCHLIST_ENTRIES = "prahari_match_watchlist_entries"

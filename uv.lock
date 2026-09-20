@@ -1272,6 +1272,7 @@ name = "prahari-match"
 version = "0.1.0"
 source = { editable = "services/match-engine" }
 dependencies = [
+    { name = "asyncpg" },
     { name = "fastapi" },
     { name = "grpcio" },
     { name = "prahari-common" },
@@ -1294,6 +1295,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "asyncpg", specifier = ">=0.31.0" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "grpcio", specifier = ">=1.66" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
