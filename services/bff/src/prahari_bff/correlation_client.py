@@ -25,6 +25,12 @@ class CorrelationClient:
         self._client = client or httpx.AsyncClient(
             base_url=settings.correlation_base_url,
             timeout=settings.correlation_timeout_s,
+            # The shared internal secret — correlation's `internal_token` gate
+            # (PRAHARI_CORRELATION_INTERNAL_TOKEN) expects the same value the
+            # match-engine gate reads. Empty sends no header.
+            headers={"x-internal-token": settings.internal_token}
+            if settings.internal_token
+            else None,
         )
 
     async def get_route(self, plate: str) -> dict:

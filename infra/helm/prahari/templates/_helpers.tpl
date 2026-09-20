@@ -55,8 +55,9 @@ and bff). Emitted into the worker/match-engine/correlation pods it would be a
 dead env, which the chart↔settings parity test now fails on.
 */}}
 {{- define "prahari.databaseEnv" -}}
-- name: PRAHARI_DATABASE_URL
-  value: "postgresql://{{ .Values.postgres.user }}:$(POSTGRES_PASSWORD)@prahari-postgres:5432/{{ .Values.postgres.database }}"
+# ORDER IS LOAD-BEARING: Kubernetes expands $(VAR) only against env vars defined
+# EARLIER in the list. POSTGRES_PASSWORD must precede PRAHARI_DATABASE_URL or
+# the DSN arrives literally containing "$(POSTGRES_PASSWORD)" and auth fails.
 - name: POSTGRES_PASSWORD
   valueFrom:
     secretKeyRef:
@@ -66,6 +67,8 @@ dead env, which the chart↔settings parity test now fails on.
       # don't touch Postgres must still start in that configuration. When
       # postgres.enabled, a missing Secret SHOULD fail loudly.
       optional: {{ not .Values.postgres.enabled }}
+- name: PRAHARI_DATABASE_URL
+  value: "postgresql://{{ .Values.postgres.user }}:$(POSTGRES_PASSWORD)@prahari-postgres:5432/{{ .Values.postgres.database }}"
 {{- end -}}
 
 {{- define "prahari.commonEnv" -}}

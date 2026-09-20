@@ -93,12 +93,22 @@ def redact_url_credentials(url: str) -> str:
     must never leave the process in an HTTP response, so the endpoint renders
     every URL through this. The reconcile path keeps the credentialed form —
     stripping there would silently break every authenticated pull.
+
+    The query string is dropped entirely: some DVR/NVR lines accept
+    `?username=&password=` auth, and a scheme+host+path answer is all the
+    diagnostic surface needs. `parts.port` is guarded — a malformed port in a
+    stored URL must degrade to the unredacted port's absence, not a 500.
     """
     parts = urlsplit(url)
     netloc = parts.hostname or ""
-    if parts.port is not None:
-        netloc += f":{parts.port}"
-    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    if ":" in netloc and not netloc.startswith("["):
+        netloc = f"[{netloc}]"  # IPv6 literal — hostname strips the brackets
+    try:
+        if parts.port is not None:
+            netloc += f":{parts.port}"
+    except ValueError:
+        pass  # malformed port — emit host-only rather than fail the endpoint
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 def _with_credentials(url: str, username: str | None, password: str) -> str:

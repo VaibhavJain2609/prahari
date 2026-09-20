@@ -46,4 +46,6 @@ def expected_token_ok(provided: str | None, expected: str) -> bool:
         return True
     if provided is None:
         return False
-    return hmac.compare_digest(provided, expected)
+    # compare_digest on str raises TypeError for non-ASCII input — a header is
+    # attacker-controlled bytes, so encode explicitly rather than 500 on it.
+    return hmac.compare_digest(provided.encode("utf-8", "replace"), expected.encode())

@@ -303,8 +303,11 @@ async def readyz(pool: PoolDep, response: Response) -> dict:
     try:
         await pool.fetchval("SELECT 1")
     except (asyncpg.PostgresError, OSError) as exc:
+        # Exception text can carry DB internals (hostnames, query fragments) —
+        # this endpoint answers unauthenticated callers, so log it, don't leak it.
+        log.warning("readyz: database check failed: %s", exc)
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return {"status": "unavailable", "database": f"{type(exc).__name__}: {exc}"}
+        return {"status": "unavailable", "database": "error"}
     return {"status": "ready", "database": "ok"}
 
 

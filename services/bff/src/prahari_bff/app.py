@@ -22,6 +22,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 from urllib.parse import quote, urlparse
 
+import asyncpg
 import httpx
 import redis as redis_lib
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -150,6 +151,14 @@ app = FastAPI(
 )
 
 
+@app.exception_handler(asyncpg.DataError)
+async def _data_error_handler(request: Request, exc: asyncpg.DataError) -> JSONResponse:
+    # Malformed uuid/literal inputs (e.g. an org_id that isn't a uuid) reach
+    # asyncpg as DataError — a caller error, not a server failure. The registry
+    # already maps this to 422; the BFF must not 500 on it.
+    return JSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content={"detail": "invalid identifier"})
+
+
 # --- dependency accessors ---------------------------------------------------
 #
 # These must be defined *before* every route that uses them: `from __future__
@@ -225,7 +234,14 @@ async def origin_and_security_headers(request: Request, call_next):
     """
     origin = request.headers.get("origin")
     if request.method in _MUTATING_METHODS and origin:
-        if urlparse(origin).netloc != request.headers.get("host", ""):
+        # Browser traffic arrives via the Next.js proxy: the BFF's own Host is
+        # the in-cluster service name, so the proxy forwards the browser's host
+        # as X-Forwarded-Host and the real Origin through verbatim. The proxy is
+        # the only path that can legitimately set X-Forwarded-Host — direct
+        # callers that spoof it still fail unless their Origin also lies to
+        # match, which a browser's fetch cannot do.
+        expected_host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+        if urlparse(origin).netloc != expected_host:
             return _with_security_headers(
                 JSONResponse(
                     {"detail": "origin does not match request host"},

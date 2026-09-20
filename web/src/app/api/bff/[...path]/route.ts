@@ -10,6 +10,21 @@ const BFF_URL = process.env.PRAHARI_BFF_URL ?? "http://localhost:8001";
 // everything else about the request (method, query, body, content-type) is
 // forwarded verbatim.
 async function proxy(request: NextRequest, path: string[]): Promise<Response> {
+  // Next.js decodes catch-all params before we see them — `%2e%2e` arrives as
+  // the literal `..`, and `new URL` normalizes dot-segments, which would let
+  // a request escape `/api/v1/` onto the BFF's unauthenticated surfaces
+  // (/openapi.json, /readyz). Reject any segment that could move or mutate
+  // the upstream path before joining.
+  for (const segment of path) {
+    if (
+      segment === "" ||
+      segment === "." ||
+      segment === ".." ||
+      /[/?#%\\]/.test(segment)
+    ) {
+      return Response.json({ error: "invalid path segment" }, { status: 400 });
+    }
+  }
   const upstream = new URL(`/api/v1/${path.join("/")}`, BFF_URL);
   request.nextUrl.searchParams.forEach((value, key) => upstream.searchParams.append(key, value));
 
@@ -22,6 +37,13 @@ async function proxy(request: NextRequest, path: string[]): Promise<Response> {
   if (authorization) headers.set("authorization", authorization);
   const purposeCode = request.headers.get("x-purpose-code");
   if (purposeCode) headers.set("x-purpose-code", purposeCode);
+  // The BFF's same-origin middleware compares Origin to Host — forward both
+  // or the check is vacuous for the only traffic that can carry a hostile
+  // Origin (browsers). Host is the browser's host, not the BFF's, so the BFF
+  // must compare Origin against the *request's* host header it sees here.
+  const origin = request.headers.get("origin");
+  if (origin) headers.set("origin", origin);
+  headers.set("x-forwarded-host", request.headers.get("host") ?? "");
 
   const hasBody = !["GET", "HEAD"].includes(request.method);
 
