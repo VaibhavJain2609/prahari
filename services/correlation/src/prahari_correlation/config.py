@@ -52,16 +52,13 @@ class CorrelationSettings(BaseSettings):
     prefix, not a second Postgres), the consumer persists before XACK, and
     route queries read the durable table."""
 
-    route_history_lookback_s: float = 86_400.0
-    """How far back `/api/v1/routes/{plate}` searches. A hard bound matters now
-    that history is durable: without one a route query scans everything the
-    plate ever did. 24h covers the demo scenario (a stolen vehicle's day);
-    the store's own per-plate bound still applies in memory-only mode."""
-
     route_history_max_sightings: int = 5_000
     """Cap on sightings pulled for one route build, applied against the most
-    recent end of history (db.py orders DESC then reverses). A taxi-scale
-    plate must be bounded rather than unbounded."""
+    recent end of history (db.py orders DESC then reverses). The always-on
+    bound now that history is durable; a narrower window is a per-request
+    `since_s` on the endpoint, not a silent default — an officer asking for a
+    route should get all of it (capped), not a 24h slice they never asked
+    for."""
 
     # --- detection store (DAY3-DESIGN.md §3.1) -----------------------------
 

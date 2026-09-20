@@ -7,7 +7,6 @@ the registry.
 from __future__ import annotations
 
 import logging
-import time
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -167,7 +166,10 @@ def get_registry(request: Request) -> RegistryClient:
 
 
 def get_metrics(request: Request) -> Metrics:
-    return request.app.state.metrics
+    # A throwaway sink when the lifespan never ran (in-process ASGI transports
+    # in the gate tests don't run it) — counters go nowhere, but a route query
+    # must not 500 because a metrics handle was missing.
+    return getattr(request.app.state, "metrics", None) or Metrics()
 
 
 StoreDep = Annotated[SightingSource, Depends(get_store)]
@@ -286,7 +288,12 @@ async def get_route(
     registry: RegistryDep,
     settings: SettingsDep,
     metrics: MetricsDep,
+    since_s: float | None = None,
 ) -> dict:
+    """`since_s` (epoch seconds) bounds the history window explicitly — a
+    caller that wants "yesterday" says so. Absent, the whole persisted
+    history is searched, capped at `route_history_max_sightings` of the most
+    recent sightings."""
     metrics.inc("route_queries")
     result = await build_route(
         plate,
@@ -295,7 +302,7 @@ async def get_route(
         settings.max_speed_kmh,
         settings.appearance_similarity_threshold,
         clock_skew_allowance_s=settings.clock_skew_allowance_s,
-        since_s=time.time() - settings.route_history_lookback_s,
+        since_s=since_s,
         max_sightings=settings.route_history_max_sightings,
     )
     metrics.inc("rejected_hops", len(result.rejected))

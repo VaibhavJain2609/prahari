@@ -28,9 +28,7 @@ def test_database_url_reads_the_service_prefixed_env(monkeypatch) -> None:
     assert settings.database_url == "postgresql://prahari:x@prahari-postgres:5432/prahari"
 
 
-def test_route_history_bounds_have_defaults(monkeypatch) -> None:
-    monkeypatch.delenv("PRAHARI_CORRELATION_ROUTE_HISTORY_LOOKBACK_S", raising=False)
+def test_route_history_bound_has_a_default(monkeypatch) -> None:
     monkeypatch.delenv("PRAHARI_CORRELATION_ROUTE_HISTORY_MAX_SIGHTINGS", raising=False)
     settings = CorrelationSettings()
-    assert settings.route_history_lookback_s > 0
     assert settings.route_history_max_sightings > 0

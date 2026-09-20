@@ -5,8 +5,9 @@ handed to the store, consumer and registry client, each of which increments
 the counters it owns; gauges are registered as zero-arg callables and sampled
 at render time.
 
-Thread-safe: `inc()` runs on the background consumer thread (via
-`DetectionStore.add`) while `render()` runs on the FastAPI event loop.
+Thread-safe: `inc()` runs inside `DetectionStore.add`, which the detection
+consumer task drives while `render()` runs on request handlers — same event
+loop today, but the lock keeps the class correct for any caller.
 """
 
 from __future__ import annotations
