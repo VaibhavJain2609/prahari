@@ -38,8 +38,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 FROM python:3.12-slim AS runtime
 
-# No compiler, no uv, no build cache. Correlation holds the detection ring
-# buffers and route-reconstruction state in memory; the smaller the image, the
+# No compiler, no uv, no build cache. Correlation's detection ring buffers are
+# still in-memory (Postgres holds the durable copy); the smaller the image, the
 # less there is to audit in `docs/SECURITY.md`.
 RUN useradd --create-home --uid 10001 prahari
 WORKDIR /app
@@ -60,5 +60,4 @@ EXPOSE 8002
 # PRAHARI_CORRELATION_HTTP_PORT (default 8002, matching
 # CorrelationSettings.http_port and the chart's services.correlation.port) so a
 # profile that sets the env is not silently ignored by the process itself.
-#
 CMD ["sh", "-c", "exec uvicorn prahari_correlation.app:app --host 0.0.0.0 --port ${PRAHARI_CORRELATION_HTTP_PORT:-8002}"]

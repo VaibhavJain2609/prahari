@@ -277,7 +277,9 @@ Correlation-only environment (PRAHARI_CORRELATION_* = CorrelationSettings).
 
 redis_url unset means "the detection consumer never starts" and /readyz says so
 honestly — so it is set here, pointed at the same Redis the match engine
-publishes `prahari:detections` on.
+publishes `prahari:detections` on. database_url unset means "sightings are
+memory-only" and /readyz reports `persistence: in-memory` — so it is also set
+here, pointed at the same Postgres database the registry uses.
 
 Two token fields, same Secret key: INTERNAL_TOKEN gates this service's own
 /api/* (route reconstruction is surveillance capability — it must not be
@@ -289,6 +291,22 @@ is what it sends to a gated registry for camera-location lookups.
   value: {{ .Values.services.correlation.port | quote }}
 - name: PRAHARI_CORRELATION_REDIS_URL
   value: "redis://prahari-redis:6379"
+# Correlation persists sightings to the SAME Postgres + database the registry
+# uses — the `correlation_` table prefix is the ownership boundary, a second
+# database adds nothing an operator wants to babysit. CorrelationSettings reads
+# the service-prefixed name (its env_prefix is PRAHARI_CORRELATION_), so this
+# DSN is emitted inline rather than via the shared databaseEnv helper, which
+# would emit the bare PRAHARI_DATABASE_URL nothing here reads. POSTGRES_PASSWORD
+# is declared BEFORE the URL that expands it — $(VAR) only resolves against
+# earlier entries in the env list.
+- name: POSTGRES_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "prahari.postgresSecretName" . }}
+      key: password
+      optional: {{ not .Values.postgres.enabled }}
+- name: PRAHARI_CORRELATION_DATABASE_URL
+  value: "postgresql://{{ .Values.postgres.user }}:$(POSTGRES_PASSWORD)@prahari-postgres:5432/{{ .Values.postgres.database }}"
 - name: PRAHARI_CORRELATION_REGISTRY_BASE_URL
   value: "http://prahari-registry:{{ .Values.services.registry.port }}"
 - name: PRAHARI_CORRELATION_INTERNAL_TOKEN
