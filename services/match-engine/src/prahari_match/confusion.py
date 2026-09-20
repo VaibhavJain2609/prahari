@@ -6,9 +6,17 @@ OCR returns `GJ01AB1Z34`, the watchlist holds `GJ01AB1234`, and a lookup that
 does not know `2` and `Z` look alike just misses. Everything here exists to
 turn that miss into a scored, explained hit.
 
-What is deliberately NOT here: candidate generation and banding (`matcher.py`)
-and the watchlist index (`watchlist.py`). This module only prices one
-character against another and chains that into a weighted edit distance.
+What is deliberately NOT here: candidate generation and banding (`matcher.py`),
+the watchlist index (`watchlist.py`), and the confusion-class table itself —
+`skeleton()` and `CONFUSION_CLASSES` live in `prahari_common.plates`, because
+canonicalisation is grammar (which glyphs are interchangeable spellings of the
+same plate) while this module is tolerance (what a substitution between them
+should cost). `skeleton` is re-exported below so existing imports keep working;
+the match engine and the correlation store must fold readings onto the same
+identity keys, which is exactly why the table cannot live here.
+
+This module only prices one character against another and chains that into a
+weighted edit distance.
 """
 
 from __future__ import annotations
@@ -16,34 +24,18 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from prahari_common.plates import MASK_ALPHA, MASK_DIGIT
+from prahari_common.plates import CONFUSION_CLASSES, MASK_ALPHA, MASK_DIGIT, skeleton
 
 __all__ = [
     "Edit",
     "WeightedDistance",
     "in_same_confusion_class",
-    "skeleton",
+    "skeleton",  # re-exported from prahari_common.plates; canonical home is there
     "substitution_cost",
     "weighted_levenshtein",
 ]
 
-# Bidirectional confusion classes. Membership, not direction, is what matters:
-# OCR that misreads 0 as O is exactly as likely to misread O as 0.
-_CONFUSION_CLASSES: tuple[frozenset[str], ...] = (
-    frozenset("0ODQ"),
-    frozenset("8B"),
-    frozenset("1IL"),
-    frozenset("5S"),
-    frozenset("2Z"),
-    frozenset("6G"),
-)
-
-# One canonical representative per class, chosen arbitrarily but fixed, so
-# `skeleton()` is deterministic. Digits, since a skeleton is compared against
-# other skeletons rather than displayed.
-_CANONICAL_BY_CLASS: dict[int, str] = {0: "0", 1: "8", 2: "1", 3: "5", 4: "2", 5: "6"}
-
-_CLASS_OF: dict[str, int] = {ch: idx for idx, cls in enumerate(_CONFUSION_CLASSES) for ch in cls}
+_CLASS_OF: dict[str, int] = {ch: idx for idx, cls in enumerate(CONFUSION_CLASSES) for ch in cls}
 
 # Substitution cost, before confidence and position are applied. Cheap inside a
 # confusion class; full price outside it, which is what makes an unrelated
@@ -78,17 +70,6 @@ def in_same_confusion_class(a: str, b: str) -> bool:
     class_a = _CLASS_OF.get(a)
     class_b = _CLASS_OF.get(b)
     return class_a is not None and class_a == class_b
-
-
-def skeleton(text: str) -> str:
-    """Fold every confusable character onto its class's canonical
-    representative, so `GJ01AB1Z34` and `GJ01AB1234` produce the same string.
-
-    This is stage 1 of the matcher: a Bloom filter and an index are built over
-    skeletons, not raw plate text, which is what lets an OCR misread land in
-    the same bucket as the plate it actually is.
-    """
-    return "".join(_CANONICAL_BY_CLASS.get(_CLASS_OF.get(ch, -1), ch) for ch in text)
 
 
 def _char_kind(ch: str) -> str:

@@ -59,3 +59,53 @@ def test_negative_elapsed_time_with_distance_is_rejected() -> None:
     # nonsense negative speed that happens to pass the envelope.
     verdict = check_feasibility(*_AHMEDABAD, *_SURAT, elapsed_s=-60.0, max_speed_kmh=120.0)
     assert not verdict.feasible
+
+
+def test_small_negative_elapsed_within_skew_allowance_is_treated_as_zero() -> None:
+    # Two cameras whose clocks disagree by a few seconds produce a slightly
+    # negative elapsed time. Within the allowance that is judged by the
+    # zero-elapsed rule: feasible at the same location, teleport with distance.
+    same_spot = check_feasibility(
+        23.0,
+        72.0,
+        23.0,
+        72.0,
+        elapsed_s=-3.0,
+        max_speed_kmh=120.0,
+        clock_skew_allowance_s=5.0,
+    )
+    assert same_spot.feasible
+
+    with_distance = check_feasibility(
+        *_AHMEDABAD,
+        *_SURAT,
+        elapsed_s=-3.0,
+        max_speed_kmh=120.0,
+        clock_skew_allowance_s=5.0,
+    )
+    assert not with_distance.feasible
+    assert with_distance.reason == "teleport"
+
+
+def test_negative_elapsed_beyond_the_allowance_is_bad_data_not_a_teleport() -> None:
+    # -60s apart is more than camera clocks plausibly skew; labelled
+    # "negative_elapsed" so the rejection reads as a timestamp problem.
+    verdict = check_feasibility(
+        23.0,
+        72.0,
+        23.0,
+        72.0,
+        elapsed_s=-60.0,
+        max_speed_kmh=120.0,
+        clock_skew_allowance_s=5.0,
+    )
+    assert not verdict.feasible
+    assert verdict.reason == "negative_elapsed"
+    assert verdict.implied_speed_kmh is None
+
+
+def test_zero_allowance_keeps_the_old_hard_boundary() -> None:
+    # Default allowance is 0: any negative elapsed is immediately "beyond".
+    verdict = check_feasibility(23.0, 72.0, 23.0, 72.0, elapsed_s=-0.5, max_speed_kmh=120.0)
+    assert not verdict.feasible
+    assert verdict.reason == "negative_elapsed"

@@ -41,6 +41,12 @@ class FeasibilityVerdict:
     negative elapsed time. That is only feasible when no distance needed to
     be covered either (the same location, same instant); any non-zero
     distance in zero time is a teleport and is rejected."""
+    reason: str | None = None
+    """Why the hop failed, when it did: "teleport" (non-zero distance in ~no
+    time), "negative_elapsed" (timestamps out of order beyond the clock-skew
+    allowance -- a data problem, not a speed problem). `None` on feasible
+    verdicts and on plain over-the-speed-envelope rejections, which callers
+    describe themselves ("exceeds max_speed_kmh ...")."""
 
 
 def check_feasibility(
@@ -50,18 +56,35 @@ def check_feasibility(
     lon2: float,
     elapsed_s: float,
     max_speed_kmh: float,
+    *,
+    clock_skew_allowance_s: float = 0.0,
 ) -> FeasibilityVerdict:
     distance_km = haversine_km(lat1, lon1, lat2, lon2)
 
+    if elapsed_s < -clock_skew_allowance_s:
+        # Timestamps out of order by MORE than two cameras' clocks can
+        # plausibly disagree -- this is not a fast vehicle or a teleport, it
+        # is broken data (a poisoned or mis-synced `observed_at`), and the
+        # rejection is labelled as such rather than as an impossible speed.
+        return FeasibilityVerdict(
+            feasible=False,
+            distance_km=distance_km,
+            elapsed_s=elapsed_s,
+            implied_speed_kmh=None,
+            reason="negative_elapsed",
+        )
+
     if elapsed_s <= 0:
-        # No time to have moved in -- feasible only if no distance needed
-        # covering either (same spot, same instant); a non-zero distance in
-        # zero or negative elapsed time is a teleport, not a fast vehicle.
+        # Within the skew allowance (or exactly zero): treated as "no time to
+        # have moved in" -- feasible only if no distance needed covering
+        # either (same spot, same instant). A non-zero distance in zero or
+        # skew-small negative elapsed time is a teleport, not a fast vehicle.
         return FeasibilityVerdict(
             feasible=distance_km <= 1e-6,
             distance_km=distance_km,
             elapsed_s=elapsed_s,
             implied_speed_kmh=None,
+            reason=None if distance_km <= 1e-6 else "teleport",
         )
 
     implied_speed_kmh = distance_km / (elapsed_s / 3600.0)

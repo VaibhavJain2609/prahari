@@ -83,6 +83,9 @@ class TestRoutes:
         assert body["hops"][0]["camera_id"] == "CAM-A"
         assert body["hops"][0]["location"] == {"latitude": 23.0, "longitude": 72.5}
         assert body["hops"][0]["link_kind"] is None
+        assert body["hops"][0]["first_seen_s"] == body["hops"][0]["last_seen_s"]
+        assert body["hops"][0]["sightings"] == 1
+        assert body["ungated_hops"] == 0
         assert body["dark_zones"] == [{"camera_id": "CAM-DOWN", "location": None}]
 
     def test_get_route_for_an_unseen_plate_is_an_empty_route(self) -> None:
@@ -101,3 +104,34 @@ class TestRoutes:
         body = response.json()
         assert body["hops"] == []
         assert body["rejected"] == []
+
+
+class TestMetrics:
+    def test_metrics_endpoint_is_plaintext_prahari_correlation_lines(self) -> None:
+        # The real lifespan store/metrics are exercised here rather than
+        # overridden: the gauges are bound to the lifespan's objects, so a
+        # dependency-overridden store would be invisible to them.
+        registry = _FakeRegistry({"CAM-A": GeoPoint(latitude=23.0, longitude=72.5)})
+        app.dependency_overrides[get_registry] = lambda: registry
+        try:
+            with _client() as client:
+                response = client.get("/metrics")
+                client.app.state.store.add(_detection("CAM-A", "GJ01AB1234"))
+                # One route query so a request-side counter has something to say.
+                client.get("/api/v1/routes/GJ01AB1234")
+                after = client.get("/metrics")
+        finally:
+            app.dependency_overrides.clear()
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/plain")
+        text = after.text
+        # Store-side counters and gauges.
+        assert "prahari_correlation_detections_consumed 1" in text
+        assert "prahari_correlation_store_plates 1" in text
+        assert "prahari_correlation_store_unplated 0" in text
+        # Request-side counters.
+        assert "prahari_correlation_route_queries 1" in text
+        # No Redis configured -> the stream-length gauge is omitted rather
+        # than rendered as a misleading 0.
+        assert "detections_stream_length" not in text
