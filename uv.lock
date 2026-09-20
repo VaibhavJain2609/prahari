@@ -14,6 +14,7 @@ members = [
     "prahari-common",
     "prahari-correlation",
     "prahari-inference",
+    "prahari-loadtest",
     "prahari-match",
     "prahari-proto",
     "prahari-registry",
@@ -1079,6 +1080,7 @@ dev = [
     { name = "prahari-common" },
     { name = "prahari-correlation" },
     { name = "prahari-inference" },
+    { name = "prahari-loadtest" },
     { name = "prahari-match" },
     { name = "prahari-proto" },
     { name = "prahari-registry" },
@@ -1096,6 +1098,7 @@ dev = [
     { name = "prahari-common", editable = "packages/prahari-common" },
     { name = "prahari-correlation", editable = "services/correlation" },
     { name = "prahari-inference", editable = "services/inference" },
+    { name = "prahari-loadtest", editable = "infra/loadtest" },
     { name = "prahari-match", editable = "services/match-engine" },
     { name = "prahari-proto", editable = "packages/prahari-proto" },
     { name = "prahari-registry", editable = "services/registry" },
@@ -1266,6 +1269,30 @@ requires-dist = [
     { name = "ultralytics", marker = "extra == 'models'", specifier = ">=8.3" },
 ]
 provides-extras = ["dev", "models"]
+
+[[package]]
+name = "prahari-loadtest"
+version = "0.1.0"
+source = { editable = "infra/loadtest" }
+dependencies = [
+    { name = "httpx" },
+    { name = "prahari-proto" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "prahari-proto", editable = "packages/prahari-proto" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
+]
+provides-extras = ["dev"]
 
 [[package]]
 name = "prahari-match"

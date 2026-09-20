@@ -23,6 +23,7 @@ members = [
     "services/registry",
     "services/correlation",
     "services/bff",
+    "infra/loadtest",
 ]
 
 [tool.uv.sources]
@@ -33,6 +34,7 @@ prahari-match = { workspace = true }
 prahari-registry = { workspace = true }
 prahari-correlation = { workspace = true }
 prahari-bff = { workspace = true }
+prahari-loadtest = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -43,6 +45,7 @@ dev = [
     "prahari-registry",
     "prahari-correlation",
     "prahari-bff",
+    "prahari-loadtest",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "pytest-cov>=5.0",
