@@ -12,14 +12,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import grpc
 from google.protobuf.timestamp_pb2 import Timestamp
 from prahari.v1 import adapter_pb2, common_pb2, events_pb2
 
-from prahari_match.alerts import AlertBuilder, RecentAlertsPublisher
+from prahari_match.alerts import AlertBuilder, NullPublisher, RecentAlertsPublisher
 from prahari_match.bloom import BloomFilter
 from prahari_match.config import MatchSettings
 from prahari_match.dedup import Deduper
-from prahari_match.grpc_server import MetadataIngestServicer
+from prahari_match.grpc_server import MetadataIngestServicer, serve
 from prahari_match.matcher import WatchlistStore
 from prahari_match.watchlist import Watchlist
 
@@ -206,6 +207,106 @@ class TestStreamDetections:
         assert response.ack.rejected == 1
         assert response.ack.detail  # non-empty, explains the one failure
         assert len(recent.recent()) == 1  # the good message still got through
+
+
+class TestInputBounds:
+    """Malformed input is rejected at the boundary (counted in
+    `IngestAck.rejected` with a `detail` reason) rather than absorbed into
+    pipeline work. Rejection also means the detection never reaches the
+    evidence bus -- a message we refuse to vouch for is not evidence."""
+
+    def test_detection_with_no_camera_id_is_rejected(self) -> None:
+        store = _store_with("GJ01AB1234")
+        servicer, _recent, detections = _servicer(store)
+
+        detection = events_pb2.VehicleDetection(
+            detection_id="D1",
+            plate=events_pb2.PlateReading(normalised_text="GJ01AB1234"),
+        )
+        response = servicer.StreamDetections(
+            iter([adapter_pb2.StreamDetectionsRequest(detection=detection)]), context=None
+        )
+
+        assert response.ack.accepted == 0
+        assert response.ack.rejected == 1
+        assert "camera_id" in response.ack.detail
+        assert len(detections.published) == 0
+
+    def test_raw_text_over_the_limit_is_rejected(self) -> None:
+        store = _store_with("GJ01AB1234")
+        servicer, _recent, detections = _servicer(store)
+
+        detection = _detection("CAM-1", "GJ01AB1234")
+        detection.plate.raw_text = "X" * (MatchSettings().max_raw_text_chars + 1)
+        response = servicer.StreamDetections(
+            iter([adapter_pb2.StreamDetectionsRequest(detection=detection)]), context=None
+        )
+
+        assert response.ack.rejected == 1
+        assert "raw_text" in response.ack.detail
+        assert len(detections.published) == 0
+
+    def test_char_confidence_over_the_limit_is_rejected(self) -> None:
+        store = _store_with("GJ01AB1234")
+        servicer, _recent, detections = _servicer(store)
+
+        detection = _detection("CAM-1", "GJ01AB1234")
+        del detection.plate.char_confidence[:]
+        detection.plate.char_confidence.extend([0.5] * (MatchSettings().max_char_confidences + 1))
+        response = servicer.StreamDetections(
+            iter([adapter_pb2.StreamDetectionsRequest(detection=detection)]), context=None
+        )
+
+        assert response.ack.rejected == 1
+        assert "char_confidence" in response.ack.detail
+        assert len(detections.published) == 0
+
+    def test_detail_keeps_the_first_error_and_counts_the_rest(self) -> None:
+        # A flood of identical rejections used to leave only the LAST error in
+        # `detail`, overwriting the original cause. Now it keeps the first
+        # error and a count.
+        store = _store_with("GJ01AB1234")
+        servicer, _recent, _detections = _servicer(store)
+
+        no_camera = events_pb2.VehicleDetection(detection_id="D1")
+        bad_raw = _detection("CAM-1", "GJ01AB1234")
+        bad_raw.plate.raw_text = "X" * 100
+        requests = [
+            adapter_pb2.StreamDetectionsRequest(detection=no_camera),
+            adapter_pb2.StreamDetectionsRequest(detection=bad_raw),
+        ]
+        response = servicer.StreamDetections(iter(requests), context=None)
+
+        assert response.ack.rejected == 2
+        assert "camera_id" in response.ack.detail  # the first error, kept
+        assert "raw_text" not in response.ack.detail  # the second, counted not kept
+        assert "+1 more rejected" in response.ack.detail
+
+
+class TestServe:
+    def test_server_options_bound_message_size_and_streams(self, monkeypatch) -> None:
+        captured: dict = {}
+        real_server = grpc.server
+
+        def _spy(executor, options=None):  # noqa: ANN001, ANN202
+            captured["options"] = dict(options or [])
+            return real_server(executor, options=options)
+
+        monkeypatch.setattr("prahari_match.grpc_server.grpc.server", _spy)
+
+        settings = MatchSettings(grpc_port=0)
+        server = serve(
+            _store_with("GJ01AB1234"),
+            Deduper(bucket_s=8.0, max_entries=1000),
+            NullPublisher(),
+            settings,
+        )
+        try:
+            options = captured["options"]
+            assert options["grpc.max_receive_message_length"] == 4 * 1024 * 1024
+            assert options["grpc.max_concurrent_streams"] == 100
+        finally:
+            server.stop(0)
 
 
 class TestStreamHealth:

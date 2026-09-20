@@ -21,6 +21,7 @@ paraphrase of them.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -32,6 +33,14 @@ from .bloom import BloomFilter
 from .config import MatchSettings
 from .confusion import Edit, weighted_levenshtein
 from .confusion import skeleton as fold_skeleton
+from .metrics import (
+    BLOOM_REJECTED,
+    CANDIDATES_SCORED,
+    MATCHES_CONFIRMED,
+    MATCHES_PROBABLE,
+    MATCHES_WEAK,
+    METRICS,
+)
 from .watchlist import Watchlist, WatchlistRecord, single_char_deletions
 
 __all__ = ["MatchResult", "WatchlistSnapshot", "WatchlistStore", "bloom_probes", "match"]
@@ -180,14 +189,30 @@ def _band_for(score: float, settings: MatchSettings) -> int:
     return common_pb2.CONFIDENCE_BAND_UNSPECIFIED
 
 
+# Band -> metric counter, so `/metrics` can show the match rate per band
+# rather than one undifferentiated total.
+_BAND_METRIC = {
+    common_pb2.CONFIDENCE_BAND_CONFIRMED: MATCHES_CONFIRMED,
+    common_pb2.CONFIDENCE_BAND_PROBABLE: MATCHES_PROBABLE,
+    common_pb2.CONFIDENCE_BAND_WEAK: MATCHES_WEAK,
+}
+
+
+def _sanitise_confidences(confidences: Iterable[float]) -> tuple[float, ...]:
+    """Non-finite wire confidences (NaN, ±inf) become 0.0 -- "trust this
+    character least", the same default `project_confidences` uses for a
+    missing entry. A NaN left in place propagates through the weighted DP
+    into `final_score`, and `NaN > best_score` is False for every candidate:
+    a genuine hit degenerates into a silent no-match with nothing logged."""
+    return tuple(c if math.isfinite(c) else 0.0 for c in confidences)
+
+
 def _score(
     observed: str,
     record: WatchlistRecord,
     confidences: tuple[float, ...],
     settings: MatchSettings,
 ) -> tuple[float, events_pb2.MatchExplanation]:
-    import math
-
     weighted = weighted_levenshtein(
         observed, record.normalised.text, confidences=confidences, mask=record.normalised.mask
     )
@@ -257,10 +282,12 @@ def match(
                 observed,
                 plate.normalised_text,
             )
-        confidences = project_confidences(list(plate.char_confidence), normalised)
+        confidences = _sanitise_confidences(
+            project_confidences(list(plate.char_confidence), normalised)
+        )
     else:
         observed = plate.normalised_text
-        confidences = tuple(plate.char_confidence)
+        confidences = _sanitise_confidences(plate.char_confidence)
 
     if not observed:
         return MatchResult.no_match()
@@ -277,6 +304,7 @@ def match(
     # the watchlist entry (see `bloom_probes`); checking only the exact
     # skeleton here would make those paths dead code behind a false negative.
     if not any(probe in snapshot.bloom for probe in bloom_probes(observed_skeleton)):
+        METRICS.inc(BLOOM_REJECTED)
         return MatchResult.no_match()
 
     # Stage 2: bounded candidate generation.
@@ -297,6 +325,7 @@ def match(
     for record in candidates[: settings.max_candidates]:
         if _is_expired(record.entry, now):
             continue
+        METRICS.inc(CANDIDATES_SCORED)
         score, explanation = _score(observed, record, confidences, settings)
         if score > best_score:
             best_score, best_entry, best_explanation = score, record.entry, explanation
@@ -308,4 +337,5 @@ def match(
     if band == common_pb2.CONFIDENCE_BAND_UNSPECIFIED:
         return MatchResult.no_match()
 
+    METRICS.inc(_BAND_METRIC[band])
     return MatchResult(matched=True, band=band, explanation=best_explanation, entry=best_entry)

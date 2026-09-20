@@ -70,6 +70,36 @@ class TestProbes:
         assert response.json()["status"] == "unavailable"
 
 
+class TestMetrics:
+    def test_metrics_endpoint_is_plaintext_exposition(
+        self, monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path
+    ) -> None:
+        with _client(monkeypatch, watchlist_dir) as client:
+            response = client.get("/metrics")
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/plain")
+        body = response.text
+        # The gauges the lifespan always sets -- a scraper must see watchlist
+        # size and bloom fp rate even before the first detection arrives.
+        assert "prahari_match_watchlist_entries 2" in body
+        assert "prahari_match_bloom_false_positive_rate" in body
+        assert "# TYPE prahari_match_watchlist_entries gauge" in body
+
+    def test_metrics_gauges_follow_a_watchlist_reload(
+        self, monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path
+    ) -> None:
+        with _client(monkeypatch, watchlist_dir) as client:
+            (watchlist_dir / "extra.json").write_text(
+                json.dumps([{"entry_id": "E3", "plate": "GJ18EF9012", "reason": "wanted"}]),
+                encoding="utf-8",
+            )
+            assert client.post("/api/v1/watchlist/reload").status_code == 200
+            body = client.get("/metrics").text
+
+        assert "prahari_match_watchlist_entries 3" in body
+
+
 class TestWatchlistAdmin:
     def test_summary_reflects_loaded_entries(
         self, monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path

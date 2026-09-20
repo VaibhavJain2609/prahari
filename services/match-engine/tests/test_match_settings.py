@@ -41,6 +41,18 @@ _ENV_NAME = re.compile(r"-\s*name:\s*(PRAHARI_MATCH_[A-Z0-9_]+)")
 _DELIBERATELY_INTERNAL = {
     "grpc_host": "always 0.0.0.0 in-cluster; no profile needs a different bind address",
     "grpc_max_workers": "thread-pool sizing, not an accuracy or deployment-topology knob",
+    "grpc_max_concurrent_streams": (
+        "HTTP/2 flow-control bound on the server, not a per-profile tuning knob"
+    ),
+    "grpc_max_receive_message_bytes": (
+        "a message-size safety bound at the gRPC boundary, not per-deployment"
+    ),
+    "max_raw_text_chars": (
+        "input bound derived from what a plate can plausibly be, not a profile knob"
+    ),
+    "max_char_confidences": (
+        "index-aligned with raw_text; same input-bound reasoning as max_raw_text_chars"
+    ),
     "bloom_expected_entries": (
         "sizing input tuned against the accuracy tests in tests/test_matcher.py, "
         "not a per-deployment value"
@@ -54,7 +66,13 @@ _DELIBERATELY_INTERNAL = {
     ),
     "max_candidates": "a safety cap on scoring work, not an accuracy or topology decision",
     "dedup_max_entries": "a memory-bound safety cap, not something a profile tunes",
+    "redis_socket_timeout_s": "client resilience bound, not something a profile tunes",
+    "redis_socket_connect_timeout_s": "same reasoning as redis_socket_timeout_s",
     "redis_stream_key": "channel name is a code-level contract with consumers, not per-profile",
+    "alert_stream_maxlen": (
+        "a memory/retention safety cap on the stream, not something a profile "
+        "tunes -- same reasoning as detection_stream_maxlen"
+    ),
     "recent_alerts_size": "bounds a debug/admin ring buffer, not the system of record",
     "redis_detection_stream_key": (
         "channel name is a code-level contract with consumers (services/correlation), "

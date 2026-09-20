@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.responses import PlainTextResponse
 from google.protobuf.json_format import MessageToDict
 
 from .alerts import FanOutPublisher, RecentAlertsPublisher, RedisStreamPublisher
@@ -25,6 +26,7 @@ from .dedup import Deduper
 from .detections import DetectionPublisher, NullDetectionPublisher, RedisDetectionPublisher
 from .grpc_server import serve
 from .matcher import WatchlistStore
+from .metrics import BLOOM_FP_RATE, METRICS, WATCHLIST_ENTRIES
 from .watchlist import Watchlist
 
 __all__ = ["app"]
@@ -56,6 +58,15 @@ def _build_bloom(watchlist: Watchlist, settings: MatchSettings) -> BloomFilter:
     return bloom
 
 
+def _record_watchlist_gauges(store: WatchlistStore) -> None:
+    """Refresh the `/metrics` gauges that describe the live watchlist --
+    called at startup and after every reload so a stale filter or a dropped
+    watchlist shows up as a number, not a surprise."""
+    snapshot = store.snapshot()
+    METRICS.set_gauge(WATCHLIST_ENTRIES, len(snapshot.watchlist))
+    METRICS.set_gauge(BLOOM_FP_RATE, snapshot.bloom.current_false_positive_rate)
+
+
 def _watchlist_summary(store: WatchlistStore) -> dict:
     # One snapshot, not four separate `store.watchlist` / `store.bloom`
     # reads -- a reload landing mid-call must not produce a summary mixing
@@ -83,7 +94,15 @@ async def lifespan(app: FastAPI):
     recent = RecentAlertsPublisher(max_size=settings.recent_alerts_size)
     publishers = [recent]
     if settings.redis_url:
-        publishers.append(RedisStreamPublisher(settings.redis_url, settings.redis_stream_key))
+        publishers.append(
+            RedisStreamPublisher(
+                settings.redis_url,
+                settings.redis_stream_key,
+                settings.alert_stream_maxlen,
+                socket_timeout_s=settings.redis_socket_timeout_s,
+                socket_connect_timeout_s=settings.redis_socket_connect_timeout_s,
+            )
+        )
     else:
         log.warning("PRAHARI_MATCH_REDIS_URL not set; alerts fan out only to /api/v1/alerts")
     fan_out = FanOutPublisher(publishers) if len(publishers) > 1 else recent
@@ -94,6 +113,8 @@ async def lifespan(app: FastAPI):
             settings.redis_url,
             settings.redis_detection_stream_key,
             settings.detection_stream_maxlen,
+            socket_timeout_s=settings.redis_socket_timeout_s,
+            socket_connect_timeout_s=settings.redis_socket_connect_timeout_s,
         )
     else:
         detection_publisher = NullDetectionPublisher()
@@ -103,6 +124,7 @@ async def lifespan(app: FastAPI):
     app.state.deduper = deduper
     app.state.recent_alerts = recent
     app.state.publisher = fan_out
+    _record_watchlist_gauges(store)
 
     grpc_server = serve(store, deduper, fan_out, settings, detection_publisher=detection_publisher)
     app.state.grpc_server = grpc_server
@@ -167,6 +189,15 @@ async def readyz(store: StoreDep, response: Response) -> dict:
     return {"status": "ready", **summary}
 
 
+@app.get("/metrics", tags=["ops"], response_class=PlainTextResponse)
+async def metrics() -> str:
+    """Prometheus text exposition of the process-local counters and gauges --
+    ingest accept/reject, funnel rates, dedup suppression, publish failures,
+    watchlist size, bloom fp rate, in-flight gRPC streams. No prometheus
+    client dep: the service needs a dozen numbers, not a registry."""
+    return METRICS.render()
+
+
 # --- watchlist admin -----------------------------------------------------------
 
 
@@ -196,6 +227,7 @@ def watchlist_reload(request: Request, settings: SettingsDep) -> dict:
     watchlist = _load_watchlist(settings)
     bloom = _build_bloom(watchlist, settings)
     store.replace(watchlist, bloom)
+    _record_watchlist_gauges(store)
     return {"status": "reloaded", **_watchlist_summary(store)}
 
 

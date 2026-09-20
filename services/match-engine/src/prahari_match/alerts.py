@@ -24,6 +24,7 @@ from google.protobuf.timestamp_pb2 import Timestamp
 from prahari.v1 import events_pb2
 
 from .matcher import MatchResult
+from .metrics import ALERT_PUBLISH_FAILURES, METRICS
 
 __all__ = [
     "AlertBuilder",
@@ -98,31 +99,73 @@ class RedisStreamPublisher:
     on first use rather than at construction, so a service can start (and
     serve /healthz) before Redis is reachable -- matching the same
     "observe, don't gate startup on a dependency" pattern as the registry's
-    `/healthz`."""
+    `/healthz`.
 
-    def __init__(self, redis_url: str, stream_key: str) -> None:
+    `XADD` carries `MAXLEN ~ maxlen` for the same reason the detections stream
+    does: an unbounded producer must not grow the stream forever on a
+    long-running demo. Alerts are the lower-rate stream (deduped watchlist
+    hits only), so the cap is smaller than `detection_stream_maxlen`."""
+
+    def __init__(
+        self,
+        redis_url: str,
+        stream_key: str,
+        maxlen: int,
+        *,
+        socket_timeout_s: float = 5.0,
+        socket_connect_timeout_s: float = 2.0,
+    ) -> None:
         self._redis_url = redis_url
         self._stream_key = stream_key
+        self._maxlen = maxlen
+        self._socket_timeout_s = socket_timeout_s
+        self._socket_connect_timeout_s = socket_connect_timeout_s
         self._client = None
 
     def _client_or_connect(self):
         if self._client is None:
             import redis
 
-            self._client = redis.Redis.from_url(self._redis_url)
+            # Socket timeouts are mandatory here: a hung Redis on an unbounded
+            # read wedges one of the `grpc_max_workers` handler threads per
+            # in-flight publish until the pool is gone.
+            self._client = redis.Redis.from_url(
+                self._redis_url,
+                socket_timeout=self._socket_timeout_s,
+                socket_connect_timeout=self._socket_connect_timeout_s,
+            )
         return self._client
 
     def publish(self, alert: events_pb2.Alert) -> None:
-        try:
-            client = self._client_or_connect()
-            client.xadd(self._stream_key, {"alert": alert.SerializeToString()})
-        except Exception:
-            # A Redis blip must not fail the gRPC ack the worker is waiting
-            # on, and must not be mistaken for a bad match -- the alert was
-            # correctly built and scored; only its delivery to the bus failed.
-            log.exception(
-                "failed to publish alert %s to redis stream %s", alert.alert_id, self._stream_key
-            )
+        # An alert is worth one retry where a detection is not (detections.py):
+        # this stream is low-rate, so a second attempt costs little, and the
+        # alert may be the only copy of a watchlist hit the bus ever sees. On
+        # failure the connection is dropped so the retry reconnects rather
+        # than reusing the socket that just timed out. After that, drop with a
+        # counter -- a Redis blip must not fail the gRPC ack the worker is
+        # waiting on, and must not be mistaken for a bad match.
+        fields = {"alert": alert.SerializeToString()}
+        for attempt in range(2):
+            try:
+                client = self._client_or_connect()
+                client.xadd(self._stream_key, fields, maxlen=self._maxlen, approximate=True)
+                return
+            except Exception:
+                self._client = None
+                if attempt == 0:
+                    log.warning(
+                        "failed to publish alert %s to redis stream %s; reconnecting and "
+                        "retrying once",
+                        alert.alert_id,
+                        self._stream_key,
+                    )
+                else:
+                    METRICS.inc(ALERT_PUBLISH_FAILURES)
+                    log.exception(
+                        "failed to publish alert %s to redis stream %s after retry; dropping",
+                        alert.alert_id,
+                        self._stream_key,
+                    )
 
 
 class RecentAlertsPublisher:

@@ -36,6 +36,29 @@ class MatchSettings(BaseSettings):
     grpc_port: int = 9001
     grpc_max_workers: int = 10
 
+    grpc_max_concurrent_streams: int = 100
+    """`grpc.max_concurrent_streams` server option: caps HTTP/2 streams per
+    connection so one misbehaving worker cannot open unbounded streams. The
+    handler pool is `grpc_max_workers` (10) threads; a worker holding a stream
+    open is cheap until it sends, so the cap sits well above the worker
+    count — it bounds memory, not concurrency."""
+
+    grpc_max_receive_message_bytes: int = 4 * 1024 * 1024
+    """`grpc.max_receive_message_length` server option. A `VehicleDetection` is
+    hundreds of bytes; 4 MiB is generous headroom for a coalesced or padded
+    message while still refusing the genuinely malformed."""
+
+    max_raw_text_chars: int = 64
+    """Upper bound on `PlateReading.raw_text` accepted at the gRPC boundary.
+    No real plate is anywhere near 64 characters; beyond it the reading is a
+    bug or an attack, and `match()` re-normalises it into scoring work for
+    nothing. Rejected messages count in `IngestAck.rejected`."""
+
+    max_char_confidences: int = 64
+    """Upper bound on `PlateReading.char_confidence` list length. The list is
+    index-aligned with `raw_text` (bounded by `max_raw_text_chars`), so a
+    longer list is malformed input, not signal."""
+
     # --- HTTP surface --------------------------------------------------------
 
     http_port: int = 8001
@@ -115,7 +138,24 @@ class MatchSettings(BaseSettings):
     Deliberately optional: the accuracy tests, and a laptop run before Redis
     is wired into `make up`, must not require it."""
 
+    redis_socket_timeout_s: float = 5.0
+    """`socket_timeout` for `redis.Redis.from_url`. Without it a hung Redis
+    wedges a gRPC handler thread on `XADD` forever; with 10 handler threads a
+    dead Redis would take the whole ingest link down with it. A timed-out
+    publish logs and drops instead (see alerts.py/detections.py)."""
+
+    redis_socket_connect_timeout_s: float = 2.0
+    """`socket_connect_timeout` for `redis.Redis.from_url` -- the connect path
+    gets a tighter bound than steady-state reads so a dead Redis fails fast
+    rather than queuing behind TCP retries."""
+
     redis_stream_key: str = "prahari:alerts"
+
+    alert_stream_maxlen: int = 50_000
+    """`XADD ... MAXLEN ~` cap on the alerts stream — previously a bare XADD,
+    so a long-running demo grew `prahari:alerts` without bound. Alerts are the
+    lower-rate of the two streams this service writes (watchlist hits only,
+    already deduped), so the cap sits a quarter of `detection_stream_maxlen`."""
 
     recent_alerts_size: int = 500
     """Bounded in-memory ring buffer backing `/api/v1/alerts` -- a debug/admin
