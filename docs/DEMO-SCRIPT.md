@@ -10,10 +10,12 @@ below requires a feature that does not exist — where the honest answer is
 ```bash
 make cluster          # k3d (skippable if the cluster exists)
 make proto images     # stubs first — images ImportError without them
-make up               # helm upgrade --install, profile=local
+# Secrets BEFORE up: secretKeyRef env binds at pod creation — a Secret
+# created after the deploy is invisible until a restart.
 make internal-secret  # internal-token + credential-key (create-if-absent)
 make gateway-secret   # .env → prahari-gateway (catalogue sync needs it)
 make bff-bootstrap    # first-login admin Secret (needs the two env vars in .env)
+make up               # helm upgrade --install, profile=local
 ```
 
 Console: `http://localhost:3000` (k3d port map). BFF: `:8080`. Sign in with
