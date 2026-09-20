@@ -137,13 +137,17 @@ class FakeUserRepo:
 
 
 class FakeSessionRepo:
-    def __init__(self) -> None:
+    def __init__(self, sessions: dict[str, tuple[User, str]] | None = None) -> None:
         self.created_for: str | None = None
         self.revoked: list[str] = []
+        self._sessions = sessions or {}
 
     async def create(self, user_id: str, *, ttl_hours: int):
         self.created_for = user_id
         return "session-cookie", datetime.now(UTC) + timedelta(hours=ttl_hours)
+
+    async def resolve(self, session_id: str) -> tuple[User, str] | None:
+        return self._sessions.get(session_id)
 
     async def revoke(self, session_id: str) -> None:
         self.revoked.append(session_id)
