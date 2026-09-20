@@ -8,6 +8,7 @@ registry intact rather than half-written.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -250,6 +251,46 @@ async def test_successful_sync_reconciles_mediamtx(snapshot: Catalogue):
     mediamtx = FakeMediaMTX()
     await make_sync(FakeRepo(), mediamtx).run_once(snapshot)
     assert len(mediamtx.reconciled) == 1
+
+
+async def test_finish_sync_run_failure_does_not_mask_the_result(snapshot: Catalogue):
+    """Recording the run is bookkeeping; the pass already happened. A failure
+    there must not turn a good sync (or its real error) into an exception."""
+
+    class BadFinishRepo(FakeRepo):
+        async def finish_sync_run(self, run_id: int, result: SyncResult) -> None:
+            raise RuntimeError("db gone mid-write")
+
+    result = await make_sync(BadFinishRepo()).run_once(snapshot)
+    assert result.ok
+    assert result.finished_at is not None
+
+
+async def test_sync_loop_survives_a_failing_first_pass():
+    """The startup pass used to run outside the loop's try/except: one
+    transient failure at boot — the likeliest time for a DB blip — killed the
+    background task and silently ended every future sync."""
+    sync = make_sync(FakeRepo())
+    sync._s = RegistrySettings(
+        catalogue_source="test-gateway", sync_on_startup=True, sync_interval_s=0.01
+    )
+    calls = 0
+
+    async def flaky_pass():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("db blip at boot")
+        return None
+
+    sync.run_once_locked = flaky_pass  # type: ignore[method-assign]
+    task = asyncio.create_task(sync._loop())
+    await asyncio.sleep(0.15)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # The loop kept running past the raising first pass.
+    assert calls > 1
 
 
 def test_snapshot_round_trip_needs_no_network(snapshot: Catalogue):

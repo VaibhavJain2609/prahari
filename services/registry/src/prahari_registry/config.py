@@ -58,6 +58,15 @@ class RegistrySettings(BaseSettings):
     mediamtx_hls_port: int = 8888
     mediamtx_whep_port: int = 8889
 
+    # --- connectivity probe ----------------------------------------------------
+
+    probe_allowed_ports: set[int] = {554}
+    """Ports `/api/v1/cameras/probe` may connect to (`PRAHARI_PROBE_ALLOWED_PORTS`,
+    JSON list, e.g. `[554, 8554]`). The probe is a server-side connect to a
+    caller-supplied host — SSRF — so the port list defaults closed at the RTSP
+    well-known port rather than open. Anything not listed is refused with a 400
+    before DNS is even consulted."""
+
     # --- access ----------------------------------------------------------
 
     internal_token: str = ""

@@ -29,6 +29,7 @@ from .models import (
     GeoPoint,
     HealthState,
     Heartbeat,
+    HeartbeatSample,
     Lifecycle,
     Org,
     OrgCreate,
@@ -39,6 +40,40 @@ from .models import (
 
 log = logging.getLogger(__name__)
 
+_MAX_OBSERVED_AT_SKEW_S = 60.0
+"""How far into the future a heartbeat's `observed_at` may run ahead of the
+registry's clock before we stop trusting it. `last_heartbeat_at` is updated
+with GREATEST(), so a worker with a wildly wrong clock (or a malicious one)
+could stamp next year and permanently suppress the staleness overlay for that
+camera — the camera would read healthy forever after dying. Small skews are
+real (NTP is not perfect), so we clamp rather than reject."""
+
+
+def _clamp_observed_at(observed_at: datetime | None) -> datetime:
+    """The `observed_at` a heartbeat is actually recorded under.
+
+    `None` becomes now — the worker did not timestamp it. A timestamp more than
+    `_MAX_OBSERVED_AT_SKEW_S` ahead of now is clamped to now rather than
+    rejected, because a worker with a fast clock is still reporting a live
+    camera and a 422 would just make it retry forever; but its timestamp must
+    not be allowed to poison `last_heartbeat_at` via GREATEST.
+    """
+    now = datetime.now(UTC)
+    if observed_at is None:
+        return now
+    # A naive timestamp is interpreted as UTC — the workers all run UTC, and
+    # comparing naive against aware would raise here instead.
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=UTC)
+    if (observed_at - now).total_seconds() > _MAX_OBSERVED_AT_SKEW_S:
+        log.warning(
+            "heartbeat observed_at %s is >%.0fs in the future; clamped to now",
+            observed_at.isoformat(),
+            _MAX_OBSERVED_AT_SKEW_S,
+        )
+        return now
+    return observed_at
+
 
 def _point(location: GeoPoint | None) -> str | None:
     """WKT for a geography(Point, 4326). Longitude first — the commonest way to
@@ -46,6 +81,24 @@ def _point(location: GeoPoint | None) -> str | None:
     if location is None:
         return None
     return f"SRID=4326;POINT({location.longitude} {location.latitude})"
+
+
+def redact_url_credentials(url: str) -> str:
+    """The same URL minus its userinfo — `rtsp://user:pass@host:554/x` becomes
+    `rtsp://host:554/x`.
+
+    Exists for the diagnostic surface (`GET /api/v1/streams/paths`): the
+    mapping `desired_mediamtx_paths` returns embeds decrypted DVR credentials
+    because MediaMTX's reconcile needs them to pull the source. That secret
+    must never leave the process in an HTTP response, so the endpoint renders
+    every URL through this. The reconcile path keeps the credentialed form —
+    stripping there would silently break every authenticated pull.
+    """
+    parts = urlsplit(url)
+    netloc = parts.hostname or ""
+    if parts.port is not None:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def _with_credentials(url: str, username: str | None, password: str) -> str:
@@ -555,6 +608,58 @@ class CameraRepository:
         tamper = [r["tamper_suspected"] for r in rows]
         return fps, tamper
 
+    async def health_history(
+        self,
+        camera_id: str,
+        *,
+        scope: str,
+        since: datetime | None = None,
+        limit: int = 100,
+    ) -> list[HeartbeatSample]:
+        """Stored heartbeats for one camera, newest first.
+
+        Backs `GET /cameras/{id}/health-history` — the console's camera detail
+        drawer. Scope-gated by the same `o.path <@ scope` predicate as `get`:
+        a heartbeat is camera data, and camera data is only visible inside the
+        caller's subtree. `since` bounds the window; `limit` is bounded by the
+        endpoint (≤500) so a drawer cannot pull the whole retention window.
+        """
+        rows = await self._pool.fetch(
+            """
+            SELECT h.observed_at, h.worker_id, h.connected, h.measured_fps,
+                   h.last_frame_at, h.frames_decoded, h.consecutive_failures,
+                   h.black_frame_ratio, h.tamper_suspected, h.loop_epoch, h.last_error
+            FROM camera_heartbeat h
+            JOIN cameras c ON c.id = h.camera_id
+            JOIN orgs o ON o.id = c.org_id
+            WHERE h.camera_id = $1::uuid
+              AND o.path <@ $2::ltree
+              AND ($3::timestamptz IS NULL OR h.observed_at >= $3)
+            ORDER BY h.observed_at DESC
+            LIMIT $4
+            """,
+            camera_id,
+            scope,
+            since,
+            limit,
+        )
+        return [
+            HeartbeatSample(
+                observed_at=r["observed_at"],
+                worker_id=r["worker_id"],
+                connected=r["connected"],
+                measured_fps=r["measured_fps"],
+                last_frame_at=r["last_frame_at"],
+                frames_decoded=r["frames_decoded"],
+                consecutive_failures=r["consecutive_failures"],
+                black_frame_ratio=r["black_frame_ratio"],
+                tamper_suspected=r["tamper_suspected"],
+                loop_epoch=r["loop_epoch"],
+                last_error=r["last_error"],
+            )
+            for r in rows
+        ]
+
     async def prune_heartbeats(self, *, retention_days: int) -> int:
         """Delete heartbeats older than the retention window; returns the count.
 
@@ -580,7 +685,7 @@ class CameraRepository:
     async def record_heartbeat(
         self, camera_id: str, heartbeat: Heartbeat, verdict: HealthVerdict
     ) -> None:
-        observed_at = heartbeat.observed_at or datetime.now(UTC)
+        observed_at = _clamp_observed_at(heartbeat.observed_at)
         async with self._pool.acquire() as conn, conn.transaction():
             await conn.execute(
                 """
@@ -693,10 +798,15 @@ class CameraRepository:
         buys reconnect noise.
 
         A locally-registered camera's credential is decrypted here and only
-        here: this is the one place the raw upstream URL is assembled, and it
-        goes to the MediaMTX API, never back out to an HTTP caller —
-        `fanout_endpoints()` in `mediamtx.py` hands callers only the
-        MediaMTX-fronted public URL, never this one.
+        here: this is the one place the raw upstream URL is assembled, and the
+        result embeds `user:pass` in each URL.
+
+        **Callers must not hand this mapping to an HTTP response.** It exists
+        for the MediaMTX API only — `MediaMTXClient.reconcile` needs the
+        credentialed URL to configure the source pull. The one HTTP consumer,
+        `GET /api/v1/streams/paths`, renders every value through
+        `redact_url_credentials` before serialising; `fanout_endpoints()` in
+        `mediamtx.py` hands callers only the MediaMTX-fronted public URL.
         """
         rows = await self._pool.fetch(
             """

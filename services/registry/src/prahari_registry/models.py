@@ -300,16 +300,20 @@ class Heartbeat(BaseModel):
     observed_at: datetime | None = None
     connected: bool = True
 
-    measured_fps: float | None = None
+    measured_fps: float | None = Field(default=None, ge=0)
     """From PTSClock.measured_fps. Null until enough frames have been seen to
-    measure — that is not a fault, and must not read as one."""
+    measure — that is not a fault, and must not read as one. Bounded below at
+    zero: a negative rate is a bug in the reporter, and letting it through would
+    corrupt the drift baseline it gets folded into."""
 
     last_frame_at: datetime | None = None
-    frames_decoded: int = 0
-    consecutive_failures: int = 0
-    black_frame_ratio: float | None = None
+    frames_decoded: int = Field(default=0, ge=0)
+    consecutive_failures: int = Field(default=0, ge=0)
+    black_frame_ratio: float | None = Field(default=None, ge=0, le=1)
+    """A ratio, so [0, 1]. Anything outside that range is a broken reporter,
+    not a camera that is somehow more than entirely black."""
     tamper_suspected: bool = False
-    loop_epoch: int = 0
+    loop_epoch: int = Field(default=0, ge=0)
     last_error: str | None = None
 
 
@@ -321,6 +325,29 @@ class HeartbeatAck(BaseModel):
     """The camera's own recent median delivery rate, which drift is judged
     against. Returned so a worker's logs explain a degraded verdict without a
     round trip to the database."""
+
+
+class HeartbeatSample(BaseModel):
+    """One stored heartbeat, as served by `GET /cameras/{id}/health-history`.
+
+    This is the raw observation the worker sent — deliberately NOT the derived
+    verdict (`health.py` derives state at read time, and the detail drawer
+    wants to show the observations the verdicts were computed from). Column set
+    mirrors `camera_heartbeat` (migration 003); there is no surrogate id because
+    the table has none — `(camera_id, observed_at)` is the identity.
+    """
+
+    observed_at: datetime
+    worker_id: str
+    connected: bool
+    measured_fps: float | None = None
+    last_frame_at: datetime | None = None
+    frames_decoded: int = 0
+    consecutive_failures: int = 0
+    black_frame_ratio: float | None = None
+    tamper_suspected: bool = False
+    loop_epoch: int = 0
+    last_error: str | None = None
 
 
 class SyncResult(BaseModel):
