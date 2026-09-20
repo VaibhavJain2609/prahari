@@ -1,8 +1,8 @@
 import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import AlertPanel from "./AlertPanel";
+import AlertsRail from "./AlertsRail";
 
-// The panel subscribes to the shared stream in lib/alerts.ts, whose
+// The rail subscribes to the shared stream in lib/alerts.ts, whose
 // EventSource is a module-level singleton — so the mock captures it once
 // and both tests drive the same instance, exactly like the real console.
 class MockEventSource {
@@ -35,6 +35,7 @@ class MockEventSource {
 
 const ALERT = {
   alert_id: "alert-1",
+  dedup_key: "cam-7|GJ01AB1234|bucket-1",
   raised_at: new Date(Date.now() - 90_000).toISOString(),
   priority: "ALERT_PRIORITY_CRITICAL",
   detection: {
@@ -67,9 +68,9 @@ function stream(): MockEventSource {
   return es;
 }
 
-describe("AlertPanel", () => {
+describe("AlertsRail", () => {
   it("renders an alert with priority, reason and a raised-at time", () => {
-    render(<AlertPanel />);
+    render(<AlertsRail />);
     const es = stream();
     act(() => es.emit("alert", ALERT));
 
@@ -80,12 +81,23 @@ describe("AlertPanel", () => {
     expect(screen.getByRole("button", { name: /match explanation/i })).toBeTruthy();
   });
 
-  it("dedupes a replayed alert_id instead of adding a second row", () => {
-    render(<AlertPanel />);
+  it("folds a repeated dedup_key into one row with a ×n counter", () => {
+    render(<AlertsRail />);
     const es = stream();
     act(() => es.emit("alert", ALERT));
-    act(() => es.emit("alert", ALERT));
+    act(() => es.emit("alert", { ...ALERT, alert_id: "alert-2" }));
 
     expect(screen.getAllByText("GJ01AB1234 at cam-7")).toHaveLength(1);
+    expect(screen.getByText("×2")).toBeTruthy();
+  });
+
+  it("opens the camera drawer via onCameraSelect when a row is clicked", () => {
+    const onSelect = vi.fn();
+    render(<AlertsRail onCameraSelect={onSelect} />);
+    const es = stream();
+    act(() => es.emit("alert", ALERT));
+
+    act(() => screen.getByText("GJ01AB1234 at cam-7").click());
+    expect(onSelect).toHaveBeenCalledWith("cam-7");
   });
 });

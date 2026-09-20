@@ -41,17 +41,27 @@ describe("api", () => {
     expect(assign).not.toHaveBeenCalled();
   });
 
-  it("sends the operator's case reference in X-Purpose-Code", async () => {
+  it("sends the operator's composed purpose code in X-Purpose-Code", async () => {
     vi.mocked(fetch).mockResolvedValue(
       jsonResponse(200, { plate: "GJ01AB1234", hops: [], rejected: [], dark_zones: [] }),
     );
 
-    await api.getRoute("GJ01AB1234", "FIR-42/2026");
+    await api.getRoute("GJ01AB1234", "plate-trace:FIR-42/2026");
 
     const [, init] = vi.mocked(fetch).mock.calls[0];
     expect(new Headers(init?.headers).get("x-purpose-code")).toBe(
       "plate-trace:FIR-42/2026",
     );
+  });
+
+  it("sends the purpose code verbatim on audited camera reads", async () => {
+    vi.mocked(fetch).mockResolvedValue(jsonResponse(200, { id: "cam-1" }));
+
+    await api.getCamera("cam-1", "investigation:FIR-9");
+
+    const [url, init] = vi.mocked(fetch).mock.calls[0];
+    expect(url).toBe("/api/bff/cameras/cam-1");
+    expect(new Headers(init?.headers).get("x-purpose-code")).toBe("investigation:FIR-9");
   });
 
   it("passes bbox and limit through to the geojson endpoint", async () => {
