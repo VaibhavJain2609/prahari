@@ -7,11 +7,21 @@ another, every lookup misses and nothing raises. That is the silent failure the
 entire match-engine design exists to prevent, so the vocabulary cannot live in
 either consumer.
 
-What is here: grammar — stripping, uppercasing, format classification, and the
-positional character mask that falls out of a format.
+What is here: grammar — stripping, uppercasing, format classification, the
+positional character mask that falls out of a format, and `skeleton()`, the
+canonicalisation that folds every OCR-confusable character onto its class's
+fixed representative. Skeleton-folding is grammar, not tolerance: it states
+which glyphs are interchangeable *spellings* of the same plate so that two
+readings land on one identity key (the match engine's stage-1 buckets, and
+the correlation service's per-plate sighting index — keying that index on
+raw normalised text fragments one vehicle into two routes on a single
+`2`/`Z` misread).
 
-What is deliberately NOT here: tolerance. Confusion classes, edit costs and
-scoring belong to the match engine, where a correction is scored and auditable.
+What is deliberately NOT here: tolerance. Edit costs, confidence weighting
+and scoring belong to the match engine, where a correction is scored and
+auditable. `skeleton()` itself is score-free canonicalisation: it never
+decides which of two confusable readings is *right*, it only gives both the
+same key.
 
 INVARIANT (also stated in `events.proto`): normalisation never *corrects* a
 plate. It removes separators and case. It does not turn `O` into `0` because a
@@ -26,6 +36,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 
 __all__ = [
+    "CONFUSION_CLASSES",
     "MASK_ALPHA",
     "MASK_DIGIT",
     "MASK_FREE",
@@ -33,6 +44,7 @@ __all__ = [
     "PlateFormat",
     "normalise_plate",
     "project_confidences",
+    "skeleton",
 ]
 
 
@@ -171,6 +183,43 @@ def normalise_plate(raw: str) -> NormalisedPlate:
 
     fmt, mask = _mask_for(text)
     return NormalisedPlate(text=text, format=fmt, mask=mask, source_index=tuple(index))
+
+
+# Bidirectional confusion classes: glyphs Indian-plate OCR reliably mixes up.
+# Membership, not direction, is what matters — OCR that misreads 0 as O is
+# exactly as likely to misread O as 0. Shared with the match engine (which
+# prices a substitution inside a class far cheaper than one across classes)
+# so the canonicalisation here and the tolerance there can never disagree on
+# which characters are confusable — one table, two consumers.
+CONFUSION_CLASSES: tuple[frozenset[str], ...] = (
+    frozenset("0ODQ"),
+    frozenset("8B"),
+    frozenset("1IL"),
+    frozenset("5S"),
+    frozenset("2Z"),
+    frozenset("6G"),
+)
+
+# One canonical representative per class, chosen arbitrarily but fixed, so
+# `skeleton()` is deterministic. Digits, since a skeleton is compared against
+# other skeletons rather than displayed.
+_CANONICAL_BY_CLASS: dict[int, str] = {0: "0", 1: "8", 2: "1", 3: "5", 4: "2", 5: "6"}
+
+_CLASS_OF: dict[str, int] = {ch: idx for idx, cls in enumerate(CONFUSION_CLASSES) for ch in cls}
+
+
+def skeleton(text: str) -> str:
+    """Fold every confusable character in `text` onto its class's canonical
+    representative, so `GJ01AB1Z34` and `GJ01AB1234` produce the same string.
+
+    Canonicalisation, not correction: a skeleton is an identity *key*, never
+    display text — it answers "which bucket does this reading belong to" for
+    the match engine's stage-1 index and the correlation store's per-plate
+    sightings, while the raw reading stays on the record as what was actually
+    observed. Feed it already-normalised text (`normalise_plate(...).text`);
+    separators and lowercase are grammar's job, not this function's.
+    """
+    return "".join(_CANONICAL_BY_CLASS.get(_CLASS_OF.get(ch, -1), ch) for ch in text)
 
 
 def project_confidences(

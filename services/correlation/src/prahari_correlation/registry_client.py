@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from .metrics import Metrics
+
 __all__ = ["GeoPoint", "DarkZone", "RegistryClient"]
 
 log = logging.getLogger(__name__)
@@ -37,9 +39,11 @@ class RegistryClient:
         timeout_s: float,
         cache_ttl_s: float,
         client: httpx.AsyncClient | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         self._cache_ttl_s = cache_ttl_s
         self._client = client or httpx.AsyncClient(base_url=base_url, timeout=timeout_s)
+        self._metrics = metrics if metrics is not None else Metrics()
         # camera_id -> (cached_at_monotonic, location). A miss (camera has no
         # location, or the lookup failed) is cached too -- otherwise a
         # location-less camera costs one HTTP round trip on every hop for the
@@ -61,6 +65,7 @@ class RegistryClient:
             response = await self._client.get(f"/api/v1/cameras/{camera_id}")
             response.raise_for_status()
         except httpx.HTTPError:
+            self._metrics.inc("registry_lookup_failures")
             log.exception("failed to fetch camera %s from registry", camera_id)
             return None
 

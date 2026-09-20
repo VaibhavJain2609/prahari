@@ -35,6 +35,7 @@ class DetectionConsumer:
         ping_client: _PingableRedis | None = None,
     ) -> None:
         self._redis_url = redis_url
+        self._stream_key = stream_key
         self._store = store
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -95,6 +96,26 @@ class DetectionConsumer:
         except Exception:
             log.exception("detection consumer readiness ping failed")
             return False
+
+    def stream_length(self) -> int | None:
+        """XLEN of the detections stream, or `None` when it cannot be known
+        (no Redis configured, Redis unreachable, a ping-only test double).
+
+        Exposed as a metric under the name `detections_stream_length` -- NOT
+        `consumer_lag`: this consumer reads with `start_id="$"` rather than a
+        consumer group, so no server-side pending count exists to report, and
+        emitting XLEN *as* lag would report history the consumer will never
+        read as backlog. Total stream length is the honest cheap signal."""
+        if self._redis_url is None:
+            return None
+        try:
+            client = self._ping_client_or_connect()
+            xlen = getattr(client, "xlen", None)
+            if xlen is None:
+                return None
+            return int(xlen(self._stream_key))
+        except Exception:
+            return None
 
     def _ping_client_or_connect(self) -> _PingableRedis:
         if self._ping_client is None:

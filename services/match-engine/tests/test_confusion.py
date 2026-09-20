@@ -9,13 +9,14 @@ scorer rewards nonsense. These tests pin the exact behaviour DAY2-DESIGN.md
 from __future__ import annotations
 
 import pytest
+from prahari_common.plates import skeleton
 
 from prahari_match.confusion import (
     in_same_confusion_class,
-    skeleton,
     substitution_cost,
     weighted_levenshtein,
 )
+from prahari_match.confusion import skeleton as compat_skeleton
 
 # Every bidirectional confusion class the model claims to know about.
 CONFUSION_PAIRS = [
@@ -68,6 +69,14 @@ def test_skeleton_is_a_pure_function_of_confusion_class() -> None:
 def test_skeleton_leaves_unconfusable_characters_untouched() -> None:
     assert skeleton("JK") == "JK"  # neither letter belongs to any confusion class
     assert skeleton("9") == "9"  # 9 is in no confusion class
+
+
+def test_confusion_module_still_reexports_skeleton_for_compat() -> None:
+    # `skeleton()`'s canonical home moved to prahari_common.plates (grammar,
+    # not tolerance); confusion.py re-exports it so watchlist.py, matcher.py
+    # and the Day-3 gate keep working. Pin that the re-export is the SAME
+    # function, not a diverging copy.
+    assert compat_skeleton is skeleton
 
 
 class TestSubstitutionCost:

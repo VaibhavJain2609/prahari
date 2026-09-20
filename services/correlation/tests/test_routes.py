@@ -159,10 +159,74 @@ async def test_unknown_camera_location_passes_through_ungated() -> None:
     result = await build_route("GJ01AB1234", store, registry, MAX_SPEED_KMH, APPEARANCE_THRESHOLD)
 
     assert [h.camera_id for h in result.hops] == ["CAM-A", "CAM-UNMAPPED"]
-    assert result.hops[1].link_kind == LinkKind.PLATE
+    # The sighting is kept -- it is real and plate-confirmed -- but the link
+    # to it was never feasibility-gated, and must say so rather than read
+    # identically to a gated "plate" hop in the evidence export.
+    assert result.hops[1].link_kind == LinkKind.UNVERIFIED
     assert result.hops[1].confidence == 1.0
     assert result.hops[1].location is None
+    assert result.ungated_hops == 1
     assert result.rejected == []
+
+
+async def test_consecutive_same_camera_detections_collapse_into_one_dwell_hop() -> None:
+    # A vehicle in frame for 8 s at ~3 fps is ~24 detections; the route must
+    # show ONE hop carrying the dwell interval, not 24 identical-camera hops.
+    store = DetectionStore(max_per_plate=50, max_plates=10)
+    for i in range(5):
+        store.add(_detection("CAM-A", plate_text="GJ01AB1234", wall_clock_s_value=1000.0 + i))
+    store.add(_detection("CAM-B", plate_text="GJ01AB1234", wall_clock_s_value=1600.0))
+    registry = _FakeRegistry({"CAM-A": CAM_A, "CAM-B": CAM_B})
+
+    result = await build_route("GJ01AB1234", store, registry, MAX_SPEED_KMH, APPEARANCE_THRESHOLD)
+
+    assert [h.camera_id for h in result.hops] == ["CAM-A", "CAM-B"]
+    dwell = result.hops[0]
+    assert dwell.sightings == 5
+    assert dwell.first_seen_s == 1000.0
+    assert dwell.last_seen_s == 1004.0
+    assert dwell.link_kind is None
+    assert result.hops[1].link_kind == LinkKind.PLATE
+    # The leg was timed from the END of the dwell (1004) to the first sighting
+    # at CAM-B (1600): ~5.5km in 596s is feasible either way here, but the
+    # store still holds all five raw sightings as evidence.
+    assert len(store.by_plate("GJ01AB1234")) == 6
+
+
+async def test_dwell_end_not_start_is_the_leg_departure_time() -> None:
+    # ~5.55 km from CAM-A to CAM-B. If the leg were timed from the dwell's
+    # FIRST sighting (1000s) the 660s gap would be feasible; timed honestly
+    # from the LAST (1750s, while the vehicle was still in frame) the 10s
+    # gap implies ~2000 km/h -- a rejection, not a hop.
+    store = DetectionStore(max_per_plate=50, max_plates=10)
+    for i in range(3):
+        store.add(
+            _detection("CAM-A", plate_text="GJ01AB1234", wall_clock_s_value=1000.0 + i * 375)
+        )  # dwell spans 1000..1750
+    store.add(_detection("CAM-B", plate_text="GJ01AB1234", wall_clock_s_value=1760.0))
+    registry = _FakeRegistry({"CAM-A": CAM_A, "CAM-B": CAM_B})
+
+    result = await build_route("GJ01AB1234", store, registry, MAX_SPEED_KMH, APPEARANCE_THRESHOLD)
+
+    assert [h.camera_id for h in result.hops] == ["CAM-A"]
+    assert len(result.rejected) == 1
+    assert result.rejected[0].from_camera_id == "CAM-A"
+    assert result.rejected[0].to_camera_id == "CAM-B"
+
+
+async def test_non_consecutive_same_camera_is_not_collapsed() -> None:
+    # A, B, A is a return journey, not a dwell -- only CONSECUTIVE
+    # same-camera sightings fold.
+    store = DetectionStore(max_per_plate=50, max_plates=10)
+    store.add(_detection("CAM-A", plate_text="GJ01AB1234", wall_clock_s_value=1000.0))
+    store.add(_detection("CAM-B", plate_text="GJ01AB1234", wall_clock_s_value=1600.0))
+    store.add(_detection("CAM-A", plate_text="GJ01AB1234", wall_clock_s_value=2200.0))
+    registry = _FakeRegistry({"CAM-A": CAM_A, "CAM-B": CAM_B})
+
+    result = await build_route("GJ01AB1234", store, registry, MAX_SPEED_KMH, APPEARANCE_THRESHOLD)
+
+    assert [h.camera_id for h in result.hops] == ["CAM-A", "CAM-B", "CAM-A"]
+    assert all(h.sightings == 1 for h in result.hops)
 
 
 async def test_a_rejected_middle_hop_does_not_fracture_the_rest_of_the_route() -> None:

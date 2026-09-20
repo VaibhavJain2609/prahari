@@ -59,6 +59,22 @@ class CorrelationSettings(BaseSettings):
     a speed envelope, not a hard distance cap -- a 200 km hop over 3 hours is
     plausible, the same 200 km over 3 minutes is not."""
 
+    clock_skew_allowance_s: float = 5.0
+    """How far two cameras' wall clocks may disagree before a hop between them
+    is treated as broken data rather than motion. Used in two places with the
+    same bound, so the ingest gate and the feasibility gate can never disagree
+    on what "slightly out of sync" means:
+
+    * `check_feasibility` -- `elapsed_s` in `[-allowance, 0]` is treated as
+      ~zero elapsed (feasible only at ~zero distance); more negative than the
+      allowance is rejected as `negative_elapsed`, a timestamp problem, not a
+      speed problem.
+    * `DetectionStore.add` -- a detection whose `observed_at.wall_clock` is
+      more than this far in the FUTURE is dropped as poisoned; indexing it
+      would pin it at the end of the plate's history and turn every real
+      later sighting into a negative-elapsed hop.
+    """
+
     camera_location_cache_ttl_s: float = 300.0
     """How long a camera's `GeoPoint`, fetched from the registry, is cached
     before being re-fetched. The registry is the source of truth for camera

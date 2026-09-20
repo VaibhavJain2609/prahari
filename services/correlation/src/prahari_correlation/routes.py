@@ -4,7 +4,24 @@ into an ordered, physically-defensible route.
 `hops` is the *connected* route -- consecutive sightings that chain together
 either via an appearance-bridged waypoint (`link_kind="bridged"`,
 DAY3-DESIGN.md §3.3) or, when no such waypoint exists, a direct hop that
-passed feasibility gating (`link_kind="plate"`). Bridging is attempted
+passed feasibility gating (`link_kind="plate"`). A hop that could NOT be
+gated -- the registry has no location for one of its endpoint cameras -- is
+kept, but marked `link_kind="unverified"` rather than `"plate"`: a real,
+plate-confirmed sighting must not be discarded because the registry is
+incomplete, but it must not masquerade as a gated hop either. The two were
+previously indistinguishable, which meant the evidence export presented an
+untested link as a verified one. `ungated_hops` on the result counts them.
+
+Sightings are collapsed before chaining: a run of consecutive detections at
+the SAME camera (a vehicle dwelling in frame -- 8 s at 3 fps is ~24
+detections) becomes ONE hop carrying `first_seen_s`/`last_seen_s` (the dwell
+interval) and `sightings` (the collapsed count). The store keeps the raw
+detections as evidence; the collapse is a presentation-level fold in this
+assembly step only. Feasibility between consecutive runs is measured
+last-seen -> first-seen -- the gap *between* dwells is the time the vehicle
+actually had to cover the distance.
+
+Bridging is attempted
 *before* falling back to a plain direct check, not only as a rescue for a
 failed one: by the triangle inequality, any waypoint whose two legs are both
 individually feasibility-gated makes the direct hop between its endpoints
@@ -28,11 +45,12 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from prahari.v1 import events_pb2
+from prahari_common.plates import normalise_plate
 
 from .bridging import cosine_similarity, is_bridge_candidate
 from .feasibility import check_feasibility
 from .registry_client import DarkZone, GeoPoint, RegistryClient
-from .store import DetectionStore, plate_key, wall_clock_s
+from .store import DetectionStore, wall_clock_s
 
 __all__ = ["LinkKind", "RouteHop", "RejectedHop", "RouteResult", "build_route"]
 
@@ -40,6 +58,12 @@ __all__ = ["LinkKind", "RouteHop", "RejectedHop", "RouteResult", "build_route"]
 class LinkKind(StrEnum):
     PLATE = "plate"
     BRIDGED = "bridged"
+    UNVERIFIED = "unverified"
+    """The sighting is real and plate-confirmed, but the link to it could not
+    be feasibility-gated because the registry has no location for one of its
+    endpoints. Deliberately NOT `PLATE`: an ungated hop presented as a gated
+    one reads identically in the exported evidence, which is exactly the
+    misrepresentation this value exists to prevent."""
 
 
 @dataclass(frozen=True)
@@ -47,12 +71,24 @@ class RouteHop:
     camera_id: str
     location: GeoPoint | None
     wall_clock_s: float
+    """When the vehicle was FIRST seen at this camera -- same value as
+    `first_seen_s`; kept as the hop's headline timestamp for backward
+    compatibility with consumers reading one time per hop."""
     pts_ms: int
     link_kind: LinkKind | None
     """`None` only for the route's first hop -- there is no preceding leg to
     describe a link kind for."""
     confidence: float
     evidence_ref: str
+    """Reference to the FIRST sighting of the collapsed dwell -- the full
+    raw sequence stays in the store; this points at its start."""
+    first_seen_s: float
+    last_seen_s: float
+    """`first_seen_s`/`last_seen_s` bracket the dwell at this camera; they are
+    equal when the hop is a single detection."""
+    sightings: int
+    """How many consecutive same-camera detections this hop folds. `1` means
+    no collapsing happened."""
 
 
 @dataclass(frozen=True)
@@ -66,8 +102,16 @@ class RejectedHop:
 @dataclass(frozen=True)
 class RouteResult:
     plate: str
+    """The queried plate, normalised (separators stripped, uppercased) for
+    display. Deliberately NOT the skeleton index key the store buckets on --
+    a skeleton (`6J01A81234`) is an internal identity, not something an
+    officer should read on an export."""
     hops: list[RouteHop]
     rejected: list[RejectedHop]
+    ungated_hops: int
+    """Count of `hops` whose link could not be feasibility-gated
+    (`link_kind="unverified"`). Surfaced as a number so a console or export
+    can flag "this route contains untested links" without re-deriving it."""
     dark_zones: list[DarkZone]
     """The registry's current full dark-zone list, not filtered to zones
     plausibly on this specific route -- precise corridor matching needs a
@@ -83,15 +127,58 @@ def _hop_from_detection(
     link_kind: LinkKind | None,
     confidence: float,
 ) -> RouteHop:
+    seen = wall_clock_s(detection)
     return RouteHop(
         camera_id=detection.camera_id,
         location=location,
-        wall_clock_s=wall_clock_s(detection),
+        wall_clock_s=seen,
         pts_ms=detection.observed_at.pts_ms,
         link_kind=link_kind,
         confidence=confidence,
         evidence_ref=detection.evidence_ref,
+        first_seen_s=seen,
+        last_seen_s=seen,
+        sightings=1,
     )
+
+
+def _hop_from_run(
+    run: list[events_pb2.VehicleDetection],
+    location: GeoPoint | None,
+    link_kind: LinkKind | None,
+    confidence: float,
+) -> RouteHop:
+    """One hop for a run of consecutive same-camera detections. Identity
+    fields (`pts_ms`, `evidence_ref`) come from the run's FIRST detection;
+    `first_seen_s`/`last_seen_s` carry the whole dwell."""
+    first, last = run[0], run[-1]
+    return RouteHop(
+        camera_id=first.camera_id,
+        location=location,
+        wall_clock_s=wall_clock_s(first),
+        pts_ms=first.observed_at.pts_ms,
+        link_kind=link_kind,
+        confidence=confidence,
+        evidence_ref=first.evidence_ref,
+        first_seen_s=wall_clock_s(first),
+        last_seen_s=wall_clock_s(last),
+        sightings=len(run),
+    )
+
+
+def _consecutive_runs(
+    detections: list[events_pb2.VehicleDetection],
+) -> list[list[events_pb2.VehicleDetection]]:
+    """Group `detections` (already chronological) into runs of consecutive
+    sightings at the same camera. A non-consecutive repeat (A, B, A) is two
+    runs -- a return journey is not a dwell."""
+    runs: list[list[events_pb2.VehicleDetection]] = []
+    for detection in detections:
+        if runs and runs[-1][0].camera_id == detection.camera_id:
+            runs[-1].append(detection)
+        else:
+            runs.append([detection])
+    return runs
 
 
 async def _find_bridge(
@@ -103,6 +190,7 @@ async def _find_bridge(
     right_loc: GeoPoint,
     max_speed_kmh: float,
     appearance_threshold: float,
+    clock_skew_allowance_s: float,
 ) -> tuple[events_pb2.VehicleDetection, GeoPoint, float] | None:
     """The first plate-unreadable detection, chronologically between `left`
     and `right`, that is both feasibility-gated against *both* neighbours and
@@ -125,6 +213,7 @@ async def _find_bridge(
             candidate_loc.longitude,
             wall_clock_s(candidate) - wall_clock_s(left),
             max_speed_kmh,
+            clock_skew_allowance_s=clock_skew_allowance_s,
         )
         right_leg = check_feasibility(
             candidate_loc.latitude,
@@ -133,6 +222,7 @@ async def _find_bridge(
             right_loc.longitude,
             wall_clock_s(right) - wall_clock_s(candidate),
             max_speed_kmh,
+            clock_skew_allowance_s=clock_skew_allowance_s,
         )
         if not (left_leg.feasible and right_leg.feasible):
             continue
@@ -164,53 +254,65 @@ async def build_route(
     registry: RegistryClient,
     max_speed_kmh: float,
     appearance_threshold: float,
+    *,
+    clock_skew_allowance_s: float = 0.0,
 ) -> RouteResult:
-    key = plate_key(raw_plate_text)
+    plate = normalise_plate(raw_plate_text).text or raw_plate_text
     detections = store.by_plate(raw_plate_text)
     dark_zones = await registry.dark_zones()
 
     if not detections:
-        return RouteResult(plate=key, hops=[], rejected=[], dark_zones=dark_zones)
+        return RouteResult(plate=plate, hops=[], rejected=[], ungated_hops=0, dark_zones=dark_zones)
 
     hops: list[RouteHop] = []
     rejected: list[RejectedHop] = []
 
-    first = detections[0]
-    prev = first
-    prev_loc = await registry.camera_location(first.camera_id)
-    hops.append(_hop_from_detection(first, prev_loc, link_kind=None, confidence=1.0))
+    # Collapse consecutive same-camera sightings into dwell runs FIRST, then
+    # chain runs -- see the module docstring for why the fold lives here and
+    # not in the store.
+    runs = _consecutive_runs(detections)
 
-    for current in detections[1:]:
-        current_loc = await registry.camera_location(current.camera_id)
+    prev_run = runs[0]
+    prev_loc = await registry.camera_location(prev_run[0].camera_id)
+    hops.append(_hop_from_run(prev_run, prev_loc, link_kind=None, confidence=1.0))
+
+    for run in runs[1:]:
+        current_loc = await registry.camera_location(run[0].camera_id)
 
         if prev_loc is None or current_loc is None:
             # Cannot feasibility-gate without both endpoints' locations --
             # pass the sighting through rather than discarding a real,
             # plate-confirmed detection because the registry does not know
-            # where a camera is. Confidence stays full: the *sighting* is not
-            # in doubt, only the untested link to it.
-            hops.append(_hop_from_detection(current, current_loc, LinkKind.PLATE, 1.0))
-            prev, prev_loc = current, current_loc
+            # where a camera is, but label it UNVERIFIED so the hop is never
+            # mistaken for a gated one downstream (console or evidence
+            # export). Confidence stays full: the *sighting* is not in doubt,
+            # only the untested link to it.
+            hops.append(_hop_from_run(run, current_loc, LinkKind.UNVERIFIED, 1.0))
+            prev_run, prev_loc = run, current_loc
             continue
 
+        # Legs are timed from the last sighting of the previous dwell to the
+        # first of this one: while the vehicle was still in the previous
+        # camera's frame it was not yet travelling this leg.
         bridge = await _find_bridge(
             store,
             registry,
-            prev,
+            prev_run[-1],
             prev_loc,
-            current,
+            run[0],
             current_loc,
             max_speed_kmh,
             appearance_threshold,
+            clock_skew_allowance_s,
         )
         if bridge is not None:
             candidate, candidate_loc, confidence = bridge
             hops.append(_hop_from_detection(candidate, candidate_loc, LinkKind.BRIDGED, confidence))
-            hops.append(_hop_from_detection(current, current_loc, LinkKind.BRIDGED, confidence))
-            prev, prev_loc = current, current_loc
+            hops.append(_hop_from_run(run, current_loc, LinkKind.BRIDGED, confidence))
+            prev_run, prev_loc = run, current_loc
             continue
 
-        elapsed = wall_clock_s(current) - wall_clock_s(prev)
+        elapsed = wall_clock_s(run[0]) - wall_clock_s(prev_run[-1])
         verdict = check_feasibility(
             prev_loc.latitude,
             prev_loc.longitude,
@@ -218,21 +320,31 @@ async def build_route(
             current_loc.longitude,
             elapsed,
             max_speed_kmh,
+            clock_skew_allowance_s=clock_skew_allowance_s,
         )
         if verdict.feasible:
-            hops.append(_hop_from_detection(current, current_loc, LinkKind.PLATE, 1.0))
-            prev, prev_loc = current, current_loc
+            hops.append(_hop_from_run(run, current_loc, LinkKind.PLATE, 1.0))
+            prev_run, prev_loc = run, current_loc
             continue
 
         rejected.append(
             RejectedHop(
-                from_camera_id=prev.camera_id,
-                to_camera_id=current.camera_id,
-                reason="exceeds max_speed_kmh with no appearance bridge available",
+                from_camera_id=prev_run[0].camera_id,
+                to_camera_id=run[0].camera_id,
+                # "teleport"/"negative_elapsed" come from the gate itself; a
+                # plain over-the-envelope rejection keeps its usual reason.
+                reason=verdict.reason
+                or "exceeds max_speed_kmh with no appearance bridge available",
                 implied_speed_kmh=verdict.implied_speed_kmh,
             )
         )
-        # `prev`/`prev_loc` deliberately unchanged: the next candidate is
+        # `prev_run`/`prev_loc` deliberately unchanged: the next candidate is
         # tested against the last *connected* hop, not the rejected one.
 
-    return RouteResult(plate=key, hops=hops, rejected=rejected, dark_zones=dark_zones)
+    return RouteResult(
+        plate=plate,
+        hops=hops,
+        rejected=rejected,
+        ungated_hops=sum(1 for h in hops if h.link_kind == LinkKind.UNVERIFIED),
+        dark_zones=dark_zones,
+    )

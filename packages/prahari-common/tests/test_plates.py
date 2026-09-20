@@ -8,12 +8,14 @@ re-alignment against real Gujarat-style plate shapes.
 from __future__ import annotations
 
 from prahari_common.plates import (
+    CONFUSION_CLASSES,
     MASK_ALPHA,
     MASK_DIGIT,
     MASK_FREE,
     PlateFormat,
     normalise_plate,
     project_confidences,
+    skeleton,
 )
 
 
@@ -106,6 +108,35 @@ class TestSourceIndexAlignment:
         raw = "INDGJ01AB1234"
         for text_pos, raw_pos in enumerate(result.source_index):
             assert raw[raw_pos].upper() == result.text[text_pos]
+
+
+class TestSkeleton:
+    """`skeleton()` is canonicalisation, not correction: it gives two
+    confusable readings of one plate the same identity key, for the match
+    engine's stage-1 buckets and the correlation store's sighting index."""
+
+    def test_folds_the_day2_design_example(self) -> None:
+        # DAY2-DESIGN.md §7.2: the worked example for why stage 1 buckets on
+        # skeleton rather than raw text.
+        assert skeleton("GJ01AB1Z34") == skeleton("GJ01AB1234") == "6J01A81234"
+
+    def test_every_member_of_a_class_folds_to_the_same_representative(self) -> None:
+        for cls in CONFUSION_CLASSES:
+            folded = {skeleton(ch) for ch in cls}
+            assert len(folded) == 1, f"class {cls} does not fold to one key"
+
+    def test_leaves_unconfusable_characters_untouched(self) -> None:
+        assert skeleton("JK") == "JK"  # neither letter is in any class
+        assert skeleton("9") == "9"  # 9 is in no confusion class
+
+    def test_does_not_normalise(self) -> None:
+        # Skeleton-folding is the LAST step: separators and case are
+        # normalise_plate's job, and this function deliberately does not
+        # duplicate it -- composition is `skeleton(normalise_plate(x).text)`.
+        assert skeleton(normalise_plate("gj 01 ab 1z34").text) == "6J01A81234"
+
+    def test_empty_input_is_empty(self) -> None:
+        assert skeleton("") == ""
 
 
 class TestProjectConfidences:
