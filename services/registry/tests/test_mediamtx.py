@@ -7,12 +7,13 @@ and the restreamer being unreachable is never fatal.
 
 from __future__ import annotations
 
+from urllib.parse import urlsplit
+
 import httpx
 import pytest
 
 from prahari_registry.config import RegistrySettings
 from prahari_registry.mediamtx import MediaMTXClient, fanout_endpoints, path_name
-from prahari_registry.models import StreamEndpoints
 
 SETTINGS = RegistrySettings(
     mediamtx_public_host="prahari-mediamtx",
@@ -66,13 +67,48 @@ def test_fanout_urls_point_at_mediamtx_not_the_gateway():
     """Every client that connects to a source gets its own copy of the stream.
     Consumers must reach the restreamer, or N workers become N connections to a
     shared government feed."""
-    upstream = StreamEndpoints(rtsp_url="rtsp://gateway.example:8554/stream/101")
-    endpoints = fanout_endpoints(SETTINGS, "abc", upstream)
+    endpoints = fanout_endpoints(SETTINGS, "abc")
 
-    assert endpoints.rtsp_url == "rtsp://gateway.example:8554/stream/101"
     assert endpoints.fanout_rtsp_url == "rtsp://prahari-mediamtx:8554/cam-abc"
     assert endpoints.fanout_hls_url == "http://prahari-mediamtx:8888/cam-abc/index.m3u8"
     assert endpoints.fanout_whep_url == "http://prahari-mediamtx:8889/cam-abc/whep"
+
+
+def test_fanout_urls_embed_the_worker_credential_when_a_token_is_set():
+    """With MediaMTX auth armed, an uncredentialed read is refused — and an
+    RTSP consumer has no header channel, so the credential travels in the
+    URL's userinfo. Only ever on the internal-token-gated API."""
+    settings = RegistrySettings(
+        mediamtx_public_host="prahari-mediamtx",
+        internal_token="t0k/en",  # URL-unsafe chars must be quoted
+    )
+    endpoints = fanout_endpoints(settings, "abc")
+
+    assert endpoints.fanout_rtsp_url == "rtsp://worker:t0k%2Fen@prahari-mediamtx:8554/cam-abc"
+    assert endpoints.fanout_hls_url.startswith("http://worker:t0k%2Fen@")
+    # WHEP is browser-only and never carries the credential — browsers get
+    # short-lived tickets instead.
+    assert endpoints.fanout_whep_url == "http://prahari-mediamtx:8889/cam-abc/whep"
+
+
+def test_fanout_urls_carry_no_credential_when_enforcement_is_off():
+    """Empty internal_token = auth off on both sides (the documented local
+    default) — the URLs must then contain no userinfo at all."""
+    for url in fanout_endpoints(SETTINGS, "abc").model_dump().values():
+        assert url is None or "@" not in urlsplit(url).netloc
+
+
+async def test_api_client_presents_the_internal_credential():
+    """The restreamer's `authMethod: http` defers control-API auth back to
+    this service — the reconcile client must arrive as `internal:<token>` or
+    every call it makes is refused."""
+    settings = RegistrySettings(internal_token="s3cret", mediamtx_api_url="http://mtx:9997")
+    client = MediaMTXClient(settings)
+    http = await client._http()
+    request = http.build_request("GET", "/v3/config/paths/list")
+    # base64("internal:s3cret") — the registry's control-API identity.
+    assert request.headers["authorization"] == "Basic aW50ZXJuYWw6czNjcmV0"
+    await client.aclose()
 
 
 # --- reconcile ---------------------------------------------------------------

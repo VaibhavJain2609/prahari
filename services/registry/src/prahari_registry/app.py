@@ -25,6 +25,7 @@ from .config import RegistrySettings, registry_settings
 from .crypto import CredentialKeyError
 from .db import apply_migrations, create_pool, timescale_available
 from .health import HealthPolicy, derive_state
+from .media_auth import MediaMTXAuthRequest, TicketVerifier, authorize
 from .mediamtx import MediaMTXClient
 from .models import (
     Camera,
@@ -115,6 +116,7 @@ async def lifespan(app: FastAPI):
     org_repo = OrgRepository(pool)
     gateway = _gateway_settings_or_none()
     mediamtx = MediaMTXClient(settings)
+    ticket_verifier = TicketVerifier(settings)
     sync = CatalogueSync(
         pool=pool, repo=repo, settings=settings, gateway=gateway, mediamtx=mediamtx
     )
@@ -125,6 +127,7 @@ async def lifespan(app: FastAPI):
     app.state.org_repo = org_repo
     app.state.sync = sync
     app.state.mediamtx = mediamtx
+    app.state.ticket_verifier = ticket_verifier
     app.state.gateway_configured = gateway is not None
 
     sync.start()
@@ -134,6 +137,7 @@ async def lifespan(app: FastAPI):
     finally:
         retention.cancel()
         await sync.stop()
+        await ticket_verifier.aclose()
         await pool.close()
 
 
@@ -165,11 +169,18 @@ async def require_internal_token(request: Request, call_next):
 
     `/healthz` and `/readyz` are exempt — a liveness/readiness probe carries
     no data and must not depend on a secret being wired correctly to answer.
-    Everything else under `/api/*` (and, deliberately, everything not yet
-    under `/api/*`) requires the header when a token is configured.
+    `/api/v1/mediamtx/auth` is exempt too: it IS the credential check
+    MediaMTX defers to (`authMethod: http`), and the restreamer cannot send
+    this header — gating it would deadlock the video plane. Everything else
+    under `/api/*` (and, deliberately, everything not yet under `/api/*`)
+    requires the header when a token is configured.
     """
     settings: RegistrySettings = request.app.state.settings
-    if settings.internal_token and request.url.path not in ("/healthz", "/readyz"):
+    if settings.internal_token and request.url.path not in (
+        "/healthz",
+        "/readyz",
+        "/api/v1/mediamtx/auth",
+    ):
         provided = request.headers.get("x-internal-token")
         if provided is None or not hmac.compare_digest(
             provided.encode(), settings.internal_token.encode()
@@ -595,6 +606,31 @@ async def reconcile_streams(repo: RepoDep, request: Request) -> dict:
     mediamtx: MediaMTXClient = request.app.state.mediamtx
     result = await mediamtx.reconcile(await repo.desired_mediamtx_paths())
     return result.__dict__
+
+
+@app.post("/api/v1/mediamtx/auth", tags=["streams"])
+async def mediamtx_auth(
+    payload: MediaMTXAuthRequest, settings: SettingsDep, request: Request
+) -> Response:
+    """The credential check MediaMTX defers to (`authMethod: http`).
+
+    Answers 200 to allow, 401 to refuse — MediaMTX treats any non-2xx as a
+    refusal. Exempt from `require_internal_token` by necessity (see the
+    middleware): the restreamer cannot hold the token it is asking us to
+    check. The policy itself lives in `media_auth.authorize`.
+    """
+    verifier: TicketVerifier = request.app.state.ticket_verifier
+    allowed = await authorize(settings, verifier, payload)
+    if not allowed:
+        log.info(
+            "mediamtx auth denied: action=%s path=%s user=%s ip=%s",
+            payload.action,
+            payload.path,
+            payload.user,
+            payload.ip,
+        )
+        return Response(status_code=status.HTTP_401_UNAUTHORIZED)
+    return Response(status_code=status.HTTP_200_OK)
 
 
 # --- gap analysis ------------------------------------------------------------

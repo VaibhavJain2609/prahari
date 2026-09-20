@@ -24,6 +24,7 @@ from .models import (
     Camera,
     CameraCreate,
     CameraHealth,
+    CameraPreview,
     CameraType,
     CameraUpdate,
     GeoPoint,
@@ -135,15 +136,21 @@ def camera_from_row(row: asyncpg.Record, settings: RegistrySettings) -> Camera:
     applied the staleness overlay, and the raw column is the last verdict a
     heartbeat produced, which for a camera that went dark an hour ago still says
     "healthy".
+
+    The row's `rtsp_url`/`hls_url`/`whep_url` columns never leave this
+    function: they are the upstream (gateway/DVR) pull URLs, and the only
+    code allowed to read them for connection purposes is
+    `desired_mediamtx_paths`. What a response gets instead is the fan-out
+    half — populated only when a pullable upstream exists, mirroring the
+    predicate `desired_mediamtx_paths` reconciles on, so `endpoints` and
+    `preview.available` can never advertise a path MediaMTX would not have.
     """
     location = (
         GeoPoint(latitude=row["latitude"], longitude=row["longitude"])
         if row["latitude"] is not None and row["longitude"] is not None
         else None
     )
-    upstream = StreamEndpoints(
-        rtsp_url=row["rtsp_url"], hls_url=row["hls_url"], whep_url=row["whep_url"]
-    )
+    streamable = row["rtsp_url"] is not None
     camera_id = str(row["id"])
     return Camera(
         id=camera_id,
@@ -162,7 +169,8 @@ def camera_from_row(row: asyncpg.Record, settings: RegistrySettings) -> Camera:
         codec=row["codec"],
         native_width=row["native_width"],
         native_height=row["native_height"],
-        endpoints=fanout_endpoints(settings, camera_id, upstream),
+        endpoints=fanout_endpoints(settings, camera_id) if streamable else StreamEndpoints(),
+        preview=CameraPreview(available=streamable),
         storage_location=row["storage_location"],
         retention_days=row["retention_days"],
         commissioned_at=row["commissioned_at"],

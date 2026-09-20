@@ -28,7 +28,10 @@ spec:
   policyTypes: ["Ingress"]
 ---
 # The control plane. Callers: the BFF (proxied camera reads), correlation
-# (camera locations), inference workers (heartbeat + assignments).
+# (camera locations), inference workers (heartbeat + assignments), and —
+# since the restreamer now authenticates — mediamtx, which POSTs every
+# credential check to /api/v1/mediamtx/auth (authMethod: http). Denying this
+# rule is a video-plane outage: auth fails closed.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -51,6 +54,9 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: inference
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: mediamtx
       ports:
         - port: {{ .Values.services.registry.port }}
 ---

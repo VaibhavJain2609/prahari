@@ -18,8 +18,10 @@ every consumer holding its URL.
 
 from __future__ import annotations
 
+import base64
 import logging
 from dataclasses import dataclass
+from urllib.parse import quote
 
 import httpx
 
@@ -28,23 +30,46 @@ from .models import StreamEndpoints
 
 log = logging.getLogger(__name__)
 
+# The two MediaMTX internal users. MediaMTX runs `authMethod: http` and defers
+# every credential check to this service's `/api/v1/mediamtx/auth` (see
+# `media_auth.py`), so these names exist only as the convention that endpoint
+# pattern-matches on — the shared secret itself is `internal_token`.
+MTX_API_USER = "internal"
+"""Basic-auth user the registry presents to the MediaMTX control API (:9997).
+Grants `action: api` — path reconcile. Never used for stream reads."""
+
+MTX_READER_USER = "worker"
+"""Basic-auth user embedded in the fan-out URLs handed to inference workers
+via `GET /api/v1/cameras` (their assignments feed — `worker.py` prefers
+`fanout_rtsp_url`, and ffmpeg can only authenticate RTSP through URL
+userinfo). Grants `action: read` on `cam-*` paths and nothing else."""
+
 
 def path_name(camera_id: str) -> str:
     return f"cam-{camera_id}"
 
 
-def fanout_endpoints(
-    settings: RegistrySettings, camera_id: str, upstream: StreamEndpoints
-) -> StreamEndpoints:
-    """Upstream URLs plus the fan-out URLs consumers should actually use."""
+def fanout_endpoints(settings: RegistrySettings, camera_id: str) -> StreamEndpoints:
+    """The MediaMTX URLs a worker connects to for this camera.
+
+    The RTSP/HLS URLs embed `worker:<internal-token>` userinfo when a token is
+    configured — with `authMethod: http` armed on the restreamer, an
+    uncredentialed read is refused, and RTSP consumers have no header channel
+    to carry one on. Empty token = auth enforcement off (the local default);
+    the URLs then carry no userinfo at all.
+
+    These URLs must only leave this service on the internal-token-gated API —
+    the BFF strips `endpoints` before a camera payload can reach a browser.
+    """
     name = path_name(camera_id)
     host = settings.mediamtx_public_host
+    if settings.internal_token:
+        creds = f"{MTX_READER_USER}:{quote(settings.internal_token, safe='')}@"
+    else:
+        creds = ""
     return StreamEndpoints(
-        rtsp_url=upstream.rtsp_url,
-        hls_url=upstream.hls_url,
-        whep_url=upstream.whep_url,
-        fanout_rtsp_url=f"rtsp://{host}:{settings.mediamtx_rtsp_port}/{name}",
-        fanout_hls_url=f"http://{host}:{settings.mediamtx_hls_port}/{name}/index.m3u8",
+        fanout_rtsp_url=f"rtsp://{creds}{host}:{settings.mediamtx_rtsp_port}/{name}",
+        fanout_hls_url=f"http://{creds}{host}:{settings.mediamtx_hls_port}/{name}/index.m3u8",
         fanout_whep_url=f"http://{host}:{settings.mediamtx_whep_port}/{name}/whep",
     )
 
@@ -72,7 +97,19 @@ class MediaMTXClient:
 
     async def _http(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(base_url=self._s.mediamtx_api_url, timeout=10.0)
+            # The control API is authenticated (authMethod: http on the
+            # restreamer defers to /api/v1/mediamtx/auth on this service, which
+            # accepts `internal:<internal-token>` for action api). A header,
+            # not httpx's auth= tuple — client-level auth does not materialise
+            # until send, and a test must be able to see the credential. With
+            # no token configured the header carries an empty password and
+            # enforcement is off on both sides anyway.
+            basic = base64.b64encode(f"{MTX_API_USER}:{self._s.internal_token}".encode()).decode()
+            self._client = httpx.AsyncClient(
+                base_url=self._s.mediamtx_api_url,
+                timeout=10.0,
+                headers={"Authorization": f"Basic {basic}"},
+            )
         return self._client
 
     async def aclose(self) -> None:

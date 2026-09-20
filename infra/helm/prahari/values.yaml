@@ -54,6 +54,23 @@ redis:
   # Pinned to the Alpine base — a floating `-alpine` tag that moves under us is
   # the same class of surprise as `latest`.
   image: redis:7.4-alpine3.21
+  # Name of a pre-existing Secret holding `key: password` — the same
+  # out-of-band pattern as postgres.existingSecret. When empty the chart
+  # generates `prahari-redis-auth` (helm.sh/resource-policy: keep) and runs
+  # redis-server --requirepass; consumers pick the password up as
+  # $(REDIS_PASSWORD) inside their redis:// URL — it never lands in rendered
+  # YAML. If the Secret is absent entirely the deployment degrades to
+  # passwordless on BOTH ends together (server --requirepass "", client URL
+  # with an empty password) — loudly equivalent to the internal-token
+  # convention, not a silent half-authenticated state.
+  #
+  # KNOWN GAP: the KEDA redis-streams scaler in inference.yaml connects to
+  # `prahari-redis:6379` without a credential — its metadata has no secret
+  # reference. With requirepass armed the scaler reads NOAUTH and the gpu
+  # profile's scale trigger goes dark; fix is a TriggerAuthentication
+  # (secretTargetRef → prahari-redis-auth/password) in inference.yaml, which
+  # is owned outside this change.
+  existingSecret: ""
   resources:
     requests: { cpu: 50m,  memory: 128Mi }
     limits:   { cpu: 500m, memory: 512Mi }
@@ -75,12 +92,18 @@ mediamtx:
   apiPort: 9997
   # Prometheus-compatible metrics endpoint (mediamtx `metrics: yes`).
   metricsPort: 9998
-  # Host the registry puts into the fan-out URLs it hands consumers. In-cluster
-  # workers resolve `prahari-mediamtx`; `localhost` inside a pod resolves to the
-  # pod itself — the previous default made every worker's capture fail while the
-  # pod heartbeated happily. Browser preview no longer uses this host: it goes
-  # through the BFF's audited ticket endpoint (see feat/audited-video-access).
+  # Host the registry puts into the fan-out URLs it hands to in-cluster
+  # consumers — the inference workers' RTSP/HLS pull URLs (worker.py prefers
+  # fanout_rtsp_url), which since the audited-video-access change carry an
+  # embedded `worker:<internal-token>` credential and are never shown to a
+  # browser. The cluster service name is therefore the right value in EVERY
+  # profile — browser reachability is `browserWhepBase` below, not this.
   publicHost: prahari-mediamtx
+  # The WHEP base URL the BFF embeds in preview-ticket responses — as the
+  # BROWSER can reach it. `localhost:8889` works through k3d's port maps; the
+  # gpu profile must set this to the public ingress URL (and that ingress
+  # must pass the Authorization header or the `?jwt=` query through).
+  browserWhepBase: "http://localhost:8889"
   resources:
     requests: { cpu: 100m, memory: 128Mi }
     limits:   { cpu: "1",  memory: 512Mi }

@@ -111,6 +111,35 @@ class BFFSettings(BaseSettings):
     """Route reconstruction walks more rows than a camera lookup; the plate
     export endpoint (the mandatory submission path) gets a longer budget."""
 
+    # --- media preview tickets ----------------------------------------------
+    #
+    # MediaMTX runs `authMethod: http` and asks the registry whether a
+    # credential may touch a path. For browsers that credential is a
+    # short-lived Ed25519 JWT minted here (`POST /api/v1/media/preview-ticket`)
+    # after the scope check and audit append — the registry verifies it
+    # against the public half, published on `GET /api/v1/media/jwks`.
+
+    media_jwt_private_key: str | None = None
+    """PEM-encoded Ed25519 private key for signing preview tickets
+    (`PRAHARI_MEDIA_JWT_PRIVATE_KEY`, secret `prahari-internal` key
+    `media-jwt-private-key`). When unset the BFF generates an ephemeral
+    keypair at boot — fine for local dev, and honest about the trade-off a
+    restart creates: tickets already issued stop verifying the moment their
+    `kid` disappears from the JWKS. Set the Secret in any deployment where a
+    pod restart must not invalidate live previews."""
+
+    media_ticket_ttl_s: int = 60
+    """Preview-ticket lifetime. Short on purpose: the ticket is a bearer
+    credential that grants one stream read, so its theft window is its TTL.
+    The console re-mints on expiry — minting is cheap and already audited."""
+
+    media_whep_base_url: str = "http://localhost:8889"
+    """The MediaMTX WHEP base URL *as the browser can reach it* — not the
+    in-cluster service name (workers get that inside their credentialed
+    fan-out URLs; browsers need the port-map or ingress host). Local default
+    is the k3d port map; the gpu profile must set `mediamtx.browserWhepBase`
+    to the public ingress URL."""
+
     # --- audit -----------------------------------------------------------
 
     audit_db_path: str = "audit.db"

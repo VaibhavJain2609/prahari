@@ -10,11 +10,92 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from prahari_registry.config import RegistrySettings
 from prahari_registry.repository import (
     _MAX_OBSERVED_AT_SKEW_S,
     _clamp_observed_at,
+    camera_from_row,
     redact_url_credentials,
 )
+
+
+def _row(**overrides) -> dict:
+    """A `camera_current`-shaped record (a dict stands in for asyncpg.Record —
+    `camera_from_row` only ever does `row["name"]` lookups)."""
+    row = {
+        "id": "00000000-0000-0000-0000-0000000000ab",
+        "source": "gujarat-sentinel",
+        "external_id": "cam-42",
+        "latitude": 23.0,
+        "longitude": 72.5,
+        "site_name": "Zone 4 junction",
+        "district": "Ahmedabad",
+        "department": None,
+        "owner": None,
+        "org_id": "00000000-0000-0000-0000-000000000001",
+        "adapter": "gateway",
+        "camera_type": "ip",
+        "vendor": None,
+        "vms_platform": None,
+        "codec": "h264",
+        "native_width": 1920,
+        "native_height": 1080,
+        "rtsp_url": "rtsp://gateway.gov.example:8554/stream/42",
+        "hls_url": "https://gateway.gov.example/hls/42.m3u8",
+        "whep_url": None,
+        "storage_location": None,
+        "retention_days": None,
+        "commissioned_at": None,
+        "amc_expires_at": None,
+        "lifecycle": "active",
+        "catalogue_live": True,
+        "present_in_catalogue": True,
+        "last_seen_in_catalogue": None,
+        "effective_health_state": "healthy",
+        "effective_health_reason": None,
+        "last_heartbeat_at": None,
+        "last_frame_at": None,
+        "observed_fps": 8.0,
+        "declared_fps": 25.0,
+        "black_frame_ratio": None,
+        "tamper_suspected": False,
+        "consecutive_failures": 0,
+        "loop_epoch": 0,
+        "last_error": None,
+        "created_at": None,
+        "updated_at": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_response_never_carries_upstream_urls():
+    """The catalogued `rtsp_url` is the government's pull URL — the invariant
+    this whole change exists for. A Camera must contain no upstream URL and
+    no credential, whatever the row holds."""
+    settings = RegistrySettings(internal_token="tok", mediamtx_public_host="mtx")
+    camera = camera_from_row(_row(), settings)
+    dumped = camera.model_dump()
+
+    assert "rtsp_url" not in dumped["endpoints"]
+    assert "hls_url" not in dumped["endpoints"]
+    assert "whep_url" not in dumped["endpoints"]
+    text = str(dumped)
+    assert "gateway.gov.example" not in text
+
+    # What remains: fan-out URLs for workers (credentialed) and the public
+    # capability flag.
+    assert dumped["endpoints"]["fanout_rtsp_url"].startswith("rtsp://worker:tok@mtx:8554/")
+    assert dumped["preview"]["available"] is True
+
+
+def test_camera_without_upstream_gets_no_endpoints():
+    """A camera MediaMTX cannot pull advertises no fan-out and no preview —
+    `desired_mediamtx_paths` would never create the path, so the response
+    must not pretend it exists."""
+    camera = camera_from_row(_row(rtsp_url=None), RegistrySettings())
+    assert camera.endpoints.fanout_rtsp_url is None
+    assert camera.preview.available is False
 
 
 def test_redact_strips_userinfo():

@@ -101,11 +101,23 @@ class GeoPoint(BaseModel):
 
 
 class StreamEndpoints(BaseModel):
-    rtsp_url: str | None = None
-    hls_url: str | None = None
-    whep_url: str | None = None
-    """Browser preview only. Never an inference source — the WebRTC path loses
-    the PTS fidelity evidence timestamps depend on."""
+    """MediaMTX fan-out URLs — the *internal* half of the endpoints contract.
+
+    Upstream URLs (`cameras.rtsp_url`/`hls_url`/`whep_url`, which for catalogue
+    cameras are the government gateway's pull URLs) are deliberately absent
+    from this model: they are stored columns read only by
+    `CameraRepository.desired_mediamtx_paths` for the reconcile path, and no
+    HTTP response may carry them — a response is the difference between
+    "stored for the restreamer" and "handed to whoever can read the API".
+
+    The fan-out URLs below are worker-facing. `GET /api/v1/cameras` doubles as
+    the inference workers' assignments feed (`worker.py` prefers
+    `fanout_rtsp_url`), and with MediaMTX auth armed the RTSP/HLS URLs embed
+    the internal reader credential. That is safe only because this service's
+    `/api/*` is cluster-internal (`internal_token` gate) and the BFF strips
+    `endpoints` entirely before a payload approaches a browser — see
+    `prahari_bff.app._public_camera`.
+    """
 
     fanout_rtsp_url: str | None = None
     """Where consumers should actually connect: our MediaMTX path, not the
@@ -113,7 +125,28 @@ class StreamEndpoints(BaseModel):
     pulling the gateway directly would exhaust a shared government feed."""
 
     fanout_hls_url: str | None = None
+
     fanout_whep_url: str | None = None
+    """WHEP is a browser-only protocol and browsers never see this object —
+    they get a short-lived ticket from the BFF's preview-ticket endpoint.
+    Carried here for completeness (and so a future internal consumer can
+    tell the path exists), but it never embeds credentials."""
+
+
+class CameraPreview(BaseModel):
+    """Whether a live stream exists behind this camera — the only part of the
+    endpoints contract a browser-facing response is allowed to say.
+
+    The browser learns *that* a preview can be minted here; *how* to reach it
+    comes from `POST /api/v1/media/preview-ticket` on the BFF, which is the
+    audited path — a URL in a catalogue row is an access that no audit entry
+    could ever be written for."""
+
+    available: bool = False
+    """True when the camera has an upstream stream MediaMTX can pull (today:
+    a stored `rtsp_url`, the same predicate `desired_mediamtx_paths` uses).
+    Says nothing about health — a degraded camera still has a previewable
+    stream."""
 
 
 class CameraHealth(BaseModel):
@@ -172,6 +205,14 @@ class Camera(BaseModel):
     native_height: int | None = None
 
     endpoints: StreamEndpoints = Field(default_factory=StreamEndpoints)
+    """Worker-facing fan-out URLs (see `StreamEndpoints`). Empty object when
+    the camera has no pullable upstream. Never contains upstream gateway URLs
+    and must never reach a browser — the BFF drops this field in
+    `_public_camera`."""
+
+    preview: CameraPreview = Field(default_factory=CameraPreview)
+    """Capability flag safe to show anyone who can see the camera itself:
+    whether a preview *could* be minted, not how to reach the stream."""
 
     storage_location: str | None = None
     retention_days: int | None = None
