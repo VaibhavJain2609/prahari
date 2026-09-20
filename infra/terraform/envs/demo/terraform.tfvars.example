@@ -6,3 +6,8 @@
 
 region         = "ap-south-1"
 ssh_public_key = "ssh-ed25519 AAAA... you@example.com"
+
+# Operator egress CIDR — SSH and the k3s API accept traffic only from here.
+# Find yours with `curl -s ifconfig.me` and append /32. The module rejects
+# 0.0.0.0/0 on purpose: an open GPU node is a cryptomining target.
+ssh_cidr = "203.0.113.10/32"
