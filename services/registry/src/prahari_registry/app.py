@@ -43,9 +43,17 @@ from .models import (
     Org,
     OrgCreate,
     SyncResult,
+    WorkerAssignment,
+    WorkerRegister,
+    WorkerRegistration,
 )
 from .probe import ProbeError, ProbeResult, SSRFBlockedError, probe_rtsp
-from .repository import CameraRepository, OrgRepository, redact_url_credentials
+from .repository import (
+    CameraRepository,
+    OrgRepository,
+    WorkerRepository,
+    redact_url_credentials,
+)
 from .sync import CatalogueSync
 
 log = logging.getLogger(__name__)
@@ -65,12 +73,14 @@ def _gateway_settings_or_none() -> GatewaySettings | None:
         return None
 
 
-async def _retention_loop(repo: CameraRepository, settings: RegistrySettings) -> None:
-    """Keep `camera_heartbeat` bounded where TimescaleDB is not doing it for us.
+async def _retention_loop(
+    repo: CameraRepository, worker_repo: WorkerRepository, settings: RegistrySettings
+) -> None:
+    """Keep `camera_heartbeat` and `workers` bounded where nothing else does.
 
-    Runs in every replica. That is harmless — the DELETE is idempotent and the
-    losers of the race simply delete nothing — and it avoids making retention
-    depend on which pod happens to be the leader.
+    Runs in every replica. That is harmless — the DELETEs are idempotent and
+    the losers of the race simply delete nothing — and it avoids making
+    retention depend on which pod happens to be the leader.
     """
     while True:
         await asyncio.sleep(settings.heartbeat_prune_interval_s)
@@ -81,6 +91,13 @@ async def _retention_loop(repo: CameraRepository, settings: RegistrySettings) ->
                     "pruned %d heartbeats older than %d days",
                     deleted,
                     settings.heartbeat_retention_days,
+                )
+            reaped = await worker_repo.prune_stale()
+            if reaped:
+                log.info(
+                    "reaped %d worker registration(s) idle for >%dx the assignment lease",
+                    reaped,
+                    WorkerRepository._REAP_LEASES,
                 )
         except asyncio.CancelledError:
             raise
@@ -114,6 +131,7 @@ async def lifespan(app: FastAPI):
 
     repo = CameraRepository(pool, settings)
     org_repo = OrgRepository(pool)
+    worker_repo = WorkerRepository(pool, settings)
     gateway = _gateway_settings_or_none()
     mediamtx = MediaMTXClient(settings)
     ticket_verifier = TicketVerifier(settings)
@@ -125,13 +143,16 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.repo = repo
     app.state.org_repo = org_repo
+    app.state.worker_repo = worker_repo
     app.state.sync = sync
     app.state.mediamtx = mediamtx
     app.state.ticket_verifier = ticket_verifier
     app.state.gateway_configured = gateway is not None
 
     sync.start()
-    retention = asyncio.create_task(_retention_loop(repo, settings), name="heartbeat-retention")
+    retention = asyncio.create_task(
+        _retention_loop(repo, worker_repo, settings), name="heartbeat-retention"
+    )
     try:
         yield
     finally:
@@ -226,6 +247,10 @@ def get_org_repo(request: Request) -> OrgRepository:
     return request.app.state.org_repo
 
 
+def get_worker_repo(request: Request) -> WorkerRepository:
+    return request.app.state.worker_repo
+
+
 def get_pool(request: Request) -> asyncpg.Pool:
     return request.app.state.pool
 
@@ -240,6 +265,7 @@ def get_sync(request: Request) -> CatalogueSync:
 
 RepoDep = Annotated[CameraRepository, Depends(get_repo)]
 OrgRepoDep = Annotated[OrgRepository, Depends(get_org_repo)]
+WorkerRepoDep = Annotated[WorkerRepository, Depends(get_worker_repo)]
 PoolDep = Annotated[asyncpg.Pool, Depends(get_pool)]
 SettingsDep = Annotated[RegistrySettings, Depends(get_settings)]
 SyncDep = Annotated[CatalogueSync, Depends(get_sync)]
@@ -557,6 +583,50 @@ async def health_history(
     if camera is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no camera {camera_id}")
     return await repo.health_history(camera_id, scope=scope, since=since, limit=limit)
+
+
+# --- worker assignment ---------------------------------------------------------
+#
+# Worker-facing, and behind the same X-Internal-Token gate as everything else
+# under /api/* — no separate middleware branch. Two endpoints instead of one
+# combined call because register is cheap (one upsert) and idempotent: a worker
+# refreshes its lease every assignment cycle, and an operator can ask "what
+# shard does pod X think it owns" without pulling the camera list.
+
+
+@app.post("/api/v1/workers/register", response_model=WorkerRegistration, tags=["workers"])
+async def register_worker(
+    payload: WorkerRegister, worker_repo: WorkerRepoDep
+) -> WorkerRegistration:
+    """Join or refresh the ingest pool; returns the worker's shard coordinates.
+
+    Idempotent by construction — the keep-alive IS re-registering, so a worker
+    calls this at boot and on every assignment-refresh tick. `shard_index` and
+    `shard_count` are recomputed from the alive set on every call: a pod that
+    missed its lease simply drops out of `shard_count` on the next call, which
+    is the whole reaper — no DELETE endpoint exists because a killed pod cannot
+    be relied on to make one last request.
+    """
+    return await worker_repo.register(payload.worker_id)
+
+
+@app.get("/api/v1/assignments", response_model=WorkerAssignment, tags=["workers"])
+async def worker_assignments(
+    worker_id: Annotated[
+        str,
+        Query(min_length=1, description="the id this worker registered with"),
+    ],
+    worker_repo: WorkerRepoDep,
+    settings: SettingsDep,
+) -> WorkerAssignment:
+    """This worker's slice of the active camera estate.
+
+    Register-or-refresh happens inside the call, so polling this endpoint alone
+    keeps the lease warm. The scope is the estate root — workers pull for the
+    whole registry, not one org subtree — taken from settings rather than the
+    provisional `org_scope` parameter, which a worker has no business widening.
+    """
+    return await worker_repo.assignment(worker_id, scope=settings.sync_default_org_path)
 
 
 # --- catalogue sync ----------------------------------------------------------

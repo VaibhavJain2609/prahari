@@ -66,12 +66,34 @@ class IngestSettings(BaseSettings):
     """
 
     assignment_refresh: bool = True
-    """Re-read camera assignments on every heartbeat tick.
+    """Re-read camera assignments on the refresh cadence below.
 
     Without this the worker's camera set is frozen at process start, and a
     camera the catalogue sync adds mid-run is invisible until the pod restarts.
     Switchable because a frozen set is the reproducible thing to want during a
     measured load run."""
+
+    assignment_refresh_s: float = 30.0
+    """Seconds between assignment refreshes — each one re-registers the worker
+    (refreshing its lease) and re-fetches its shard of the estate.
+
+    This is deliberately slower than the heartbeat tick: a refresh re-reads
+    the shard's camera list, which is the heavier call, and the registry only
+    needs it often enough to keep `last_seen` well inside the lease. It must
+    stay comfortably below the registry's assignment lease
+    (`PRAHARI_ASSIGNMENT_LEASE_S`, default 60 s) — a worker whose refreshes
+    outlive their lease drops out of `shard_count` and stops being counted
+    while still alive, which leaves its slice unpulled."""
+
+    worker_id: str = ""
+    """This worker's identity at the registry's sharding endpoints
+    (`POST /api/v1/workers/register`, `GET /api/v1/assignments`) and on every
+    camera heartbeat it sends.
+
+    Empty derives it: `$HOSTNAME` — the pod name under Kubernetes, which is
+    also what the chart pins via fieldRef — then `socket.gethostname()`. Set
+    it explicitly only off-cluster, where several workers on one host would
+    otherwise all register as the same machine and be handed the same shard."""
 
     snapshot_dir: str = "data/catalogue"
 

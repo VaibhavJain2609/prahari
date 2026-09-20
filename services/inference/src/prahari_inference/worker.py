@@ -58,13 +58,17 @@ log = logging.getLogger(__name__)
 _BOOT_FETCH_ATTEMPTS = 5
 
 
-def worker_id() -> str:
+def worker_id(settings: IngestSettings | None = None) -> str:
     """Stable within a pod lifetime, unique across pods.
 
-    The pod name under Kubernetes, the hostname otherwise. It is written on every
-    heartbeat so that "which worker said this camera was down" is answerable
-    without correlating timestamps across pod logs.
+    `settings.worker_id` wins when configured; otherwise the pod name under
+    Kubernetes, the hostname otherwise. It is written on every heartbeat and
+    registered at the sharding endpoints, so "which worker said this camera
+    was down" and "which slice is this pod pulling" are answerable without
+    correlating timestamps across pod logs.
     """
+    if settings is not None and settings.worker_id:
+        return settings.worker_id
     return os.getenv("HOSTNAME") or socket.gethostname()
 
 
@@ -129,11 +133,18 @@ class CameraStats:
 
 
 class RegistryClient:
-    """The worker's half of the health contract."""
+    """The worker's half of the health contract, plus its shard membership."""
 
     def __init__(self, settings: IngestSettings, *, client: httpx.Client | None = None) -> None:
         self._s = settings
+        self.worker_id = worker_id(settings)
         self._http = client or httpx.Client(base_url=settings.registry_url, timeout=10.0)
+        # Latched once the registry proves it has no worker-sharding endpoints:
+        # a 404 there means we are talking to a registry that predates them,
+        # and the only correct response is the old unsharded fetch — retried
+        # never, because a deployment does not gain endpoints mid-run.
+        self._unsharded = False
+        self._last_shard: tuple[int, int] | None = None
         if settings.internal_token:
             # The registry's `require_internal_token` gate: every call this
             # client makes goes to the registry, so the header lives on the
@@ -141,8 +152,55 @@ class RegistryClient:
             # credential is this client's contract, not a construction detail.
             self._http.headers[internal_auth.HEADER_NAME] = settings.internal_token
 
+    def register(self) -> dict | None:
+        """Join or refresh the sharding pool. Returns the registration, or
+        None when the registry has no such endpoint (a pre-sharding deploy —
+        the caller falls back to the unsharded fetch).
+
+        Re-registering is the lease keep-alive: cheap, idempotent, and it is
+        what makes this worker count toward `shard_count`. Any non-404 failure
+        propagates — the caller treats it as a registry outage and keeps the
+        camera set it already has.
+        """
+        response = self._http.post("/api/v1/workers/register", json={"worker_id": self.worker_id})
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict) or "shard_count" not in body:
+            # Endpoint exists but answered nonsense — treat like the 404: the
+            # unsharded fetch still yields a usable camera set, which beats
+            # raising a non-HTTP error the reconcile loop does not catch.
+            self._mark_unsharded("register returned a malformed body")
+            return None
+        shard = (body.get("shard_index"), body.get("shard_count"))
+        if shard != self._last_shard:
+            # The reshard line an operator grep for when a camera seems to be
+            # pulled twice — every membership change lands here.
+            log.info(
+                "worker=%s registered: shard %s/%s (lease %ss)",
+                self.worker_id,
+                body.get("shard_index"),
+                body.get("shard_count"),
+                body.get("lease_s"),
+            )
+            self._last_shard = shard
+        return body
+
     def assignments(self) -> list[CameraAssignment]:
-        """Ask the registry what to pull.
+        """Ask the registry what to pull — this worker's shard when the
+        registry supports sharding, the estate's first-N otherwise.
+
+        Sharded path: re-register (the lease keep-alive), then GET
+        /api/v1/assignments for the modulo slice of the active estate the
+        registry computed for this worker_id. That is what stops N workers
+        racing the same first-N cameras.
+
+        Fallback: a 404 on either endpoint means a pre-sharding registry —
+        deployment order during a rollout can pair a new worker with an old
+        registry. The worker stays functional and unsharded, logged loudly,
+        because two unsharded workers pulling the same cameras is the exact
+        defect this endpoint exists to fix and silence would hide it.
 
         `max_active_cameras` is a hard cap from the integrator's guide, not a
         suggestion: exceeding it degrades the shared feed for every other
@@ -157,14 +215,49 @@ class RegistryClient:
         and it is applied by `_assignment`, not here, so that a camera the
         catalogue calls dead is still visible on the map with a reason.
         """
+        cameras = None
+        if not self._unsharded:
+            if self.register() is None:
+                self._mark_unsharded("POST /api/v1/workers/register -> 404")
+            else:
+                response = self._http.get(
+                    "/api/v1/assignments", params={"worker_id": self.worker_id}
+                )
+                if response.status_code == 404:
+                    self._mark_unsharded("GET /api/v1/assignments -> 404")
+                else:
+                    response.raise_for_status()
+                    body = response.json()
+                    # A dict carries the WorkerAssignment envelope; a bare list
+                    # is accepted too so the read does not hinge on the
+                    # envelope surviving a future response-shape change.
+                    cameras = body.get("cameras") if isinstance(body, dict) else body
+        if cameras is None:
+            cameras = self._legacy_cameras()
+        return [a for c in cameras if (a := _assignment(c)) is not None][
+            : self._s.max_active_cameras
+        ]
+
+    def _mark_unsharded(self, reason: str) -> None:
+        if self._unsharded:
+            return
+        self._unsharded = True
+        log.warning(
+            "registry predates worker sharding (%s); falling back to the "
+            "UNSHARDED camera fetch — every worker now pulls the same first "
+            "%d cameras until the registry is upgraded",
+            reason,
+            self._s.max_active_cameras,
+        )
+
+    def _legacy_cameras(self) -> list[dict]:
+        """The pre-sharding fetch: the whole active list, capped client-side."""
         response = self._http.get(
             "/api/v1/cameras",
             params={"lifecycle": "active", "limit": self._s.max_active_cameras},
         )
         response.raise_for_status()
-        return [a for c in response.json() if (a := _assignment(c)) is not None][
-            : self._s.max_active_cameras
-        ]
+        return response.json()
 
     def heartbeat(self, camera_id: str, payload: dict) -> None:
         response = self._http.post(f"/api/v1/cameras/{camera_id}/heartbeat", json=payload)
@@ -552,7 +645,7 @@ class IngestWorker:
     # --- heartbeats ----------------------------------------------------------
 
     def _report_once(self) -> None:
-        wid = worker_id()
+        wid = worker_id(self._s)
         now = datetime.now(UTC).isoformat()
         # Snapshot the running set under the lock, then do the (slow, network)
         # heartbeats outside it — reconciliation only ever runs on this same
@@ -639,9 +732,17 @@ class IngestWorker:
 
     def _report_loop(self) -> None:
         self._touch_liveness()
+        # None marks "no refresh yet": the first tick always reconciles, so a
+        # worker that booted empty (registry down at start) picks cameras up
+        # on its first pass rather than waiting out a whole interval.
+        last_refresh: float | None = None
         while not self._stop.wait(self._s.heartbeat_interval_s):
-            if self._s.assignment_refresh:
+            now = time.monotonic()
+            if self._s.assignment_refresh and (
+                last_refresh is None or now - last_refresh >= self._s.assignment_refresh_s
+            ):
                 self._reconcile_assignments()
+                last_refresh = now
             self._report_once()
             self._touch_liveness()
 
