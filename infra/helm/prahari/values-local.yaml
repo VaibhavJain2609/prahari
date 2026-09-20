@@ -59,6 +59,14 @@ services:
 mediamtx:
   serviceType: LoadBalancer  # k3d maps 8554/8888/8889 to the loadbalancer
 
+# Render the scrape wiring on the laptop so the path is exercised: pod
+# annotations and the NetworkPolicy rules appear in `helm template`, and a
+# `kubectl port-forward pod/... :9090` scrape of the inference worker works.
+# k3s' flannel does not enforce NetworkPolicy, and nothing scrapes the
+# annotations until a Prometheus/OTel collector exists — docs/OBSERVABILITY.md.
+observability:
+  enabled: true
+
 # The laptop estate is trimmed by inference.maxStreamsPerWorker above — that is
 # the value the chart wires to PRAHARI_INGEST_MAX_ACTIVE_CAMERAS. The old
 # top-level `ingest.maxActiveCameras` was read by nothing; the registry still

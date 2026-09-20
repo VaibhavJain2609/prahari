@@ -89,6 +89,19 @@ spec:
               app.kubernetes.io/name: bff
       ports:
         - port: {{ .Values.services.matchEngine.port }}
+    {{- if .Values.observability.enabled }}
+    # Metrics scrapes: /metrics rides this same HTTP port, so the scraper
+    # rule can't be narrower than the port — the port carries the token-gated
+    # admin API too, and the podSelector:{} half of this leans on
+    # PRAHARI_MATCH_INTERNAL_TOKEN staying armed to keep that surface closed.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.observability.monitoringNamespace }}
+        - podSelector: {}
+      ports:
+        - port: {{ .Values.services.matchEngine.port }}
+    {{- end }}
 ---
 # The media ports must stay open: browsers reach WHEP/HLS through the k3d
 # port maps and workers pull RTSP — traffic from the host arrives off-node.
@@ -115,8 +128,22 @@ spec:
               app.kubernetes.io/name: registry
       ports:
         - port: {{ .Values.mediamtx.apiPort }}
+    {{- if .Values.observability.enabled }}
+    # Metrics: unauthenticated plaintext, so this is the boundary — a scraper
+    # in the observability.monitoringNamespace namespace, or any pod in this
+    # one (an in-namespace OTel collector / demo dashboard). The API port
+    # stays registry-only; nothing else needs it.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.observability.monitoringNamespace }}
+        - podSelector: {}
+      ports:
+        - port: {{ .Values.mediamtx.metricsPort }}
+    {{- else }}
     - ports:
         - port: {{ .Values.mediamtx.metricsPort }}
+    {{- end }}
 ---
 # The bus. Consumers: match-engine (publishes detections + alerts), correlation
 # (consumes detections), bff (consumes alerts for SSE). The keda namespace rule
@@ -191,6 +218,19 @@ spec:
               app.kubernetes.io/name: bff
       ports:
         - port: {{ .Values.services.correlation.port }}
+    {{- if .Values.observability.enabled }}
+    # Same shape as match-engine: /metrics shares the token-gated HTTP port,
+    # so opening it to the monitoring namespace / in-namespace pods widens the
+    # admin surface to those sources as well — the internal token is the
+    # boundary for everything that isn't /metrics.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.observability.monitoringNamespace }}
+        - podSelector: {}
+      ports:
+        - port: {{ .Values.services.correlation.port }}
+    {{- end }}
 ---
 # web → bff is the browser's data path. The port also stays open to the host:
 # cluster.yaml maps 8080 for direct API/SSE debugging, and a web-only rule
@@ -226,4 +266,34 @@ spec:
   ingress:
     - ports:
         - port: {{ .Values.services.web.port }}
+{{- if and .Values.observability.enabled .Values.inference.metricsPort }}
+---
+# The inference workers. Every other workload here has an explicit allow;
+# inference had NONE until observability landed — it serves no traffic (exec
+# liveness probe only), so the default-deny covered it completely. The one
+# listener it does open is the plaintext /metrics server
+# (PRAHARI_INGEST_METRICS_PORT), and this rule is the only thing that lets a
+# scraper reach it: the monitoring namespace plus in-namespace pods. Nothing
+# else gets in — the workers need no inbound path for their real work
+# (assignments are pulled from the registry, detections pushed out over gRPC).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prahari-inference-ingress
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: inference
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.observability.monitoringNamespace }}
+        - podSelector: {}
+      ports:
+        - port: {{ .Values.inference.metricsPort }}
+{{- end }}
 {{- end }}
