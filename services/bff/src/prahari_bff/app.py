@@ -22,6 +22,7 @@ import logging
 import secrets
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Annotated, Literal
 from urllib.parse import quote, urlparse
 
@@ -1576,8 +1577,21 @@ async def list_alerts(
     match_engine: MatchEngineDep,
     scope_resolver: ScopeResolverDep,
     limit: int = Query(50, ge=1, le=500),
+    since: Annotated[datetime | None, Query()] = None,
+    camera_id: str | None = None,
+    plate: str | None = None,
+    acknowledged: bool | None = None,
 ) -> list:
-    response = await match_engine.get("/api/v1/alerts", {"limit": limit})
+    params: dict = {"limit": limit}
+    if since is not None:
+        params["since"] = since.isoformat()
+    if camera_id:
+        params["camera_id"] = camera_id
+    if plate:
+        params["plate"] = plate
+    if acknowledged is not None:
+        params["acknowledged"] = str(acknowledged).lower()
+    response = await match_engine.get("/api/v1/alerts", params)
     if response.status_code >= 400:
         return _forward_json(response)
     # Same filter as the SSE relay below: resolve the camera's real org
@@ -1595,6 +1609,48 @@ async def list_alerts(
             continue
         visible.append(item)
     return visible
+
+
+@app.post("/api/v1/alerts/{alert_id}/ack", tags=["alerts"])
+async def acknowledge_alert(
+    alert_id: str,
+    principal: PrincipalDep,
+    match_engine: MatchEngineDep,
+    scope_resolver: ScopeResolverDep,
+    audit: AuditDep,
+    request: Request,
+) -> dict:
+    """Acknowledge an alert — the only lifecycle transition that exists, per
+    the UX spec's "acknowledge only, no assignment workflow" decision. The
+    alert's camera is org-checked before the proxy so an operator cannot ack
+    an alert they cannot see; the ack itself is an audit entry."""
+    upstream = await match_engine.get(f"/api/v1/alerts/{alert_id}")
+    if upstream.status_code == 404:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such alert")
+    if upstream.status_code >= 400:
+        return _forward_json(upstream)
+    camera_id = (upstream.json().get("detection") or {}).get("camera_id")
+    org_path = await scope_resolver.org_path_for_camera(camera_id) if camera_id else None
+    if org_path is None or not in_scope(org_path, principal.org_path):
+        await _audit_access(
+            audit,
+            principal,
+            purpose_code=_ADMIN_PURPOSE,
+            resource=f"alert:{alert_id}",
+            action="alert_ack_denied",
+        )
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "alert is outside your own org subtree")
+    await _audit_access(
+        audit,
+        principal,
+        purpose_code=_ADMIN_PURPOSE,
+        resource=f"alert:{alert_id}",
+        action="alert_ack",
+    )
+    response = await match_engine.post(f"/api/v1/alerts/{alert_id}/ack", {"by": principal.subject})
+    if response.status_code >= 400:
+        return _forward_json(response)
+    return response.json()
 
 
 @app.get("/api/v1/alerts/stream", tags=["alerts"])
@@ -1728,6 +1784,19 @@ def _require_oidc(request: Request) -> OidcClient:
     if not request.app.state.settings.oidc_enabled:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "not found")
     return _get_oidc(request)
+
+
+@app.get("/api/v1/auth/mode", tags=["auth"])
+async def auth_mode(request: Request) -> dict:
+    """Unauthenticated by design: the login page needs to know whether to
+    offer the SSO button *before* the user has a session. Leaks only the
+    auth kind — the issuer stays on the server."""
+    settings: BFFSettings | None = getattr(request.app.state, "settings", None)
+    oidc_enabled = settings.oidc_enabled if settings else False
+    return {
+        "kind": "keycloak" if oidc_enabled else "builtin",
+        "sso_login_url": "/api/bff/auth/oidc/login" if oidc_enabled else None,
+    }
 
 
 @app.get("/api/v1/auth/oidc/login", tags=["auth"])

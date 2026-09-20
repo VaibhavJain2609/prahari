@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { api, ApiError } from "@/lib/api";
 
@@ -21,6 +21,16 @@ function LoginForm() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  // The SSO button only exists when the BFF runs auth.kind=keycloak — an
+  // unauthenticated probe the page can ask before any session exists.
+  const [ssoUrl, setSsoUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    api
+      .get<{ sso_login_url: string | null }>("auth/mode", { skipAuthRedirect: true })
+      .then((m) => setSsoUrl(m.sso_login_url))
+      .catch(() => setSsoUrl(null)); // unreachable BFF → builtin form still works
+  }, []);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -101,6 +111,25 @@ function LoginForm() {
         >
           {submitting ? "Signing in…" : "Sign in"}
         </button>
+
+        {ssoUrl && (
+          // A full navigation, not fetch: the BFF answers with a 302 to
+          // Keycloak and the proxy forwards Location — an <a> is the only
+          // element that lets the browser follow it.
+          <>
+            <div className="my-4 flex items-center gap-3">
+              <span className="h-px flex-1 bg-slate-200 dark:bg-slate-700" />
+              <span className="text-xs text-slate-400">or</span>
+              <span className="h-px flex-1 bg-slate-200 dark:bg-slate-700" />
+            </div>
+            <a
+              href={`${ssoUrl}?next=${encodeURIComponent(searchParams.get("next") || "/")}`}
+              className="block w-full rounded border border-slate-300 px-3 py-2 text-center text-sm font-medium text-slate-700 hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+            >
+              Sign in with SSO
+            </a>
+          </>
+        )}
       </form>
     </div>
   );
