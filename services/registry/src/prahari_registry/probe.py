@@ -37,6 +37,7 @@ import ipaddress
 import re
 import socket
 from base64 import b64encode
+from collections.abc import Iterable
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
@@ -47,6 +48,16 @@ _DEFAULT_RTSP_PORT = 554
 _CONNECT_TIMEOUT_S = 3.0
 _READ_TIMEOUT_S = 5.0
 _MAX_RESPONSE_BYTES = 64 * 1024
+"""Hard ceiling on the TOTAL bytes read for one RTSP response — header block
+plus body together. A hostile or broken endpoint advertising a huge
+`Content-Length` must not turn the probe into an unbounded read; an SDP answer
+is a few hundred bytes and 64 KiB is already generous."""
+
+DEFAULT_ALLOWED_PORTS: frozenset[int] = frozenset({_DEFAULT_RTSP_PORT})
+"""Ports the probe is willing to connect to. RTSP is 554; anything else is
+configurable (`RegistrySettings.probe_allowed_ports`) but defaults closed —
+this is a server-side fetch of a caller-supplied URL, and an open port list
+would make it a connect-anywhere primitive against the cluster's neighbours."""
 
 
 class ProbeError(Exception):
@@ -77,6 +88,13 @@ class ProbeResult(BaseModel):
 
 def _guard_ip(ip_str: str) -> None:
     ip = ipaddress.ip_address(ip_str)
+    # `::ffff:a.b.c.d` is an IPv4 address wearing IPv6 clothes. Newer Pythons
+    # evaluate the mapped address's properties for is_private/is_reserved, but
+    # older ones do not — guard the mapped v4 address explicitly so the answer
+    # is the same on every interpreter we might run on.
+    mapped = ip.ipv4_mapped if isinstance(ip, ipaddress.IPv6Address) else None
+    if mapped is not None:
+        _guard_ip(str(mapped))
     if (
         ip.is_link_local
         or ip.is_loopback
@@ -85,6 +103,15 @@ def _guard_ip(ip_str: str) -> None:
         or ip.is_reserved
     ):
         raise SSRFBlockedError(f"resolved address {ip_str} is not a permitted probe target")
+
+
+def _guard_port(port: int, allowed_ports: Iterable[int]) -> None:
+    """Second SSRF leg: the IP may be a legitimate DVR address and the port
+    still be a Redis or a metadata sidecar living on it."""
+    if port not in allowed_ports:
+        raise SSRFBlockedError(
+            f"port {port} is not in the probe allowlist {sorted(allowed_ports)}"
+        )
 
 
 async def _resolve_pinned_ip(host: str) -> str:
@@ -140,9 +167,20 @@ class _RTSPSession:
         lines.append("\r\n")
         self._writer.write("\r\n".join(lines).encode())
         await self._writer.drain()
-        raw = await asyncio.wait_for(
-            self._reader.readuntil(b"\r\n\r\n"), timeout=_READ_TIMEOUT_S
-        )
+        try:
+            raw = await asyncio.wait_for(
+                self._reader.readuntil(b"\r\n\r\n"), timeout=_READ_TIMEOUT_S
+            )
+        except TimeoutError as exc:
+            raise ProbeError("timed out waiting for the RTSP response headers") from exc
+        except asyncio.LimitOverrunError as exc:
+            # The header block alone exceeded the StreamReader limit — that is
+            # not a camera answering, it is something stuffing bytes at us.
+            raise ProbeError(
+                "response headers exceed the stream buffer limit; not an RTSP endpoint"
+            ) from exc
+        except asyncio.IncompleteReadError as exc:
+            raise ProbeError("connection closed before the response headers") from exc
         head, _, _ = raw.partition(b"\r\n\r\n")
         status_line, *header_lines = head.decode(errors="replace").split("\r\n")
         parts = status_line.split(" ", 2)
@@ -153,14 +191,31 @@ class _RTSPSession:
             if sep:
                 headers[key.strip().lower()] = value.strip()
         body = b""
-        content_length = int(headers.get("content-length", 0) or 0)
-        if content_length:
+        try:
+            content_length = int(headers.get("content-length", 0) or 0)
+        except ValueError as exc:
+            raise ProbeError(
+                f"malformed Content-Length {headers['content-length']!r} — "
+                "not a well-formed RTSP endpoint"
+            ) from exc
+        # `want` is the TOTAL read for this body — the cap applies to the
+        # accumulation, not to each socket read, or a 10 MB Content-Length
+        # would be fetched in full 64 KiB at a time. A truncated SDP still
+        # parses; an unbounded buffer does not stay bounded.
+        want = min(max(content_length, 0), _MAX_RESPONSE_BYTES)
+        if want:
             remaining = raw[len(head) + 4 :]
-            while len(remaining) < content_length:
-                remaining += await asyncio.wait_for(
-                    self._reader.read(_MAX_RESPONSE_BYTES), timeout=_READ_TIMEOUT_S
-                )
-            body = remaining[:content_length]
+            while len(remaining) < want:
+                try:
+                    chunk = await asyncio.wait_for(
+                        self._reader.read(want - len(remaining)), timeout=_READ_TIMEOUT_S
+                    )
+                except TimeoutError as exc:
+                    raise ProbeError("timed out reading the response body") from exc
+                if not chunk:
+                    break  # peer closed early; parse what arrived
+                remaining += chunk
+            body = remaining[:want]
         return {"status": status_code, "headers": headers, "body": body}
 
 
@@ -186,15 +241,30 @@ def _parse_sdp(body: bytes) -> tuple[str | None, float | None, list[str]]:
 
 
 async def probe_rtsp(
-    url: str, *, username: str | None = None, password: str | None = None
+    url: str,
+    *,
+    username: str | None = None,
+    password: str | None = None,
+    allowed_ports: Iterable[int] = DEFAULT_ALLOWED_PORTS,
 ) -> ProbeResult:
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError as exc:
+        raise ProbeError(f"malformed URL: {exc}") from exc
     if parts.scheme != "rtsp":
         raise ProbeError(f"unsupported scheme {parts.scheme!r} — only rtsp:// is probed")
     host = parts.hostname
     if not host:
         raise ProbeError("URL has no host")
-    port = parts.port or _DEFAULT_RTSP_PORT
+    try:
+        port = parts.port or _DEFAULT_RTSP_PORT
+    except ValueError as exc:
+        # urlsplit defers port validation to `.port` access — a garbage port
+        # in the URL surfaces here, not at parse time.
+        raise ProbeError(f"invalid port in URL: {exc}") from exc
+    # Port check happens before DNS: there is no reason to resolve a host we
+    # would refuse to connect to anyway.
+    _guard_port(port, allowed_ports)
 
     ip = await _resolve_pinned_ip(host)
 

@@ -8,12 +8,15 @@ low-rate and human-facing, and JSON keeps the console and `curl` on equal terms.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Annotated
 
 import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.responses import JSONResponse
 from prahari_common.config import GatewaySettings
 from pydantic import ValidationError
 
@@ -33,6 +36,7 @@ from .models import (
     HealthState,
     Heartbeat,
     HeartbeatAck,
+    HeartbeatSample,
     Lifecycle,
     NearestCamera,
     Org,
@@ -40,7 +44,7 @@ from .models import (
     SyncResult,
 )
 from .probe import ProbeError, ProbeResult, SSRFBlockedError, probe_rtsp
-from .repository import CameraRepository, OrgRepository
+from .repository import CameraRepository, OrgRepository, redact_url_credentials
 from .sync import CatalogueSync
 
 log = logging.getLogger(__name__)
@@ -87,6 +91,13 @@ async def _retention_loop(repo: CameraRepository, settings: RegistrySettings) ->
 async def lifespan(app: FastAPI):
     settings: RegistrySettings = registry_settings()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    if not settings.internal_token:
+        log.warning(
+            "internal API unauthenticated (PRAHARI_INTERNAL_TOKEN unset) — "
+            "every /api/* request is accepted without an X-Internal-Token "
+            "header. Acceptable only where nothing off-cluster can reach this "
+            "service; every real profile must set a shared token."
+        )
 
     pool = await create_pool(settings)
     applied = await apply_migrations(pool)
@@ -142,6 +153,16 @@ async def require_internal_token(request: Request, call_next):
     anything else) could simply call the registry directly and read the
     whole estate unscoped.
 
+    Semantics are deliberately asymmetric:
+
+    * **Token configured → fail closed.** Any request other than `/healthz`
+      `/readyz` without a byte-identical `X-Internal-Token` gets a 401. The
+      comparison is `hmac.compare_digest` — a `!=` string compare leaks the
+      token a byte at a time through response timing.
+    * **Token empty → enforcement is OFF.** Requests pass with no check.
+      This is the local/dev default and is logged loudly at startup; it is
+      NOT fail-closed, which is why every real profile must set a token.
+
     `/healthz` and `/readyz` are exempt — a liveness/readiness probe carries
     no data and must not depend on a secret being wired correctly to answer.
     Everything else under `/api/*` (and, deliberately, everything not yet
@@ -149,11 +170,38 @@ async def require_internal_token(request: Request, call_next):
     """
     settings: RegistrySettings = request.app.state.settings
     if settings.internal_token and request.url.path not in ("/healthz", "/readyz"):
-        if request.headers.get("x-internal-token") != settings.internal_token:
+        provided = request.headers.get("x-internal-token")
+        if provided is None or not hmac.compare_digest(
+            provided.encode(), settings.internal_token.encode()
+        ):
             return Response(
                 status_code=status.HTTP_401_UNAUTHORIZED, content="internal token required"
             )
     return await call_next(request)
+
+
+@app.exception_handler(asyncpg.DataError)
+async def _data_error_handler(request: Request, exc: asyncpg.DataError) -> JSONResponse:
+    """A malformed identifier reaching a `$1::uuid` / `$2::ltree` cast surfaces
+    from asyncpg as `DataError` (`InvalidTextRepresentationError`, PG 22P02)
+    rather than as a routed 4xx — without this handler it is a 500.
+
+    * Bad `ltree` (`?org_scope=...`) → 422: the *query parameter* is malformed;
+      a 404 would tell the client the camera does not exist when in fact the
+      scope itself was never valid.
+    * Anything else (a non-UUID `camera_id`/`org_id` in the path) → 404: no
+      object can ever have that id, which is what "not found" means.
+    """
+    message = str(exc)
+    if "ltree" in message:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": "org_scope is not a valid ltree path"},
+        )
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content={"detail": "not found or malformed identifier"},
+    )
 
 
 # --- dependencies ------------------------------------------------------------
@@ -374,7 +422,7 @@ async def create_camera(
 
 
 @app.post("/api/v1/cameras/probe", response_model=ProbeResult, tags=["cameras"])
-async def probe_camera(payload: CameraProbeRequest) -> ProbeResult:
+async def probe_camera(payload: CameraProbeRequest, settings: SettingsDep) -> ProbeResult:
     """SSRF-hardened connectivity check — see `probe.py` for the guard. No
     scope/role check here: this touches no camera or org data, it is a
     bare network probe of a caller-supplied URL. The BFF proxy is where
@@ -383,7 +431,10 @@ async def probe_camera(payload: CameraProbeRequest) -> ProbeResult:
     on any of the camera write handlers below)."""
     try:
         return await probe_rtsp(
-            payload.rtsp_url, username=payload.username, password=payload.password
+            payload.rtsp_url,
+            username=payload.username,
+            password=payload.password,
+            allowed_ports=settings.probe_allowed_ports,
         )
     except SSRFBlockedError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
@@ -470,6 +521,30 @@ async def post_heartbeat(
     )
 
 
+@app.get(
+    "/api/v1/cameras/{camera_id}/health-history",
+    response_model=list[HeartbeatSample],
+    tags=["health"],
+)
+async def health_history(
+    camera_id: str,
+    repo: RepoDep,
+    scope: ScopeDep,
+    limit: int = Query(100, ge=1, le=500),
+    since: Annotated[
+        datetime | None,
+        Query(description="Only heartbeats at or after this timestamp (ISO-8601)"),
+    ] = None,
+) -> list[HeartbeatSample]:
+    """Recent heartbeats for one camera, newest first — the console's camera
+    detail drawer. Scoped exactly like `get_camera`: the camera must be
+    visible under `scope` before any of its history is."""
+    camera = await repo.get(camera_id, scope=scope)
+    if camera is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no camera {camera_id}")
+    return await repo.health_history(camera_id, scope=scope, since=since, limit=limit)
+
+
 # --- catalogue sync ----------------------------------------------------------
 
 
@@ -502,8 +577,14 @@ async def sync_runs(repo: RepoDep, limit: int = Query(10, ge=1, le=100)) -> list
 async def stream_paths(repo: RepoDep) -> dict[str, str]:
     """The MediaMTX paths this registry wants to exist. Diagnostic: comparing
     this against MediaMTX's own list tells you whether a missing preview is a
-    registry problem or a restreamer problem."""
-    return await repo.desired_mediamtx_paths()
+    registry problem or a restreamer problem.
+
+    `desired_mediamtx_paths` embeds *decrypted* DVR credentials in each URL —
+    MediaMTX needs them to pull the source. This endpoint strips userinfo from
+    every value before serialising; the reconcile path keeps the credentialed
+    form."""
+    paths = await repo.desired_mediamtx_paths()
+    return {name: redact_url_credentials(url) for name, url in paths.items()}
 
 
 @app.post("/api/v1/streams/reconcile", tags=["streams"])

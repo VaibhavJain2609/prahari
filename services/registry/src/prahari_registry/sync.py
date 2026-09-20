@@ -158,7 +158,15 @@ class CatalogueSync:
             log.warning("catalogue sync failed: %s", result.error)
         finally:
             result.finished_at = datetime.now(UTC)
-            await self._repo.finish_sync_run(run_id, result)
+            try:
+                await self._repo.finish_sync_run(run_id, result)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Bookkeeping must not mask the real result: if recording the
+                # run fails, the pass already happened and its SyncResult is
+                # still the truth the caller and the logs need.
+                log.exception("failed to record sync run %d; result still stands", run_id)
 
         if result.ok:
             await self._mediamtx.reconcile(await self._repo.desired_mediamtx_paths())
@@ -180,10 +188,15 @@ class CatalogueSync:
     # --- background loop -----------------------------------------------------
 
     async def _loop(self) -> None:
-        if self._s.sync_on_startup:
-            await self.run_once_locked()
-        while True:
+        # `sync_on_startup` only skips the *immediate* first pass — the timer
+        # still applies, so we shift into the loop with one sleep up front.
+        # Either way every pass runs inside the same try/except: a transient
+        # failure at startup (a DB blip during pod boot is the commonest time
+        # for one) must not kill the loop task and silently end all future
+        # syncs.
+        if not self._s.sync_on_startup:
             await asyncio.sleep(self._s.sync_interval_s)
+        while True:
             try:
                 await self.run_once_locked()
             except asyncio.CancelledError:
@@ -192,6 +205,7 @@ class CatalogueSync:
                 # The loop outliving any single failure is the whole point of
                 # having a loop. Logged with a traceback and retried next tick.
                 log.exception("catalogue sync pass raised; continuing")
+            await asyncio.sleep(self._s.sync_interval_s)
 
     def start(self) -> None:
         if not self._s.sync_enabled:
