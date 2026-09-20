@@ -253,6 +253,17 @@ password.
 # /api/v1/alerts.
 - name: PRAHARI_MATCH_REDIS_URL
   value: "redis://prahari-redis:6379"
+# Alert persistence: history survives restarts; unset degrades to memory-only
+# and /readyz reports it. ORDER: POSTGRES_PASSWORD precedes the DSN — see
+# databaseEnv's ordering comment.
+- name: POSTGRES_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "prahari.postgresSecretName" . }}
+      key: password
+      optional: {{ not .Values.postgres.enabled }}
+- name: PRAHARI_MATCH_DATABASE_URL
+  value: "postgresql://{{ .Values.postgres.user }}:$(POSTGRES_PASSWORD)@prahari-postgres:5432/{{ .Values.postgres.database }}"
 - name: PRAHARI_MATCH_INTERNAL_TOKEN
   valueFrom:
     secretKeyRef:
