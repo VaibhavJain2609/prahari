@@ -36,6 +36,14 @@ class BFFSettings(BaseSettings):
     Helm values leaves this at the default — a session cookie sent over HTTP
     in the cloud is a credential handed to anything on the path."""
 
+    login_rate_limit_attempts: int = 10
+    login_rate_limit_window_s: float = 60.0
+    """Sliding-window throttle on `/auth/login`, applied per-username and
+    per-client-IP: beyond `login_rate_limit_attempts` attempts inside
+    `login_rate_limit_window_s` seconds the endpoint answers 429. In-memory
+    and per-process — enough to blunt a script against one pod without
+    making login depend on Redis."""
+
     # --- registry ----------------------------------------------------------
 
     registry_base_url: str = "http://prahari-registry:8000"
@@ -92,6 +100,12 @@ class BFFSettings(BaseSettings):
     alert_stream_key: str = "prahari:alerts"
     """Must match `MatchSettings.redis_stream_key` on the publishing side —
     one bus, two ends, same key."""
+
+    sse_max_connections: int = 32
+    """Cap on concurrent `/api/v1/alerts/stream` consumers — each holds an
+    open request plus one Redis connection for the life of the tab, so an
+    unbounded fan-out is a self-inflicted DoS. Beyond the cap the endpoint
+    answers 429; the browser retries."""
 
     # --- bootstrap -----------------------------------------------------------
 

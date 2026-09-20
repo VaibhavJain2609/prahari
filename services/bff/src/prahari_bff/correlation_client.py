@@ -11,6 +11,8 @@ does no reshaping — `export.py` reads the dict directly.
 
 from __future__ import annotations
 
+from urllib.parse import quote
+
 import httpx
 
 from .config import BFFSettings
@@ -26,7 +28,9 @@ class CorrelationClient:
         )
 
     async def get_route(self, plate: str) -> dict:
-        response = await self._client.get(f"/api/v1/routes/{plate}")
+        # The plate is caller-supplied path material — quote it so a value
+        # like "../admin" or "X?drop=1" can't escape or mutate the route.
+        response = await self._client.get(f"/api/v1/routes/{quote(plate, safe='')}")
         response.raise_for_status()
         return response.json()
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import io
+from xml.sax.saxutils import escape
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -31,6 +32,16 @@ _CSV_HEADERS = [
 ]
 
 
+def _csv_cell(value: object) -> object:
+    """Formula-injection guard: a cell opening with =, +, - or @ executes in
+    Excel/Sheets when the file is opened. Prefixing with a single quote makes
+    the cell a literal — the standard mitigation for CSVs that carry
+    untrusted text (plate strings, evidence refs)."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
+        return "'" + value
+    return value
+
+
 def route_to_csv(route: dict) -> bytes:
     """One row per hop — plate repeated on every row so the file is
     self-describing even split from its response headers."""
@@ -41,14 +52,14 @@ def route_to_csv(route: dict) -> bytes:
     for hop in route.get("hops", []):
         writer.writerow(
             [
-                plate,
-                hop.get("camera_id", ""),
-                hop.get("location", ""),
-                hop.get("wall_clock_s", ""),
-                hop.get("pts_ms", ""),
-                hop.get("link_kind", "") or "",
-                hop.get("confidence", ""),
-                hop.get("evidence_ref", "") or "",
+                _csv_cell(plate),
+                _csv_cell(hop.get("camera_id", "")),
+                _csv_cell(hop.get("location", "")),
+                _csv_cell(hop.get("wall_clock_s", "")),
+                _csv_cell(hop.get("pts_ms", "")),
+                _csv_cell(hop.get("link_kind", "") or ""),
+                _csv_cell(hop.get("confidence", "")),
+                _csv_cell(hop.get("evidence_ref", "") or ""),
             ]
         )
     return buf.getvalue().encode("utf-8")
@@ -64,7 +75,12 @@ def route_to_pdf(route: dict) -> bytes:
     plate = route.get("plate", "")
     hops = route.get("hops", [])
 
-    elements = [Paragraph(f"Route reconstruction: {plate}", styles["Title"]), Spacer(1, 12)]
+    # Paragraph parses a mini-HTML dialect — an unescaped plate containing
+    # '<' or '&' would be read as markup (or crash the paragraph parser).
+    elements = [
+        Paragraph(f"Route reconstruction: {escape(str(plate))}", styles["Title"]),
+        Spacer(1, 12),
+    ]
 
     header_style = TableStyle(
         [

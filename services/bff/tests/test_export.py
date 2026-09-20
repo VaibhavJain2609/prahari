@@ -82,3 +82,38 @@ def test_pdf_of_a_route_with_no_hops_still_renders():
     empty = {"plate": "GJ01ZZ0000", "hops": []}
     body = route_to_pdf(empty)
     assert body.startswith(b"%PDF-")
+
+
+def test_csv_cells_opening_with_formula_chars_are_escaped():
+    """A cell starting with =, +, - or @ is a formula in Excel/Sheets —
+    an untrusted plate or evidence ref must not execute on open."""
+    hostile = {
+        "plate": '=HYPERLINK("http://evil")',
+        "hops": [
+            {
+                "camera_id": "@cmd",
+                "location": "+1+1",
+                "wall_clock_s": 1.0,
+                "pts_ms": 1,
+                "link_kind": "seen",
+                "confidence": 0.5,
+                "evidence_ref": "-2+3",
+            }
+        ],
+    }
+    rows = list(csv.reader(io.StringIO(route_to_csv(hostile).decode("utf-8"))))
+    data_row = rows[1]
+    for cell in data_row:
+        assert cell.startswith("'") or cell[:1] not in ("=", "+", "-", "@")
+    assert data_row[0] == '\'=HYPERLINK("http://evil")'
+    assert data_row[1] == "'@cmd"
+    assert data_row[7] == "'-2+3"
+
+
+def test_pdf_escapes_markup_characters_in_the_plate():
+    """ReportLab Paragraph parses mini-HTML — a plate containing '<' or '&'
+    must be escaped, not parsed as markup (which would also crash the
+    paragraph parser on an unclosed tag)."""
+    hostile = {"plate": "GJ01<b>&amp;", "hops": []}
+    body = route_to_pdf(hostile)
+    assert body.startswith(b"%PDF-")

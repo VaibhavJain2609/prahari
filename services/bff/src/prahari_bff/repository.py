@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 import asyncpg
 
 from .models import ApiKey, ApiKeyCreate, Role, User, UserCreate
-from .security import hash_api_key, hash_password, new_api_key
+from .security import hash_api_key, hash_password, hash_session_id, new_api_key, new_session_id
 
 
 def _user_from_row(row: asyncpg.Record) -> User:
@@ -103,22 +103,42 @@ class UserRepository:
 
 
 class SessionRepository:
+    """Sessions keyed by hash, not by the cookie itself.
+
+    `sessions.id` stores `hash_session_id(cookie)` — sha256 truncated into
+    the existing uuid column — so a leaked `sessions` row yields no usable
+    credential, the same discipline `api_keys.key_hash` already applies to
+    API keys. Sessions minted before this scheme (rows whose id is itself
+    the cookie) simply stop resolving on deploy; users log in again, which
+    is the cheapest migration an ephemeral credential can have.
+
+    Residual risk, flagged for sequencing: the truncation exists only
+    because `sessions.id` is `uuid` in migrations/006_identity.sql, which
+    the registry owns. A full-width TEXT hash column would be strictly
+    better; it needs a registry-side migration, not BFF code.
+    """
+
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
 
     async def create(self, user_id: str, *, ttl_hours: int) -> tuple[str, datetime]:
+        """Returns `(cookie_value, expires_at)` — the caller sets the cookie
+        value; only its hash ever reaches the table."""
         expires_at = datetime.now(UTC) + timedelta(hours=ttl_hours)
-        session_id = await self._pool.fetchval(
-            "INSERT INTO sessions (user_id, expires_at) VALUES ($1::uuid, $2) RETURNING id",
+        cookie_value = new_session_id()
+        await self._pool.execute(
+            "INSERT INTO sessions (id, user_id, expires_at) VALUES ($1::uuid, $2::uuid, $3)",
+            hash_session_id(cookie_value),
             user_id,
             expires_at,
         )
-        return str(session_id), expires_at
+        return cookie_value, expires_at
 
     async def resolve(self, session_id: str) -> tuple[User, str] | None:
         """A valid, unexpired, unrevoked session's user and org path in one
         query — a resolver that needed a second round trip to learn scope
-        would be a resolver a busy handler forgets to make."""
+        would be a resolver a busy handler forgets to make. `session_id` is
+        the cookie value; the lookup is by its hash."""
         try:
             row = await self._pool.fetchrow(
                 """
@@ -132,10 +152,12 @@ class SessionRepository:
                   AND s.expires_at > now()
                   AND u.disabled_at IS NULL
                 """,
-                session_id,
+                hash_session_id(session_id),
             )
         except (ValueError, asyncpg.DataError):
-            # Not a well-formed uuid — a forged or stale cookie, not a server error.
+            # Belt-and-suspenders: hash_session_id always yields a valid
+            # uuid, but a driver-level type error must still read as "no
+            # such session", never a 500.
             return None
         if row is None:
             return None
@@ -144,7 +166,8 @@ class SessionRepository:
     async def revoke(self, session_id: str) -> None:
         try:
             await self._pool.execute(
-                "UPDATE sessions SET revoked_at = now() WHERE id = $1::uuid", session_id
+                "UPDATE sessions SET revoked_at = now() WHERE id = $1::uuid",
+                hash_session_id(session_id),
             )
         except (ValueError, asyncpg.DataError):
             return

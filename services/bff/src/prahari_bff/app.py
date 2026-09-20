@@ -14,15 +14,18 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import dataclasses
 import io
 import json
 import logging
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
+from urllib.parse import quote, urlparse
 
 import httpx
+import redis as redis_lib
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from google.protobuf.json_format import MessageToDict
 from prahari.v1 import events_pb2
 from prahari_common.bus import RedisStreamConsumer
@@ -43,7 +46,7 @@ from .repository import (
     org_path_for_id,
 )
 from .scope_resolver import CameraScopeResolver
-from .security import verify_password
+from .security import SlidingWindowRateLimiter, verify_password
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +117,10 @@ async def lifespan(app: FastAPI):
     app.state.correlation = correlation
     app.state.scope_resolver = scope_resolver
     app.state.audit = audit
+    app.state.login_limiter = SlidingWindowRateLimiter(
+        settings.login_rate_limit_attempts, settings.login_rate_limit_window_s
+    )
+    app.state.sse_active = 0
     try:
         yield
     finally:
@@ -131,6 +138,146 @@ app = FastAPI(
 )
 
 
+# --- dependency accessors ---------------------------------------------------
+#
+# These must be defined *before* every route that uses them: `from __future__
+# import annotations` turns parameter annotations into strings that FastAPI
+# resolves via `get_type_hints()` at route-decoration time, not lazily at
+# request time. A route decorated before its `XDep` alias exists gets
+# silently reinterpreted as a required query parameter named after the
+# argument instead of a dependency — no import error, no crash, just a 422
+# on every call. `/api/v1/orgs` shipped exactly that bug once already.
+
+
+def get_registry_client(request: Request) -> RegistryClient:
+    return request.app.state.registry
+
+
+def get_correlation_client(request: Request) -> CorrelationClient:
+    return request.app.state.correlation
+
+
+def get_scope_resolver(request: Request) -> CameraScopeResolver:
+    return request.app.state.scope_resolver
+
+
+def get_audit_log(request: Request) -> AuditLog:
+    return request.app.state.audit
+
+
+RegistryDep = Annotated[RegistryClient, Depends(get_registry_client)]
+CorrelationDep = Annotated[CorrelationClient, Depends(get_correlation_client)]
+ScopeResolverDep = Annotated[CameraScopeResolver, Depends(get_scope_resolver)]
+AuditDep = Annotated[AuditLog, Depends(get_audit_log)]
+
+
+# --- browser-facing middleware ----------------------------------------------
+
+
+_MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    # The API serves JSON/SSE/files to exactly one origin (the console),
+    # so the most conservative policy is also the correct one.
+    "Content-Security-Policy": "default-src 'self'",
+}
+
+
+def _with_security_headers(response: Response) -> Response:
+    for name, value in _SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)
+    return response
+
+
+@app.middleware("http")
+async def origin_and_security_headers(request: Request, call_next):
+    """Two small always-on guards in one pass:
+
+    1. Origin check on mutations: a POST/PATCH/PUT/DELETE carrying an
+       `Origin` header that does not match the request's `Host` is a
+       cross-site form/fetch and is refused — the session cookie's
+       `SameSite=Lax` already covers top-level navigations, this covers
+       what Lax does not. Requests with no `Origin` (curl, services,
+       non-browser clients) are unaffected; `/auth/login` is deliberately
+       included, since a cross-site login is exactly what CSRF means here.
+    2. A fixed set of defensive response headers on everything that leaves,
+       errors included.
+    """
+    origin = request.headers.get("origin")
+    if request.method in _MUTATING_METHODS and origin:
+        if urlparse(origin).netloc != request.headers.get("host", ""):
+            return _with_security_headers(
+                JSONResponse(
+                    {"detail": "origin does not match request host"},
+                    status_code=status.HTTP_403_FORBIDDEN,
+                )
+            )
+    return _with_security_headers(await call_next(request))
+
+
+# --- audit helper -------------------------------------------------------------
+#
+# The privacy invariant: every evidence access is written to the hash-chained
+# audit log — no exceptions, no "internal" bypass. In code that means the
+# append happens *before* the response is served, and a failed append fails
+# the request closed (500) rather than serving an unaudited access.
+
+_ADMIN_PURPOSE = "admin"
+"""Audit `purpose_code` for admin/config actions (user/API-key/org/camera
+writes, CSV import). These are not evidence reads, so they do not require
+`X-Purpose-Code` — but they still get recorded."""
+
+
+async def _audit_access(
+    audit: AuditLog,
+    principal: Principal,
+    *,
+    purpose_code: str,
+    resource: str,
+    action: str,
+) -> None:
+    """Append one entry, failing closed if the append itself fails.
+
+    A response served after a failed append is an unaudited access — the one
+    thing the audit log exists to prevent. Callers invoke this before
+    returning; a raise here surfaces as 500, not a silently unlogged 200."""
+    try:
+        await audit.append(
+            actor=principal.subject,
+            org_path=principal.org_path,
+            purpose_code=purpose_code,
+            resource=resource,
+            action=action,
+        )
+    except Exception as exc:
+        log.error("audit append failed for %s on %s: %s", action, resource, exc)
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "audit log unavailable") from exc
+
+
+async def _require_session_admin(
+    principal: Principal, *, audit: AuditLog, audit_action: str
+) -> None:
+    """Minting credentials is session-only: an admin-purpose API key must not
+    be able to create users or mint more keys — a leaked key would otherwise
+    be a self-renewing root of trust, and `created_by` would have no real
+    user to name. The denial is itself audited."""
+    if principal.kind == "api_key":
+        await _audit_access(
+            audit,
+            principal,
+            purpose_code=_ADMIN_PURPOSE,
+            resource=f"api_key:{principal.subject}",
+            action=audit_action,
+        )
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "API keys cannot create users or API keys — a session principal is required",
+        )
+
+
 # --- probes --------------------------------------------------------------
 
 
@@ -143,13 +290,27 @@ async def healthz() -> dict:
 async def readyz(request: Request, response: Response) -> dict:
     try:
         await request.app.state.pool.fetchval("SELECT 1")
-    except Exception as exc:  # noqa: BLE001 - readiness reports any failure, not a chosen subset
+    except Exception:  # noqa: BLE001 - readiness reports any failure, not a chosen subset
+        # Log the real error; return a generic one — exception text can carry
+        # connection strings or schema details that an unauthenticated probe
+        # has no business seeing.
+        log.exception("readiness check failed")
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return {"status": "unavailable", "database": f"{type(exc).__name__}: {exc}"}
+        return {"status": "unavailable", "database": "error"}
     return {"status": "ready", "database": "ok"}
 
 
 # --- auth ------------------------------------------------------------------
+
+
+_DUMMY_PASSWORD_HASH = (
+    "$argon2id$v=19$m=65536,t=3,p=4$jCxO1K7cdhHDRBrnpjRl+g$"
+    "LtRw0h8MiJnZw+QrvdSLl9oDKOb201kVoXoezI9ii34"
+)
+"""A real argon2id hash (of a throwaway constant), verified for unknown
+usernames so the timing profile of "no such user" is indistinguishable from
+"wrong password" — without it, the username-enumeration oracle is one
+`verify_password` early-exit wide."""
 
 
 @app.post("/api/v1/auth/login", response_model=User, tags=["auth"])
@@ -157,15 +318,25 @@ async def login(payload: LoginRequest, request: Request, response: Response) -> 
     settings: BFFSettings = request.app.state.settings
     user_repo: UserRepository = request.app.state.user_repo
     session_repo: SessionRepository = request.app.state.session_repo
+    limiter: SlidingWindowRateLimiter = request.app.state.login_limiter
+
+    # Throttle before doing any credential work: per-username so a targeted
+    # account can't be hammered, per-IP so one source can't spray usernames.
+    keys = [f"u:{payload.username}"]
+    if request.client is not None:
+        keys.append(f"ip:{request.client.host}")
+    if not all(limiter.allow(key) for key in keys):
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS, "too many login attempts — try again shortly"
+        )
 
     resolved = await user_repo.get_by_username_with_hash(payload.username)
-    if resolved is None:
-        # Same 401 whether the username doesn't exist or the password is
-        # wrong — distinguishing them would tell an attacker which usernames
-        # are real.
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
-    user, password_hash = resolved
-    if user.disabled_at is not None or not verify_password(payload.password, password_hash):
+    user, password_hash = resolved if resolved is not None else (None, _DUMMY_PASSWORD_HASH)
+    # `verify_password` runs on every path — same 401 and same argon2 cost
+    # whether the username doesn't exist or the password is wrong;
+    # distinguishing them would tell an attacker which usernames are real.
+    password_ok = verify_password(payload.password, password_hash)
+    if user is None or user.disabled_at is not None or not password_ok:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
 
     session_id, expires_at = await session_repo.create(
@@ -214,13 +385,41 @@ async def me(principal: PrincipalDep) -> Principal:
     status_code=status.HTTP_201_CREATED,
     tags=["auth"],
 )
-async def create_user(payload: UserCreate, principal: AdminDep, request: Request) -> User:
+async def create_user(
+    payload: UserCreate, principal: AdminDep, audit: AuditDep, request: Request
+) -> User:
+    await _require_session_admin(principal, audit_action="user_create_denied", audit=audit)
     target_path = await org_path_for_id(request.app.state.pool, payload.org_id)
     if target_path is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no org {payload.org_id}")
     if not in_scope(target_path, principal.org_path):
+        await _audit_access(
+            audit,
+            principal,
+            purpose_code=_ADMIN_PURPOSE,
+            resource=f"user:{payload.username}",
+            action="user_create_denied",
+        )
         raise HTTPException(status.HTTP_403_FORBIDDEN, "org is outside your own org subtree")
-    return await request.app.state.user_repo.create(payload)
+    try:
+        user = await request.app.state.user_repo.create(payload)
+    except Exception:
+        await _audit_access(
+            audit,
+            principal,
+            purpose_code=_ADMIN_PURPOSE,
+            resource=f"user:{payload.username}",
+            action="user_create_failed",
+        )
+        raise
+    await _audit_access(
+        audit,
+        principal,
+        purpose_code=_ADMIN_PURPOSE,
+        resource=f"user:{user.username}",
+        action="user_create",
+    )
+    return user
 
 
 @app.post(
@@ -230,43 +429,42 @@ async def create_user(payload: UserCreate, principal: AdminDep, request: Request
     tags=["auth"],
 )
 async def create_api_key(
-    payload: ApiKeyCreate, principal: AdminDep, request: Request
+    payload: ApiKeyCreate, principal: AdminDep, audit: AuditDep, request: Request
 ) -> ApiKeyCreated:
+    await _require_session_admin(principal, audit_action="api_key_create_denied", audit=audit)
     target_path = await org_path_for_id(request.app.state.pool, payload.org_id)
     if target_path is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no org {payload.org_id}")
     if not in_scope(target_path, principal.org_path):
+        await _audit_access(
+            audit,
+            principal,
+            purpose_code=_ADMIN_PURPOSE,
+            resource=f"api_key:{payload.label}",
+            action="api_key_create_denied",
+        )
         raise HTTPException(status.HTTP_403_FORBIDDEN, "org is outside your own org subtree")
 
     api_key_repo: ApiKeyRepository = request.app.state.api_key_repo
-    created_by = principal.id if principal.kind == "session" else None
-    key, plaintext = await api_key_repo.create(payload, created_by=created_by)
+    try:
+        key, plaintext = await api_key_repo.create(payload, created_by=principal.id)
+    except Exception:
+        await _audit_access(
+            audit,
+            principal,
+            purpose_code=_ADMIN_PURPOSE,
+            resource=f"api_key:{payload.label}",
+            action="api_key_create_failed",
+        )
+        raise
+    await _audit_access(
+        audit,
+        principal,
+        purpose_code=_ADMIN_PURPOSE,
+        resource=f"api_key:{key.label}",
+        action="api_key_create",
+    )
     return ApiKeyCreated(**key.model_dump(), plaintext=plaintext)
-
-
-# --- Stage 3 dependency accessors -------------------------------------------
-
-
-def get_registry_client(request: Request) -> RegistryClient:
-    return request.app.state.registry
-
-
-def get_correlation_client(request: Request) -> CorrelationClient:
-    return request.app.state.correlation
-
-
-def get_scope_resolver(request: Request) -> CameraScopeResolver:
-    return request.app.state.scope_resolver
-
-
-def get_audit_log(request: Request) -> AuditLog:
-    return request.app.state.audit
-
-
-RegistryDep = Annotated[RegistryClient, Depends(get_registry_client)]
-CorrelationDep = Annotated[CorrelationClient, Depends(get_correlation_client)]
-ScopeResolverDep = Annotated[CameraScopeResolver, Depends(get_scope_resolver)]
-AuditDep = Annotated[AuditLog, Depends(get_audit_log)]
 
 
 # --- orgs --------------------------------------------------------------------
@@ -278,16 +476,6 @@ AuditDep = Annotated[AuditLog, Depends(get_audit_log)]
 # `_check_target_org` on `parent_id`: the same rule camera writes already
 # apply to `org_id` — default to the caller's own org, and anything given
 # explicitly must already be within the caller's own subtree.
-#
-# Defined after the Stage 3 dependency accessors above: `RegistryDep` is a
-# type alias evaluated by FastAPI at route-decoration time (`from __future__
-# import annotations` turns the parameter annotation into a string that
-# `get_type_hints()` resolves against the module namespace right then), not
-# lazily at request time. A route decorated before its `XDep` alias exists
-# gets silently reinterpreted as a required query parameter named after the
-# argument instead of a dependency — no import error, no crash, just a 422
-# on every call. `/api/v1/orgs` shipped exactly that bug once already; keep
-# this block below every `*Dep` alias it uses.
 
 
 @app.get("/api/v1/orgs", tags=["orgs"])
@@ -296,10 +484,26 @@ async def list_orgs(principal: PrincipalDep, registry: RegistryDep) -> list:
 
 
 @app.post("/api/v1/orgs", status_code=status.HTTP_201_CREATED, tags=["orgs"])
-async def create_org(principal: AdminDep, registry: RegistryDep, request: Request) -> dict:
+async def create_org(
+    principal: AdminDep, registry: RegistryDep, audit: AuditDep, request: Request
+) -> dict:
     body = await request.json()
-    body["parent_id"] = await _check_target_org(request, principal, body.get("parent_id"))
+    body["parent_id"] = await _check_target_org(
+        request,
+        principal,
+        body.get("parent_id"),
+        audit=audit,
+        denied_action="org_create_denied",
+        resource=f"org:{body.get('label', 'new')}",
+    )
     response = await registry.post("/api/v1/orgs", json=body)
+    await _audit_access(
+        audit,
+        principal,
+        purpose_code=_ADMIN_PURPOSE,
+        resource=f"org:{body.get('label', 'new')}",
+        action="org_create" if response.status_code < 400 else "org_create_failed",
+    )
     return _forward_json(response)
 
 
@@ -399,21 +603,24 @@ async def get_camera(
     if org_path is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no camera {camera_id}")
     if not in_scope(org_path, principal.org_path):
-        await audit.append(
-            actor=principal.subject,
-            org_path=principal.org_path,
+        await _audit_access(
+            audit,
+            principal,
             purpose_code=purpose_code,
             resource=f"camera:{camera_id}",
             action="denied",
         )
         raise HTTPException(status.HTTP_403_FORBIDDEN, "camera is outside your org subtree")
     response = await registry.get(f"/api/v1/cameras/{camera_id}", {"org_scope": org_path})
-    await audit.append(
-        actor=principal.subject,
-        org_path=principal.org_path,
+    # Audit before the response is served, with the outcome recorded — a
+    # failed append fails closed rather than serving an unlogged read, and
+    # an upstream 404 is `read_failed`, not `read`.
+    await _audit_access(
+        audit,
+        principal,
         purpose_code=purpose_code,
         resource=f"camera:{camera_id}",
-        action="read",
+        action="read" if response.status_code < 400 else "read_failed",
     )
     return _forward_json(response)
 
@@ -430,19 +637,34 @@ async def get_camera(
 
 
 async def _check_target_org(
-    request: Request, principal: Principal, org_id: str | None
+    request: Request,
+    principal: Principal,
+    org_id: str | None,
+    *,
+    audit: AuditLog | None = None,
+    denied_action: str | None = None,
+    resource: str | None = None,
 ) -> str:
     """Resolve `org_id` (or the caller's own org, when the body omits one) to
     a path, and 403 if it falls outside the caller's own subtree. Shared by
     create (where a missing org_id must default to the caller's own org, not
     to no scope check at all) and update (where org_id is an optional
-    reassignment)."""
+    reassignment). When `audit`/`denied_action` are given, a refused check is
+    itself written to the audit log before the 403."""
     if org_id is None:
         return principal.org_id
     target_path = await org_path_for_id(request.app.state.pool, org_id)
     if target_path is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no org {org_id}")
     if not in_scope(target_path, principal.org_path):
+        if audit is not None:
+            await _audit_access(
+                audit,
+                principal,
+                purpose_code=_ADMIN_PURPOSE,
+                resource=resource or f"org:{org_id}",
+                action=denied_action or "org_check_denied",
+            )
         raise HTTPException(status.HTTP_403_FORBIDDEN, "org is outside your own org subtree")
     return org_id
 
@@ -453,11 +675,26 @@ async def _check_target_org(
     tags=["cameras"],
 )
 async def create_camera(
-    principal: OperatorDep, registry: RegistryDep, request: Request
+    principal: OperatorDep, registry: RegistryDep, audit: AuditDep, request: Request
 ) -> dict:
     body = await request.json()
-    body["org_id"] = await _check_target_org(request, principal, body.get("org_id"))
+    resource = f"camera:{body.get('external_id', 'new')}"
+    body["org_id"] = await _check_target_org(
+        request,
+        principal,
+        body.get("org_id"),
+        audit=audit,
+        denied_action="camera_create_denied",
+        resource=resource,
+    )
     response = await registry.post("/api/v1/cameras", json=body)
+    await _audit_access(
+        audit,
+        principal,
+        purpose_code=_ADMIN_PURPOSE,
+        resource=resource,
+        action="camera_create" if response.status_code < 400 else "camera_create_failed",
+    )
     return _forward_json(response)
 
 
@@ -467,17 +704,39 @@ async def update_camera(
     principal: OperatorDep,
     registry: RegistryDep,
     scope_resolver: ScopeResolverDep,
+    audit: AuditDep,
     request: Request,
 ) -> dict:
     org_path = await scope_resolver.org_path_for_camera(camera_id)
     if org_path is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no camera {camera_id}")
     if not in_scope(org_path, principal.org_path):
+        await _audit_access(
+            audit,
+            principal,
+            purpose_code=_ADMIN_PURPOSE,
+            resource=f"camera:{camera_id}",
+            action="camera_update_denied",
+        )
         raise HTTPException(status.HTTP_403_FORBIDDEN, "camera is outside your org subtree")
     body = await request.json()
     if "org_id" in body:
-        body["org_id"] = await _check_target_org(request, principal, body["org_id"])
+        body["org_id"] = await _check_target_org(
+            request,
+            principal,
+            body["org_id"],
+            audit=audit,
+            denied_action="camera_update_denied",
+            resource=f"camera:{camera_id}",
+        )
     response = await registry.patch(f"/api/v1/cameras/{camera_id}", json=body)
+    await _audit_access(
+        audit,
+        principal,
+        purpose_code=_ADMIN_PURPOSE,
+        resource=f"camera:{camera_id}",
+        action="camera_update" if response.status_code < 400 else "camera_update_failed",
+    )
     return _forward_json(response)
 
 
@@ -487,13 +746,28 @@ async def decommission_camera(
     principal: OperatorDep,
     registry: RegistryDep,
     scope_resolver: ScopeResolverDep,
+    audit: AuditDep,
 ) -> dict:
     org_path = await scope_resolver.org_path_for_camera(camera_id)
     if org_path is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no camera {camera_id}")
     if not in_scope(org_path, principal.org_path):
+        await _audit_access(
+            audit,
+            principal,
+            purpose_code=_ADMIN_PURPOSE,
+            resource=f"camera:{camera_id}",
+            action="camera_delete_denied",
+        )
         raise HTTPException(status.HTTP_403_FORBIDDEN, "camera is outside your org subtree")
     response = await registry.delete(f"/api/v1/cameras/{camera_id}")
+    await _audit_access(
+        audit,
+        principal,
+        purpose_code=_ADMIN_PURPOSE,
+        resource=f"camera:{camera_id}",
+        action="camera_delete" if response.status_code < 400 else "camera_delete_failed",
+    )
     return _forward_json(response)
 
 
@@ -513,12 +787,12 @@ async def probe_camera(
     that with."""
     body = await request.json()
     response = await registry.post("/api/v1/cameras/probe", json=body)
-    await audit.append(
-        actor=principal.subject,
-        org_path=principal.org_path,
+    await _audit_access(
+        audit,
+        principal,
         purpose_code=purpose_code,
         resource=f"camera-probe:{body.get('rtsp_url', '')}",
-        action="probe",
+        action="probe" if response.status_code < 400 else "probe_failed",
     )
     return _forward_json(response)
 
@@ -576,7 +850,7 @@ def _row_to_camera_payload(row: dict[str, str]) -> dict:
 
 @app.post("/api/v1/cameras/import", tags=["cameras"])
 async def import_cameras(
-    principal: OperatorDep, registry: RegistryDep, request: Request
+    principal: OperatorDep, registry: RegistryDep, audit: AuditDep, request: Request
 ) -> dict:
     raw = (await request.body()).decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(raw))
@@ -623,12 +897,23 @@ async def import_cameras(
                 }
             )
 
-    return {
+    summary = {
         "total": len(results),
         "succeeded": sum(1 for r in results if r["ok"]),
         "failed": sum(1 for r in results if not r["ok"]),
         "rows": results,
     }
+    # One entry per import, carrying the row counts — per-row entries would
+    # flood the chain for a 200-camera CSV while adding nothing a reviewer
+    # can't get from the per-row results.
+    await _audit_access(
+        audit,
+        principal,
+        purpose_code=_ADMIN_PURPOSE,
+        resource=f"cameras-import:{summary['succeeded']}/{summary['total']}",
+        action="camera_import",
+    )
+    return summary
 
 
 # --- routes: the mandatory path ----------------------------------------------
@@ -653,13 +938,29 @@ async def get_route(
     try:
         route = await correlation.get_route(plate)
     except httpx.HTTPStatusError as exc:
+        # The attempt is audited with its outcome — a 404 upstream is a
+        # `read_failed`, not a `read`, and a failed append fails closed.
+        await _audit_access(
+            audit,
+            principal,
+            purpose_code=purpose_code,
+            resource=f"route:{plate}",
+            action="read_failed",
+        )
         raise HTTPException(exc.response.status_code, _upstream_detail(exc.response)) from exc
     except httpx.HTTPError as exc:
+        await _audit_access(
+            audit,
+            principal,
+            purpose_code=purpose_code,
+            resource=f"route:{plate}",
+            action="read_failed",
+        )
         detail = f"correlation service error: {exc}"
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail) from exc
-    await audit.append(
-        actor=principal.subject,
-        org_path=principal.org_path,
+    await _audit_access(
+        audit,
+        principal,
         purpose_code=purpose_code,
         resource=f"route:{plate}",
         action="read",
@@ -679,14 +980,30 @@ async def export_route(
     try:
         route = await correlation.get_route(plate)
     except httpx.HTTPStatusError as exc:
+        await _audit_access(
+            audit,
+            principal,
+            purpose_code=purpose_code,
+            resource=f"route:{plate}",
+            action="read_failed",
+        )
         raise HTTPException(exc.response.status_code, _upstream_detail(exc.response)) from exc
     except httpx.HTTPError as exc:
+        await _audit_access(
+            audit,
+            principal,
+            purpose_code=purpose_code,
+            resource=f"route:{plate}",
+            action="read_failed",
+        )
         detail = f"correlation service error: {exc}"
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail) from exc
 
-    await audit.append(
-        actor=principal.subject,
-        org_path=principal.org_path,
+    # Audit before the file is rendered and served — the export is the access
+    # the log exists to record; an append failure must not still hand it over.
+    await _audit_access(
+        audit,
+        principal,
         purpose_code=purpose_code,
         resource=f"route:{plate}",
         action=f"export:{export_format}",
@@ -695,7 +1012,10 @@ async def export_route(
         body, media_type = route_to_csv(route), "text/csv"
     else:
         body, media_type = route_to_pdf(route), "application/pdf"
-    filename = f"route-{plate}.{export_format}"
+    # The plate is caller-controlled path material — quote it so a `"` or
+    # CR/LF in it can't break the Content-Disposition header or inject a
+    # second header.
+    filename = f"route-{quote(plate, safe='')}.{export_format}"
     return Response(
         content=body,
         media_type=media_type,
@@ -713,15 +1033,30 @@ async def alerts_stream(principal: PrincipalDep, request: Request) -> StreamingR
     if settings.redis_url is None:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "alert stream not configured")
 
+    # Each connection holds an open request plus one Redis connection for the
+    # life of the tab — cap the fan-out. The check and the increment are
+    # await-free, so two handlers can't interleave between them.
+    if request.app.state.sse_active >= settings.sse_max_connections:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "too many concurrent alert streams")
+    request.app.state.sse_active += 1
+
     # One consumer per connection, `start_id="$"` (the class default) — a
     # new browser tab sees alerts from the moment it opened, never a replay
     # of history, and per-connection instances make per-connection scope
-    # filtering trivial rather than needing a shared fan-out.
+    # filtering trivial rather than needing a shared fan-out. The Redis
+    # client is injected so the finally-block below can close it: a dropped
+    # tab must not leak a connection per poll.
+    try:
+        redis_client = redis_lib.Redis.from_url(settings.redis_url)
+    except Exception:
+        request.app.state.sse_active -= 1
+        raise
     consumer = RedisStreamConsumer(
         redis_url=settings.redis_url,
         stream_key=settings.alert_stream_key,
         field="alert",
         decode=events_pb2.Alert.FromString,
+        client=redis_client,
     )
 
     async def events():
@@ -741,14 +1076,50 @@ async def alerts_stream(principal: PrincipalDep, request: Request) -> StreamingR
                     yield f"event: alert\ndata: {json.dumps(payload)}\n\n"
         except asyncio.CancelledError:
             pass
+        finally:
+            request.app.state.sse_active -= 1
+            await asyncio.to_thread(redis_client.close)
 
     return StreamingResponse(events(), media_type="text/event-stream")
 
 
 # --- audit ---------------------------------------------------------------
+#
+# Admin-only reads over the chain itself. `verify` walks every hash;
+# `head` is the cheap truncation tripwire — a monitor polling it sees the
+# row count only ever grow and the head hash only ever advance, so rows
+# deleted off the tail (which `verify` cannot see — the remaining chain is
+# still internally consistent) show up as either shrinkage or a rewound
+# head.
+
+
+@app.get("/api/v1/audit", tags=["audit"])
+async def list_audit_entries(
+    principal: AdminDep,
+    audit: AuditDep,
+    limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    actor: str | None = None,
+    action: str | None = None,
+    since: str | None = None,
+) -> list[dict]:
+    entries = await audit.recent(limit, offset=offset, actor=actor, action=action, since=since)
+    return [dataclasses.asdict(entry) for entry in entries]
+
+
+@app.get("/api/v1/audit/head", tags=["audit"])
+async def audit_head(principal: AdminDep, audit: AuditDep) -> dict:
+    head_hash, row_count = await audit.head()
+    return {"head_hash": head_hash, "row_count": row_count}
 
 
 @app.get("/api/v1/audit/verify", tags=["audit"])
 async def verify_audit(principal: AdminDep, audit: AuditDep) -> dict:
     ok, first_broken_id = await audit.verify()
-    return {"ok": ok, "first_broken_entry": first_broken_id}
+    head_hash, row_count = await audit.head()
+    return {
+        "ok": ok,
+        "first_broken_entry": first_broken_id,
+        "head_hash": head_hash,
+        "row_count": row_count,
+    }

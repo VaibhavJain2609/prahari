@@ -17,6 +17,12 @@ fixed 64 `"0"` characters, so `verify()` never has to special-case entry #1.
 sqlite3 is synchronous; every public method here wraps its call in
 `asyncio.to_thread` so a slow disk does not stall the event loop that is also
 serving the SSE relay.
+
+`to_thread` runs on a *pool* — two concurrent `append()` calls would each
+read the same tail hash and both insert a row claiming it as `prev_hash`,
+forking the chain. `_append_sync` therefore runs under a `threading.Lock`
+(not `asyncio.Lock`: the race is between worker threads, not coroutines), so
+the SELECT-prev-hash + INSERT pair is one atomic step.
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -74,6 +81,10 @@ class AuditLog:
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute(_SCHEMA)
         self._conn.commit()
+        # Serializes the read-tail-then-insert pair inside `_append_sync`,
+        # which `append()` runs on a worker thread. Without it, concurrent
+        # appends read the same tail hash and fork the chain.
+        self._append_lock = threading.Lock()
 
     async def append(
         self, *, actor: str, org_path: str, purpose_code: str, resource: str, action: str
@@ -83,6 +94,12 @@ class AuditLog:
         )
 
     def _append_sync(
+        self, actor: str, org_path: str, purpose_code: str, resource: str, action: str
+    ) -> AuditEntry:
+        with self._append_lock:
+            return self._append_locked(actor, org_path, purpose_code, resource, action)
+
+    def _append_locked(
         self, actor: str, org_path: str, purpose_code: str, resource: str, action: str
     ) -> AuditEntry:
         cur = self._conn.execute("SELECT hash FROM audit_log ORDER BY id DESC LIMIT 1")
@@ -156,16 +173,63 @@ class AuditLog:
             expected_prev = stored_hash
         return True, None
 
-    async def recent(self, limit: int = 100) -> list[AuditEntry]:
-        return await asyncio.to_thread(self._recent_sync, limit)
+    async def recent(
+        self,
+        limit: int = 100,
+        *,
+        offset: int = 0,
+        actor: str | None = None,
+        action: str | None = None,
+        since: str | None = None,
+    ) -> list[AuditEntry]:
+        return await asyncio.to_thread(self._recent_sync, limit, offset, actor, action, since)
 
-    def _recent_sync(self, limit: int) -> list[AuditEntry]:
+    def _recent_sync(
+        self,
+        limit: int,
+        offset: int,
+        actor: str | None,
+        action: str | None,
+        since: str | None,
+    ) -> list[AuditEntry]:
+        clauses: list[str] = []
+        params: list = []
+        if actor is not None:
+            clauses.append("actor = ?")
+            params.append(actor)
+        if action is not None:
+            clauses.append("action = ?")
+            params.append(action)
+        if since is not None:
+            # occurred_at is an ISO-8601 UTC timestamp, so lexicographic
+            # comparison is chronological.
+            clauses.append("occurred_at >= ?")
+            params.append(since)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
         cur = self._conn.execute(
             "SELECT id, actor, org_path, purpose_code, resource, action, occurred_at, "
-            "prev_hash, hash FROM audit_log ORDER BY id DESC LIMIT ?",
-            (limit,),
+            f"prev_hash, hash FROM audit_log{where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            (*params, limit, offset),
         )
         return [AuditEntry(*row) for row in cur.fetchall()]
+
+    async def head(self) -> tuple[str, int]:
+        """`(head_hash, row_count)` — cheap enough for a monitor to poll.
+        Comparing the pair over time detects tail truncation: rows deleted
+        from the end leave `verify()` green (the chain it walks is still
+        internally consistent) but shrink the count and roll the head hash
+        back to an earlier entry."""
+        return await asyncio.to_thread(self._head_sync)
+
+    def _head_sync(self) -> tuple[str, int]:
+        cur = self._conn.execute(
+            "SELECT hash, (SELECT COUNT(*) FROM audit_log) AS n "
+            "FROM audit_log ORDER BY id DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        if row is None:
+            return _GENESIS_HASH, 0
+        return row[0], row[1]
 
     def close(self) -> None:
         self._conn.close()
