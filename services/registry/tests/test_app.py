@@ -259,9 +259,7 @@ def test_malformed_ltree_scope_maps_to_422(repo, client):
     repo.raise_on_get = asyncpg.exceptions.InvalidTextRepresentationError(
         'invalid input syntax for type ltree: "!!bad"'
     )
-    resp = client.get(
-        f"/api/v1/cameras/{CAM_ID}", headers=HEADERS, params={"org_scope": "!!bad"}
-    )
+    resp = client.get(f"/api/v1/cameras/{CAM_ID}", headers=HEADERS, params={"org_scope": "!!bad"})
     assert resp.status_code == 422
 
 

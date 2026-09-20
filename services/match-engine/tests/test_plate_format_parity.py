@@ -27,9 +27,7 @@ def test_plate_format_values_match_proto() -> None:
 
 
 def test_plate_format_has_same_members_as_proto() -> None:
-    proto_names = {
-        name.removeprefix("PLATE_FORMAT_") for name in events_pb2.PlateFormat.keys()
-    }
+    proto_names = {name.removeprefix("PLATE_FORMAT_") for name in events_pb2.PlateFormat.keys()}
     assert proto_names == {member.name for member in PlateFormat}, (
         "proto and prahari-common disagree on which formats exist -- a value "
         "added to one without the other normalises into a format the wire "

@@ -285,6 +285,17 @@ registry, relays alerts off Redis Streams, and owns the hash-chained audit log
       name: prahari-internal
       key: internal-token
       optional: true
+# The match engine's HTTP admin + gRPC are gated by PRAHARI_MATCH_INTERNAL_TOKEN
+# on its side; the BFF sends the same shared value (BFFSettings.internal_token).
+- name: PRAHARI_INTERNAL_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: prahari-internal
+      key: internal-token
+      optional: true
+# Watchlist summary/reload + alert history proxy targets.
+- name: PRAHARI_MATCH_ENGINE_BASE_URL
+  value: "http://prahari-match-engine:{{ .Values.services.matchEngine.port }}"
 # The SSE alert relay reads the `prahari:alerts` stream. BFFSettings is the only
 # settings class that reads the bare PRAHARI_REDIS_URL — everyone else's Redis
 # env is service-prefixed — which is why it lives here and not in commonEnv.

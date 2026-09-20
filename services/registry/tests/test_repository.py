@@ -19,8 +19,7 @@ from prahari_registry.repository import (
 
 def test_redact_strips_userinfo():
     assert (
-        redact_url_credentials("rtsp://admin:s3cret@10.0.0.5:554/ch1")
-        == "rtsp://10.0.0.5:554/ch1"
+        redact_url_credentials("rtsp://admin:s3cret@10.0.0.5:554/ch1") == "rtsp://10.0.0.5:554/ch1"
     )
 
 
@@ -29,8 +28,7 @@ def test_redact_handles_escaped_password_and_missing_port():
     # percent-escaped (see `_with_credentials`) and the netloc still has to
     # come apart cleanly.
     assert (
-        redact_url_credentials("rtsp://u:p%40ss%3Aword@dvr.local/live")
-        == "rtsp://dvr.local/live"
+        redact_url_credentials("rtsp://u:p%40ss%3Aword@dvr.local/live") == "rtsp://dvr.local/live"
     )
 
 

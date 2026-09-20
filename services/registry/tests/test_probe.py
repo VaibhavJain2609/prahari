@@ -272,9 +272,7 @@ async def test_oversized_header_block_is_a_probe_error():
 
 
 async def test_connection_closed_mid_response_is_a_probe_error():
-    reader = FakeReader(
-        readuntil_error=asyncio.IncompleteReadError(b"RTSP/1.0 200", expected=4)
-    )
+    reader = FakeReader(readuntil_error=asyncio.IncompleteReadError(b"RTSP/1.0 200", expected=4))
     with pytest.raises(ProbeError):
         await _request(reader)
 

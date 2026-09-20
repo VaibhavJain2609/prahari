@@ -189,10 +189,7 @@ def test_every_env_helper_block_is_included_by_a_template():
         name
         for path in _TEMPLATES.glob("*.yaml")
         for name in re.findall(r'include "prahari\.(\w+)"', path.read_text())
-    } | {
-        name
-        for name in re.findall(r'include "prahari\.(\w+)"', _read("_helpers.tpl"))
-    }
+    } | {name for name in re.findall(r'include "prahari\.(\w+)"', _read("_helpers.tpl"))}
     orphan = set(blocks) - included
     assert not orphan, f"env helper block(s) never included by any template: {orphan}"
 
