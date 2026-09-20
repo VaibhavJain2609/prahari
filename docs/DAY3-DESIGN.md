@@ -127,11 +127,22 @@ gap data) itself calling registry.
 
 ### 4.1 Auth and RBAC — scoped honestly for a hackathon timeline
 
+> **Superseded, in part.** What shipped is the ORG-TIERS design
+> (`docs/ORG-TIERS-DESIGN.md` §3), not this section's static `BFF_API_KEYS`:
+> real `users`/`sessions`/`api_keys` tables, argon2id passwords, and an `ltree`
+> org tree replacing the flat `department` string below. Read the rest of §4.1
+> as the reasoning that led there, not as a description of the code —
+> `department`-scoping was never built; `org_path`-scoping was. The *shape* of
+> the guarantee (server-side scope enforcement, role ladder `viewer | operator |
+> admin`, logged cross-boundary access) carried over intact.
+
 No IdP integration in the time available. Static, department-scoped API keys
 (`BFF_API_KEYS`, JSON: `{key: {subject, department, role}}`), `Authorization: Bearer
 <key>`. Role is `viewer | operator | admin`. This is explicitly a seed for a real IdP
 (SAML/OIDC against a government directory), not a claim that it is one —
-`docs/SECURITY.md` (Day 5) says so in those words.
+the IdP itself is planned work (`docs/NEXT-PHASE-PLAN.md` §2–§3, on branch
+`docs/next-phase-plan`); the current state of what *is* enforced is in
+`docs/SECURITY.md`.
 
 - **Department scoping.** A `viewer`/`operator` only sees cameras and routes where
   `Camera.department` matches their token's department, enforced server-side by filtering
@@ -253,7 +264,8 @@ infrastructure.
 
 - Real road-network routing (OSRM/Valhalla) — haversine + speed envelope, limitation
   stated in §3.2 and carried to `SCALE-80K.md`.
-- Any IdP integration — static API keys, stated as a seed in `SECURITY.md`.
+- Any IdP integration — static API keys as a seed only (planned: real IdP —
+  `docs/NEXT-PHASE-PLAN.md` §3; current enforcement state — `docs/SECURITY.md`).
 - A trained re-ID model for appearance bridging — cosine threshold over the existing
   low-dimensional embedding, nothing more.
 - Statewide RBAC hierarchy beyond department + admin — one cross-department grant
