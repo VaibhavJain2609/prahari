@@ -14,6 +14,7 @@ at "what did OCR see, and how confident was it, character by character".
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 import numpy as np
@@ -38,12 +39,18 @@ class PaddlePlateReader:
     def __init__(self, settings: DetectorSettings | None = None) -> None:
         self._s = settings or detector_settings()
         self._ocr: Any = None
+        # Same race as `YoloVehicleDetector._load`: `read()` is called from
+        # whichever thread ran the batch, so a cold-start check-then-act here
+        # could construct PaddleOCR twice — a multi-second load each.
+        self._load_lock = threading.Lock()
 
     def _load(self) -> Any:
         if self._ocr is None:
-            from paddleocr import PaddleOCR
+            with self._load_lock:
+                if self._ocr is None:
+                    from paddleocr import PaddleOCR
 
-            self._ocr = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+                    self._ocr = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
         return self._ocr
 
     def read(self, image: np.ndarray, vehicle: VehicleBox) -> PlateCandidate | None:

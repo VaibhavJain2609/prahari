@@ -11,8 +11,11 @@ cover.
 
 from __future__ import annotations
 
+import threading
+import time
 from collections.abc import Iterator
 from concurrent import futures
+from types import SimpleNamespace
 
 import grpc
 import pytest
@@ -100,6 +103,68 @@ class TestSendDetections:
         ack = client.send_detections([_detection("D1")])
 
         assert ack is None
+
+    def test_the_configured_deadline_is_passed_to_the_stub(self, running_server):
+        # A fake stub in place of the real one: what matters here is that
+        # `timeout=` leaves `DetectorSettings.grpc_timeout_s` and reaches the
+        # call — an unwired default of None is exactly the hang this exists
+        # to prevent.
+        _servicer, address = running_server
+        client = MatchEngineClient(DetectorSettings(match_engine_grpc=address, grpc_timeout_s=3.25))
+
+        calls: list[dict] = []
+
+        class _RecordingStub:
+            def StreamDetections(self, request_iterator, timeout=None):
+                calls.append({"timeout": timeout})
+                list(request_iterator)
+                return SimpleNamespace(ack=adapter_pb2.IngestAck(accepted=1, rejected=0, detail=""))
+
+        client._stub = _RecordingStub()
+        client.send_detections([_detection("D1")])
+
+        assert calls == [{"timeout": 3.25}]
+
+    def test_a_stalled_server_drops_the_batch_at_the_deadline_not_forever(self):
+        """The failure this whole setting exists for: a match engine that
+        accepts the stream and never answers. With no `timeout=` this call
+        hangs forever and wedges the calling pump/flush thread; with it, the
+        batch is dropped at the deadline and the worker moves on."""
+
+        class _StallingServicer(adapter_pb2_grpc.MetadataIngestServiceServicer):
+            def __init__(self) -> None:
+                self.release = threading.Event()
+
+            def StreamDetections(self, request_iterator, context):
+                for _ in request_iterator:
+                    pass
+                self.release.wait(timeout=30)  # the wedge: answers only if released
+                return adapter_pb2.StreamDetectionsResponse(
+                    ack=adapter_pb2.IngestAck(accepted=0, rejected=0, detail="")
+                )
+
+        servicer = _StallingServicer()
+        server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
+        adapter_pb2_grpc.add_MetadataIngestServiceServicer_to_server(servicer, server)
+        port = server.add_insecure_port("127.0.0.1:0")
+        server.start()
+        try:
+            client = MatchEngineClient(
+                DetectorSettings(match_engine_grpc=f"127.0.0.1:{port}", grpc_timeout_s=0.3)
+            )
+
+            started = time.monotonic()
+            ack = client.send_detections([_detection("D1")])
+            elapsed = time.monotonic() - started
+
+            assert ack is None
+            assert elapsed < 10.0, (
+                "send_detections blocked past the configured deadline — "
+                "StreamDetections is running without a timeout"
+            )
+        finally:
+            servicer.release.set()  # let the handler return so teardown is quick
+            server.stop(grace=None)
 
 
 def test_close_closes_the_channel(running_server):

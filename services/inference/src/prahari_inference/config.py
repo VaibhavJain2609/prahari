@@ -88,6 +88,12 @@ class IngestSettings(BaseSettings):
     this, the failure that matters — the process alive but every pump thread
     dead — looks exactly like a healthy pod."""
 
+    metrics_port: int = 0
+    """Port for the plaintext `/metrics` endpoint (stdlib `http.server`, daemon
+    thread — deliberately no prometheus dependency). 0 disables it entirely,
+    which is the default: an endpoint that is off cannot be scraped wrong and
+    costs nothing on a laptop run."""
+
 
 @lru_cache(maxsize=1)
 def ingest_settings() -> IngestSettings:
@@ -120,6 +126,17 @@ class DetectorSettings(BaseSettings):
     values file records, which is precisely what the `profile` invariant exists
     to prevent."""
 
+    device: str = "cpu"
+    """Inference device handed verbatim to `model.predict(device=...)`.
+
+    A plain string, not a Literal: ultralytics accepts `cpu`, `mps`, `cuda`,
+    `cuda:0`, `0`, ... and enumerating them here would just drift from what the
+    installed version accepts. Same rule as `decode_backend` — selected by the
+    profile (`PRAHARI_DETECT_DEVICE`), NEVER sniffed via
+    `torch.cuda.is_available()`. The gpu values file must set this to `cuda`;
+    the chart does not write it yet — that env line lands with the chart change
+    that adds it (the `PRAHARI_DETECT_*` parity test then keeps it honest)."""
+
     batch_size: int = 4
     """Frames per inference call. Batched ACROSS cameras, not within one: a
     single camera at 2 fps cannot fill a batch without adding half a second of
@@ -129,6 +146,18 @@ class DetectorSettings(BaseSettings):
     """Flush a partial batch after this long. Without it a quiet estate holds
     frames indefinitely waiting for a batch that will never fill, and the
     end-to-end alert budget is missed by an unbounded margin."""
+
+    max_pending_frames: int = 256
+    """Hard bound on `CrossCameraBatcher._pending`; on overflow the oldest
+    frame is dropped with a warning — deliberate, counted loss rather than
+    silent growth.
+
+    With the current whole-list size trigger `_pending` can never exceed
+    `batch_size`, so this is a guard rail, not the normal bound: it exists for
+    the day the flush semantics change (e.g. draining only `batch_size` frames
+    per batch) and to bound memory if `batch_size` is ever set pathologically
+    high. Setting it below `batch_size` is meaningful but deliberate — the
+    size trigger can never fire and batches flush on the deadline only."""
 
     motion_gate: bool = True
     """Drop frames with no significant motion before the detector runs. The main
@@ -168,6 +197,14 @@ class DetectorSettings(BaseSettings):
     """Where `MetadataIngestService` lives. One long-lived client stream per
     worker: at statewide rates this link carries millions of small messages, and
     per-message framing overhead is why it is gRPC and not JSON over HTTP/1.1."""
+
+    grpc_timeout_s: float = 10.0
+    """Per-call deadline on `StreamDetections`. Without it the call has NO
+    timeout — gRPC's default is unbounded — so a match engine that accepts the
+    stream and then wedges holds the calling pump/flush thread forever, and
+    every camera's batch queues behind it. A deadline-exceeded call lands in
+    the same drop-and-log path as any other `RpcError`: the vehicles in that
+    batch are gone from frame before a retry could matter anyway."""
 
     publish_enabled: bool = True
     """Off for offline measurement runs, where the cascade is being profiled and

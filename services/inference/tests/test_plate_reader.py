@@ -9,7 +9,11 @@ module does not pull it in.
 from __future__ import annotations
 
 import ast
+import sys
+import threading
+import time
 from pathlib import Path
+from types import ModuleType
 
 import numpy as np
 
@@ -52,6 +56,38 @@ class TestScriptedPlateReader:
         reader.read(_IMAGE, vehicle)
 
         assert reader.calls == [vehicle]
+
+
+class TestPaddleLoadOnce:
+    """Same cold-start race as `YoloVehicleDetector._load`: `read()` runs on
+    whichever thread the batch landed on, so the check-then-act needs the
+    lock or two threads build PaddleOCR twice."""
+
+    def test_concurrent_reads_load_the_ocr_exactly_once(self, monkeypatch):
+        class FakePaddleOCR:
+            loads = 0
+
+            def __init__(self, **_kwargs) -> None:
+                type(self).loads += 1
+                time.sleep(0.05)  # widen the check-then-act window
+
+            def ocr(self, _crop, cls=True):
+                return None  # no legible line — a normal outcome
+
+        fake = ModuleType("paddleocr")
+        fake.PaddleOCR = FakePaddleOCR
+        monkeypatch.setitem(sys.modules, "paddleocr", fake)
+
+        reader = PaddlePlateReader()
+        vehicle = VehicleBox(0.0, 0.0, 1.0, 1.0, "car", 0.9)
+        threads = [threading.Thread(target=reader.read, args=(_IMAGE, vehicle)) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+            assert not t.is_alive()
+
+        assert FakePaddleOCR.loads == 1
 
 
 class TestPaddleImportDiscipline:

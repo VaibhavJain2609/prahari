@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import signal
 import socket
 import threading
@@ -44,8 +45,16 @@ from .detect import (
     YoloVehicleDetector,
 )
 from .grpc_client import MatchEngineClient
+from .metrics import Metrics, MetricsServer
 
 log = logging.getLogger(__name__)
+
+# How many times `main()` retries the boot assignment fetch before starting
+# empty and letting `_reconcile_assignments` fill the set later. Bounded
+# because a worker that never boots never writes its liveness file — which
+# the probe reads as a dead pod — so an unreachable registry must degrade to
+# "no cameras yet", not to a crashloop.
+_BOOT_FETCH_ATTEMPTS = 5
 
 
 def worker_id() -> str:
@@ -246,6 +255,8 @@ class IngestWorker:
         self._pump_backoff: dict[str, float] = {}
         self._pump_retry_at: dict[str, float] = {}
         self._reporter_thread: threading.Thread | None = None
+        self._metrics = Metrics()
+        self._metrics_server: MetricsServer | None = None
         self._stop = threading.Event()
         # Guards `_assignments`, `_captures`, `_pump_threads` and `_stats` as
         # collections (membership, not the fields inside one CameraStats,
@@ -362,13 +373,31 @@ class IngestWorker:
         off: `DetectorSettings.publish_enabled` exists for offline throughput
         measurement, where the point is to profile the cascade itself, not to
         skip it.
+
+        Any failure here is logged, counted and dropped — the batcher already
+        shields its callers the same way, so a non-RpcError cascade failure
+        reaches this catch on the size-trigger path exactly as the flush
+        thread's own catch does. A bad batch must not kill a camera pump:
+        the vehicles in it are gone from frame before a retry could matter,
+        but the camera behind it still has decades of frames to give.
         """
-        results = self._pipeline.process_batch(frames)
-        if not self._ds.publish_enabled:
-            return
-        detections = [d for result in results for d in self._pipeline.to_protobuf(result)]
-        if detections:
-            self._match_client.send_detections(detections)
+        self._metrics.inc("batches_flushed")
+        try:
+            results = self._pipeline.process_batch(frames)
+            if not self._ds.publish_enabled:
+                return
+            detections = [d for result in results for d in self._pipeline.to_protobuf(result)]
+            if detections:
+                ack = self._match_client.send_detections(detections)
+                if ack is None:
+                    # `send_detections` already logged the RpcError; here we
+                    # only need the failure to be countable.
+                    self._metrics.inc("grpc_failures")
+                else:
+                    self._metrics.inc("detections_sent", len(detections))
+        except Exception:
+            self._metrics.inc("batch_failures")
+            log.exception("dropping batch of %d frames after cascade error", len(frames))
 
     # --- assignment reconciliation --------------------------------------------
 
@@ -522,6 +551,7 @@ class IngestWorker:
         with self._lock:
             assignments = list(self._assignments.values())
             captures = dict(self._captures)
+        failed: list[str] = []
         for assignment in assignments:
             stats = self._stats.get(assignment.camera_id)
             if stats is None:
@@ -549,12 +579,23 @@ class IngestWorker:
             }
             try:
                 self._registry.heartbeat(assignment.camera_id, payload)
-            except httpx.HTTPError as exc:
+            except httpx.HTTPError:
                 # A registry blip must not stop ingest. The camera goes stale in
                 # the registry's own view — which is correct, because from the
                 # registry's side nothing is arriving — and recovers on the next
-                # successful report.
-                log.warning("heartbeat for camera=%s failed: %s", assignment.camera_id, exc)
+                # successful report. Failures are aggregated below rather than
+                # logged per camera: during a registry outage every camera fails
+                # on every tick, and N identical warnings per interval is log
+                # spam that hides the one line that matters.
+                failed.append(assignment.camera_id)
+        if failed:
+            self._metrics.inc("heartbeat_failures", len(failed))
+            log.warning(
+                "heartbeat failed for %d/%d camera(s) this tick: %s",
+                len(failed),
+                len(assignments),
+                ", ".join(failed),
+            )
 
     def _touch_liveness(self) -> None:
         """Prove the reporter loop is still turning AND that it is turning
@@ -595,6 +636,33 @@ class IngestWorker:
             self._report_once()
             self._touch_liveness()
 
+    # --- metrics ---------------------------------------------------------------
+
+    @property
+    def metrics(self) -> Metrics:
+        return self._metrics
+
+    def _render_metrics(self) -> str:
+        """Counters plus read-time gauges. `streams_active` counts live pump
+        threads, not assigned cameras — the gap between the two (a camera
+        mid-backoff-restart) is exactly what the liveness file already gates
+        on, and seeing it is the point of exposing this at all."""
+        with self._lock:
+            assigned = len(self._assignments)
+            active = sum(
+                1
+                for cid in self._assignments
+                if (t := self._pump_threads.get(cid)) is not None and t.is_alive()
+            )
+        return self._metrics.render(
+            {
+                "streams_assigned": assigned,
+                "streams_active": active,
+                "batch_pending_frames": self._batcher.pending_depth,
+                "pending_frames_dropped": self._batcher.dropped_frames,
+            }
+        )
+
     # --- lifecycle -----------------------------------------------------------
 
     def start(self) -> None:
@@ -608,6 +676,11 @@ class IngestWorker:
         self._reporter_thread = threading.Thread(target=self._report_loop, name="heartbeat")
         self._reporter_thread.daemon = True
         self._reporter_thread.start()
+
+        if self._s.metrics_port:
+            self._metrics_server = MetricsServer(self._render_metrics, self._s.metrics_port)
+            self._metrics_server.start()
+            log.info("metrics endpoint on :%d/metrics", self._metrics_server.port)
 
     def stop(self) -> None:
         self._stop.set()
@@ -631,6 +704,9 @@ class IngestWorker:
         # detected vehicles on the floor at shutdown.
         self._batcher.close()
         self._match_client.close()
+        if self._metrics_server is not None:
+            self._metrics_server.close()
+            self._metrics_server = None
         # One last report, so a clean shutdown shows as "worker gone" promptly
         # rather than waiting out the staleness window.
         for assignment in assignments:
@@ -645,12 +721,61 @@ class IngestWorker:
             time.sleep(0.5)
 
 
+def _initial_assignments(
+    registry: RegistryClient, settings: IngestSettings
+) -> list[CameraAssignment]:
+    """Fetch the boot assignment set, retrying a still-starting registry.
+
+    `main()` used to call `registry.assignments()` bare: a registry pod that
+    had not finished starting crashed the worker before `start()` ever ran,
+    turning a routine rollout-ordering gap into a restart loop. The retry
+    uses the same jittered exponential backoff as `StreamCapture`'s reconnect
+    (2 s start, 30 s cap, full jitter — the jitter matters because every
+    worker pod in a rollout hits the recovering registry in lockstep
+    otherwise).
+
+    After `_BOOT_FETCH_ATTEMPTS` the worker starts EMPTY rather than crashing
+    or retrying forever: `_reconcile_assignments` re-fetches on every
+    heartbeat tick and fills the set the moment the registry is back. A
+    worker that retries forever at boot never writes its liveness file and
+    looks dead to the probe anyway; a worker that crashes is a crashloop.
+    Caveat: with `assignment_refresh=False` (measured load runs) there is no
+    reconciliation to recover with, so a boot-time registry outage leaves the
+    worker idle — acceptable for a mode that exists for controlled runs.
+    """
+    backoff_s = settings.backoff_initial_s
+    for attempt in range(1, _BOOT_FETCH_ATTEMPTS + 1):
+        try:
+            return registry.assignments()
+        except httpx.HTTPError as exc:
+            if attempt == _BOOT_FETCH_ATTEMPTS:
+                log.warning(
+                    "registry unreachable at boot after %d attempts; starting "
+                    "with no assignments — reconciliation will fill the set "
+                    "once the registry recovers: %s",
+                    attempt,
+                    exc,
+                )
+                return []
+            delay = random.uniform(0.0, backoff_s)
+            log.warning(
+                "registry unreachable at boot (attempt %d/%d): %s — retrying in %.1fs",
+                attempt,
+                _BOOT_FETCH_ATTEMPTS,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+            backoff_s = min(backoff_s * 2.0, settings.backoff_max_s)
+    return []  # unreachable: every loop path returns
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = ingest_settings()
     registry = RegistryClient(settings)
 
-    assignments = registry.assignments()
+    assignments = _initial_assignments(registry, settings)
     worker = IngestWorker(assignments, settings=settings, registry=registry)
 
     def shutdown(signum, _frame):

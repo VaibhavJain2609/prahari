@@ -7,6 +7,7 @@ that a registry outage does not stop ingest.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -15,11 +16,13 @@ import pytest
 
 from prahari_inference.config import IngestSettings
 from prahari_inference.worker import (
+    _BOOT_FETCH_ATTEMPTS,
     CameraAssignment,
     CameraStats,
     IngestWorker,
     RegistryClient,
     _assignment,
+    _initial_assignments,
 )
 
 SETTINGS = IngestSettings(max_active_cameras=3, heartbeat_interval_s=0.01)
@@ -324,6 +327,77 @@ def test_worker_never_exceeds_the_camera_cap_even_if_handed_more():
         assignments, settings=SETTINGS, registry=RegistryClient(SETTINGS, client=http)
     )
     assert len(worker._assignments) == 3
+
+
+# --- boot: a still-starting registry must not crash the worker ----------------
+
+
+def test_boot_retries_the_assignment_fetch_until_the_registry_answers():
+    """Rollout order is not guaranteed: the registry pod may still be
+    starting when the worker boots. The fetch retries with backoff instead
+    of crashing the process."""
+    gets = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gets["n"] += 1
+        if gets["n"] < 3:
+            raise httpx.ConnectError("registry not up yet")
+        return httpx.Response(200, json=[camera(id="cam-1")])
+
+    settings = IngestSettings(backoff_initial_s=0.001, backoff_max_s=0.002)
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
+
+    assignments = _initial_assignments(RegistryClient(settings, client=http), settings)
+
+    assert [a.camera_id for a in assignments] == ["cam-1"]
+    assert gets["n"] == 3
+
+
+def test_boot_starts_empty_after_bounded_retries_not_a_crash():
+    """A registry that stays down must degrade to 'no cameras yet' —
+    reconciliation refills the set on the next tick — not to an unhandled
+    exception before `start()` ever runs (which is a crashloop, not a blip)."""
+    gets = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gets["n"] += 1
+        raise httpx.ConnectError("registry unreachable")
+
+    settings = IngestSettings(backoff_initial_s=0.001, backoff_max_s=0.002)
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
+
+    assignments = _initial_assignments(RegistryClient(settings, client=http), settings)
+
+    assert assignments == []
+    assert gets["n"] == _BOOT_FETCH_ATTEMPTS
+
+
+def test_heartbeat_failures_log_once_per_tick_not_once_per_camera(caplog):
+    """During a registry outage every camera fails every tick. One aggregated
+    warning per tick keeps pod logs readable instead of N identical lines."""
+    posted = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted["n"] += 1
+        raise httpx.ConnectError("registry unreachable")
+
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
+    worker = IngestWorker(
+        [
+            CameraAssignment(camera_id="cam-1", url="rtsp://mtx/a"),
+            CameraAssignment(camera_id="cam-2", url="rtsp://mtx/b"),
+            CameraAssignment(camera_id="cam-3", url="rtsp://mtx/c"),
+        ],
+        settings=SETTINGS,
+        registry=RegistryClient(SETTINGS, client=http),
+    )
+    with caplog.at_level(logging.WARNING, logger="prahari_inference.worker"):
+        worker._report_once()
+
+    heartbeat_warnings = [r for r in caplog.records if "heartbeat failed" in r.message]
+    assert len(heartbeat_warnings) == 1
+    assert "3/3" in heartbeat_warnings[0].message
+    assert worker.metrics.render({}).count("prahari_worker_heartbeat_failures 3") == 1
 
 
 # --- HLS threading ------------------------------------------------------------

@@ -71,12 +71,18 @@ class MatchEngineClient:
         time the next batch flushes, the vehicles in this one are gone from
         frame, so replaying it later would attach a stale timestamp to
         evidence instead of dropping it, which is the worse failure mode.
+
+        `timeout=` is not optional: gRPC's default deadline is unbounded, so a
+        match engine that accepts the stream and then wedges would hold this
+        thread — and every batch queued behind it — forever. `grpc_timeout_s`
+        bounds the call; deadline expiry surfaces as `DEADLINE_EXCEEDED`, an
+        `RpcError`, and lands in the same drop-and-log path below.
         """
         requests = [adapter_pb2.StreamDetectionsRequest(detection=d) for d in detections]
         if not requests:
             return None
         try:
-            response = self._stub.StreamDetections(iter(requests))
+            response = self._stub.StreamDetections(iter(requests), timeout=self._s.grpc_timeout_s)
         except grpc.RpcError as exc:
             log.warning("StreamDetections failed (%d detections dropped): %s", len(requests), exc)
             return None

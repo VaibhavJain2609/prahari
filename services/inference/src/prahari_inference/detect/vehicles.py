@@ -11,6 +11,7 @@ load time would mean `make test` needs it on disk, which is exactly the failure
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from prahari_inference.config import DetectorSettings, detector_settings
@@ -35,20 +36,29 @@ class YoloVehicleDetector:
 
     `DetectorSettings.model` names the weights file (`yolov8n.pt` on the laptop,
     a larger variant under the gpu profile) — a value the chart sets, never a
-    branch this class takes on its own. `decode_backend` similarly stays a
-    passed-through string; probing for CUDA here would reintroduce exactly the
-    runtime sniffing the `profile` invariant exists to forbid.
+    branch this class takes on its own. `decode_backend` and `device` similarly
+    stay passed-through settings; probing for CUDA here (or letting ultralytics
+    auto-select it by omitting `device=`) would reintroduce exactly the runtime
+    sniffing the `profile` invariant exists to forbid.
     """
 
     def __init__(self, settings: DetectorSettings | None = None) -> None:
         self._s = settings or detector_settings()
         self._model: Any = None
+        # `detect()` runs on every pump thread that fills a batch AND on the
+        # batcher's flush thread, so two threads can reach `_load()` together
+        # on a cold start. Without the lock both see `_model is None` and both
+        # pay the multi-second weights load — the loser's model is silently
+        # discarded, the winner's predict() possibly torn mid-call.
+        self._load_lock = threading.Lock()
 
     def _load(self) -> Any:
         if self._model is None:
-            from ultralytics import YOLO
+            with self._load_lock:
+                if self._model is None:
+                    from ultralytics import YOLO
 
-            self._model = YOLO(self._s.model)
+                    self._model = YOLO(self._s.model)
         return self._model
 
     def detect(self, frames: list[SampledFrame]) -> list[list[VehicleBox]]:
@@ -58,10 +68,14 @@ class YoloVehicleDetector:
         images = [f.image for f in frames]
         # `classes=` filters inside the model rather than after, so confidence
         # thresholding and NMS never spend time on boxes this cascade discards.
+        # `device=` is passed explicitly: without it ultralytics silently
+        # auto-selects CUDA when it is present, which is backend sniffing —
+        # the device comes from `DetectorSettings.device`, set by the profile.
         results = model.predict(
             images,
             conf=self._s.vehicle_confidence,
             classes=list(_VEHICLE_CLASSES),
+            device=self._s.device,
             verbose=False,
         )
         return [
