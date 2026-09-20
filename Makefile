@@ -27,7 +27,10 @@ proto-lint: ## Lint the protobuf contract
 
 .PHONY: proto-breaking
 proto-breaking: ## Check for breaking contract changes against main
-	cd proto && buf breaking --against '../.git#branch=main,subdir=proto'
+	# --git-common-dir, not ../.git: in a linked worktree .git is a FILE, and
+	# buf resolves the git input relative to the proto/ cwd — the common dir
+	# is the real repository either way.
+	cd proto && buf breaking --against "$(shell git rev-parse --path-format=absolute --git-common-dir)#branch=main,subdir=proto"
 
 # --- local cluster ---------------------------------------------------------
 

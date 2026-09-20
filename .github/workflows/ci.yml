@@ -92,8 +92,12 @@ jobs:
 
       - run: npm ci
       - run: npm run lint
-      - run: npx tsc --noEmit
+      # `next build` before tsc: Next 16 generates LayoutProps/PageProps into
+      # .next/types at build time, and the console layout references them —
+      # a bare tsc on a fresh checkout fails without it.
       - run: npm run build
+      - run: npx tsc --noEmit
+      - run: npm run test
 
   images:
     runs-on: ubuntu-latest
