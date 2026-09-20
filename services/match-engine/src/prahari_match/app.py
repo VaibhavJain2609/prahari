@@ -10,24 +10,33 @@ needs to watch.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import PlainTextResponse
-from google.protobuf.json_format import MessageToDict
 from prahari_common.internal_auth import expected_token_ok, provided_token
+from pydantic import BaseModel
 
-from .alerts import FanOutPublisher, RecentAlertsPublisher, RedisStreamPublisher
+from .alert_store import (
+    AlertStore,
+    AlertStorePublisher,
+    MemoryAlertStore,
+    PostgresAlertStore,
+)
+from .alerts import AlertPublisher, FanOutPublisher, RedisStreamPublisher
 from .bloom import BloomFilter
 from .config import MatchSettings, match_settings
+from .db import apply_migrations, create_pool
 from .dedup import Deduper
 from .detections import DetectionPublisher, NullDetectionPublisher, RedisDetectionPublisher
 from .grpc_server import serve
 from .matcher import WatchlistStore
-from .metrics import BLOOM_FP_RATE, METRICS, WATCHLIST_ENTRIES
+from .metrics import ALERT_PERSIST_FAILURES, BLOOM_FP_RATE, METRICS, WATCHLIST_ENTRIES
 from .watchlist import Watchlist
 
 __all__ = ["app"]
@@ -92,8 +101,40 @@ async def lifespan(app: FastAPI):
     store = WatchlistStore(watchlist, bloom)
     deduper = Deduper(bucket_s=settings.dedup_bucket_s, max_entries=settings.dedup_max_entries)
 
-    recent = RecentAlertsPublisher(max_size=settings.recent_alerts_size)
-    publishers = [recent]
+    # Alert history. Postgres (when `database_url` is set) is the system of
+    # record and is persisted to *ahead of* the Redis XADD in the fan-out —
+    # submitted, not awaited; see alert_store.py's module docstring for the
+    # ordering trade-off. The in-memory store is the fallback when no database
+    # is configured or Postgres cannot be reached/migrated at startup: a
+    # history outage must not take the live alert relay down with it.
+    memory_alerts = MemoryAlertStore(max_size=settings.recent_alerts_size)
+    alert_store: AlertStore = memory_alerts
+    publishers: list[AlertPublisher] = []
+    pool = None
+    if settings.database_url:
+        try:
+            pool = await create_pool(settings)
+            applied = await apply_migrations(pool)
+            if applied:
+                log.info("applied migrations: %s", ", ".join(applied))
+            alert_store = PostgresAlertStore(pool)
+            publishers.append(AlertStorePublisher(alert_store, asyncio.get_running_loop()))
+        except Exception:
+            METRICS.inc(ALERT_PERSIST_FAILURES)
+            log.exception(
+                "PRAHARI_MATCH_DATABASE_URL is set but Postgres could not be "
+                "reached or migrated; alert history degrades to the in-memory store"
+            )
+            if pool is not None:
+                await pool.close()
+                pool = None
+    if alert_store is memory_alerts:
+        publishers.append(memory_alerts)
+        if not settings.database_url:
+            log.warning(
+                "PRAHARI_MATCH_DATABASE_URL not set; alert history is in-memory "
+                "only and lost on restart"
+            )
     if settings.redis_url:
         publishers.append(
             RedisStreamPublisher(
@@ -111,7 +152,7 @@ async def lifespan(app: FastAPI):
             "internal auth disabled: PRAHARI_MATCH_INTERNAL_TOKEN is unset, so /api/* "
             "and MetadataIngestService are reachable by anything that can reach this pod"
         )
-    fan_out = FanOutPublisher(publishers) if len(publishers) > 1 else recent
+    fan_out: AlertPublisher = FanOutPublisher(publishers) if len(publishers) > 1 else publishers[0]
 
     detection_publisher: DetectionPublisher
     if settings.redis_url:
@@ -128,7 +169,9 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.store = store
     app.state.deduper = deduper
-    app.state.recent_alerts = recent
+    app.state.alert_store = alert_store
+    app.state.alert_pool = pool
+    app.state.persistence = "postgres" if pool is not None else "memory"
     app.state.publisher = fan_out
     _record_watchlist_gauges(store)
 
@@ -138,6 +181,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         grpc_server.stop(_GRPC_STOP_GRACE_S)
+        if pool is not None:
+            await pool.close()
 
 
 app = FastAPI(
@@ -181,13 +226,13 @@ def get_settings(request: Request) -> MatchSettings:
     return request.app.state.settings
 
 
-def get_recent_alerts(request: Request) -> RecentAlertsPublisher:
-    return request.app.state.recent_alerts
+def get_alert_store(request: Request) -> AlertStore:
+    return request.app.state.alert_store
 
 
 StoreDep = Annotated[WatchlistStore, Depends(get_store)]
 SettingsDep = Annotated[MatchSettings, Depends(get_settings)]
-RecentAlertsDep = Annotated[RecentAlertsPublisher, Depends(get_recent_alerts)]
+AlertStoreDep = Annotated[AlertStore, Depends(get_alert_store)]
 
 
 # --- probes ------------------------------------------------------------------
@@ -204,17 +249,29 @@ async def healthz() -> dict:
 
 
 @app.get("/readyz", tags=["ops"])
-async def readyz(store: StoreDep, response: Response) -> dict:
+async def readyz(request: Request, store: StoreDep, response: Response) -> dict:
     """Readiness must report whether the watchlist actually loaded -- an empty
     watchlist means every detection is guaranteed to miss, which is a silent
     total failure indistinguishable from "nothing is on the watchlist today"
     unless this endpoint says so explicitly.
+
+    `persistence` reports where alert history is being written: "postgres",
+    "memory" (database_url unset or startup connect failed), or "degraded"
+    (the configured pool can no longer serve a query). It is reported, not
+    gated: a 503 here would restart pods while live alerting still works --
+    history rides a different sink than the relay on purpose.
     """
     summary = _watchlist_summary(store)
     if summary["entries"] == 0:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return {"status": "unavailable", "reason": "watchlist has 0 entries", **summary}
-    return {"status": "ready", **summary}
+    persistence = getattr(request.app.state, "persistence", "memory")
+    if persistence == "postgres":
+        try:
+            await request.app.state.alert_pool.fetchval("SELECT 1")
+        except Exception as exc:  # noqa: BLE001 - report the failure mode, any failure mode
+            persistence = f"degraded ({type(exc).__name__})"
+    return {"status": "ready", "persistence": persistence, **summary}
 
 
 @app.get("/metrics", tags=["ops"], response_class=PlainTextResponse)
@@ -263,18 +320,66 @@ def watchlist_reload(request: Request, settings: SettingsDep) -> dict:
 
 
 @app.get("/api/v1/alerts", tags=["alerts"])
-async def list_alerts(recent: RecentAlertsDep, limit: int = Query(50, ge=1, le=500)) -> list[dict]:
-    """Recent matches, newest first. Debug/admin surface -- the system of
-    record is the Redis stream, when `PRAHARI_MATCH_REDIS_URL` is configured;
-    this exists so a laptop run without Redis can still see what matched."""
-    return [
-        MessageToDict(alert, preserving_proto_field_name=True) for alert in recent.recent(limit)
-    ]
+async def list_alerts(
+    store: AlertStoreDep,
+    since: Annotated[
+        datetime | None,
+        Query(description="ISO-8601; only alerts occurring at or after this instant"),
+    ] = None,
+    camera_id: str | None = None,
+    plate: Annotated[
+        str | None,
+        Query(description="observed or matched watchlist plate, exact match"),
+    ] = None,
+    acknowledged: bool | None = None,
+    limit: int = Query(50, ge=1, le=500),
+) -> list[dict]:
+    """Alert history, newest first. Reads Postgres when
+    `PRAHARI_MATCH_DATABASE_URL` is configured (the system of record), else
+    the bounded in-memory store -- same response shape either way: the full
+    `Alert` payload plus `id`, `occurred_at`, `acknowledged_at`,
+    `acknowledged_by`."""
+    records = await store.list(
+        since=since,
+        camera_id=camera_id,
+        plate=plate,
+        acknowledged=acknowledged,
+        limit=limit,
+    )
+    return [record.to_dict() for record in records]
 
 
 @app.get("/api/v1/alerts/{alert_id}", tags=["alerts"])
-async def get_alert(alert_id: str, recent: RecentAlertsDep) -> dict:
-    for alert in recent.recent():
-        if alert.alert_id == alert_id:
-            return MessageToDict(alert, preserving_proto_field_name=True)
-    raise HTTPException(status.HTTP_404_NOT_FOUND, f"no alert {alert_id} in the recent buffer")
+async def get_alert(alert_id: str, store: AlertStoreDep) -> dict:
+    record = await store.get(alert_id)
+    if record is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no alert {alert_id}")
+    return record.to_dict()
+
+
+class _AckBody(BaseModel):
+    """Optional JSON body for the ack endpoint. `by` is who acknowledged --
+    the BFF passes the principal's subject; a bare curl can send the
+    `X-Ack-By` header instead. Both absent records "unknown" rather than
+    inventing an actor."""
+
+    by: str | None = None
+
+
+@app.post("/api/v1/alerts/{alert_id}/ack", tags=["alerts"])
+async def acknowledge_alert(
+    alert_id: str,
+    store: AlertStoreDep,
+    payload: _AckBody | None = None,
+    x_ack_by: Annotated[str | None, Header()] = None,
+) -> dict:
+    """Acknowledge an alert -- the only lifecycle transition (audit decision:
+    no assignment workflow). Idempotent and first-write-wins: re-acking
+    returns the record unchanged rather than overwriting the original actor
+    and timestamp, since `acknowledged_by` is the audit trail of who cleared
+    it."""
+    by = (payload.by if payload and payload.by else x_ack_by) or "unknown"
+    record = await store.acknowledge(alert_id, by)
+    if record is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no alert {alert_id}")
+    return {"status": "acknowledged", **record.to_dict()}

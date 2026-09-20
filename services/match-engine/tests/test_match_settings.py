@@ -73,7 +73,14 @@ _DELIBERATELY_INTERNAL = {
         "a memory/retention safety cap on the stream, not something a profile "
         "tunes -- same reasoning as detection_stream_maxlen"
     ),
-    "recent_alerts_size": "bounds a debug/admin ring buffer, not the system of record",
+    "recent_alerts_size": "bounds the in-memory alert store, not the system of record",
+    "database_url": (
+        "chart wiring lands with the infra change that provisions/credentials "
+        "the database for this service (infra/ is owned by a different change); "
+        "until then unset means in-memory history, which is the correct default"
+    ),
+    "db_pool_min": "pool sizing for a low-rate write path, not a per-profile knob",
+    "db_pool_max": "pool sizing for a low-rate write path, not a per-profile knob",
     "redis_detection_stream_key": (
         "channel name is a code-level contract with consumers (services/correlation), "
         "not per-profile -- same reasoning as redis_stream_key"

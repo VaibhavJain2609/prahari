@@ -14,6 +14,7 @@ dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.5",
     "redis>=5.0",
+    "asyncpg>=0.31.0",
 ]
 
 [project.optional-dependencies]
@@ -30,9 +31,16 @@ prahari-proto = { workspace = true }
 [tool.hatch.build.targets.wheel]
 packages = ["src/prahari_match"]
 
+# Migrations ship inside the image: the service applies its own schema on
+# startup, so a fresh deploy needs no separate migration job — same pattern
+# as the registry.
+[tool.hatch.build.targets.wheel.force-include]
+"migrations" = "prahari_match/migrations"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100

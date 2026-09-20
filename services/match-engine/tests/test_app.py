@@ -73,6 +73,28 @@ class TestProbes:
         assert response.status_code == 503
         assert response.json()["status"] == "unavailable"
 
+    def test_readyz_reports_memory_persistence_without_database_url(
+        self, monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path
+    ) -> None:
+        with _client(monkeypatch, watchlist_dir) as client:
+            body = client.get("/readyz").json()
+        assert body["status"] == "ready"
+        assert body["persistence"] == "memory"
+
+    def test_unreachable_database_url_degrades_to_memory_not_a_crash(
+        self, monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path
+    ) -> None:
+        """A configured-but-dead Postgres must not take the service (or the
+        live alert relay) down — history falls back to the in-memory store and
+        /readyz says so. Port 1 refuses fast; no real Postgres needed."""
+        monkeypatch.setenv("PRAHARI_MATCH_DATABASE_URL", "postgres://prahari@127.0.0.1:1/prahari")
+        with _client(monkeypatch, watchlist_dir) as client:
+            body = client.get("/readyz").json()
+            assert body["status"] == "ready"
+            assert body["persistence"] == "memory"
+            # ...and the alerts endpoints still work against the fallback.
+            assert client.get("/api/v1/alerts").status_code == 200
+
 
 class TestMetrics:
     def test_metrics_endpoint_is_plaintext_exposition(
