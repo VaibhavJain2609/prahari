@@ -35,7 +35,7 @@ from prahari_inference.detect.types import PlateCandidate, SampledFrame, Vehicle
 from prahari_inference.detect.vehicles import ScriptedVehicleDetector
 from prahari_inference.grpc_client import MatchEngineClient
 from prahari_inference.timing import FrameTiming
-from prahari_match.alerts import RecentAlertsPublisher
+from prahari_match.alert_store import MemoryAlertStore
 from prahari_match.app import app as match_app
 from prahari_match.bloom import BloomFilter
 from prahari_match.config import MatchSettings
@@ -106,8 +106,8 @@ def _synthetic_clip(plate_text: str) -> list[events_pb2.VehicleDetection]:
 @pytest.fixture
 def running_match_engine():
     """The real `MetadataIngestServicer` behind a real gRPC socket, wired to
-    the same `RecentAlertsPublisher` the console route reads -- exactly
-    `app.py`'s own lifespan wiring (`serve()`, `app.state.recent_alerts`),
+    the same `MemoryAlertStore` the console route reads -- mirroring
+    `app.py`'s own lifespan wiring (`serve()`, `app.state.alert_store`),
     just assembled here instead of via the cached `match_settings()`
     singleton and disk-backed watchlist, so the fixture owns the one
     watchlist entry the gate needs and nothing racing on a shared port or a
@@ -115,14 +115,14 @@ def running_match_engine():
     """
     store = _watchlist_store(KNOWN_PLATE)
     deduper = Deduper(bucket_s=8.0, max_entries=1000)
-    recent = RecentAlertsPublisher(max_size=100)
+    recent = MemoryAlertStore(max_size=100)
     settings = MatchSettings(grpc_host="127.0.0.1", grpc_port=_free_port())
     grpc_server = serve(store, deduper, recent, settings)
     # `match_app`'s routes read `request.app.state.*` (see `app.py`); a bare
     # `TestClient` never runs the app's own lifespan (confirmed: it only
     # fires inside `with TestClient(app) as client:`), so state set here is
     # the only state the console route sees below.
-    match_app.state.recent_alerts = recent
+    match_app.state.alert_store = recent
     try:
         yield settings
     finally:

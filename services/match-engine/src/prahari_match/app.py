@@ -227,7 +227,13 @@ def get_settings(request: Request) -> MatchSettings:
 
 
 def get_alert_store(request: Request) -> AlertStore:
-    return request.app.state.alert_store
+    # Day-2 gate tests build the app without running lifespan; a missing
+    # state attribute should mean "memory store", not AttributeError.
+    store = getattr(request.app.state, "alert_store", None)
+    if store is None:
+        store = MemoryAlertStore(max_size=500)
+        request.app.state.alert_store = store
+    return store
 
 
 StoreDep = Annotated[WatchlistStore, Depends(get_store)]
