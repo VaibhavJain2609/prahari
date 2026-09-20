@@ -218,7 +218,7 @@ class TestStreamHealth:
 
         events = [
             adapter_pb2.StreamHealthRequest(
-                event=events_pb2.HealthEvent(camera_id="CAM-1", observed_fps=5.0)
+                event=events_pb2.HealthEvent(camera_id="CAM-1", measured_fps=5.0)
             )
             for _ in range(4)
         ]

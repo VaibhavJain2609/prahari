@@ -78,7 +78,13 @@ service MetadataIngestService {
   // are produced; the server acknowledges once the stream closes or batches.
   rpc StreamDetections(stream StreamDetectionsRequest) returns (StreamDetectionsResponse);
 
-  // Health heartbeats, same connection, lower rate.
+  // Reserved for worker->match-engine health transport over this link. Health
+  // currently flows REST->registry (`POST /api/v1/cameras/{id}/heartbeat`) —
+  // no client calls this RPC today, and the server deliberately only counts
+  // and acknowledges: "workers observe; the registry decides" means a
+  // HealthEvent must never be reinterpreted into a verdict here. Kept rather
+  // than deleted because removing a method is a breaking change and the ABI
+  // documents where heartbeats would flow if the REST path went away.
   rpc StreamHealth(stream StreamHealthRequest) returns (StreamHealthResponse);
 }
 
