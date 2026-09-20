@@ -60,7 +60,10 @@ async function proxy(request: NextRequest, path: string[]): Promise<Response> {
   }
 
   const responseHeaders = new Headers();
-  for (const name of ["content-type", "cache-control", "content-disposition"]) {
+  // `location` is load-bearing for the OIDC flow: auth/oidc/login answers a
+  // 302 to Keycloak, and a proxy that drops the Location header turns that
+  // redirect into an empty 302 the browser cannot follow.
+  for (const name of ["content-type", "cache-control", "content-disposition", "location"]) {
     const value = upstreamResponse.headers.get(name);
     if (value) responseHeaders.set(name, value);
   }

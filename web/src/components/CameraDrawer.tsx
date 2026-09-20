@@ -29,6 +29,7 @@ export default function CameraDrawer({
   const [confirming, setConfirming] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
 
   // Gated on the purpose code: without one the call can only 400.
   const { data: camera, error, loading, revalidate } = useBFF<Camera>(
@@ -175,20 +176,39 @@ export default function CameraDrawer({
               </Section>
 
               <Section title="Streams">
-                {camera.endpoints.fanout_whep_url ? (
-                  <a
-                    href={camera.endpoints.fanout_whep_url}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-sky-600 underline focus:outline-none focus:ring-2 focus:ring-slate-400 dark:text-sky-400"
+                {/* No raw stream URL ever reaches the browser — `endpoints` is
+                    stripped server-side. Preview is an audited action: the BFF
+                    writes `video_preview` to the hash chain before minting the
+                    scoped, expiring ticket this button opens. */}
+                {camera.preview?.available ? (
+                  <button
+                    type="button"
+                    disabled={!code || previewing}
+                    onClick={async () => {
+                      if (!code) return;
+                      setPreviewing(true);
+                      setActionError(null);
+                      try {
+                        const ticket = await api.getPreviewTicket(camera.id, code);
+                        window.open(
+                          `${ticket.whep_url}?jwt=${encodeURIComponent(ticket.ticket)}`,
+                          "_blank",
+                          "noopener,noreferrer",
+                        );
+                      } catch (err) {
+                        setActionError(
+                          err instanceof ApiError ? err.message : "preview ticket failed",
+                        );
+                      } finally {
+                        setPreviewing(false);
+                      }
+                    }}
+                    className="rounded-md bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-slate-400"
                   >
-                    Live preview (WHEP)
-                  </a>
+                    {previewing ? "Minting ticket…" : "Live preview (audited)"}
+                  </button>
                 ) : (
                   <p className="text-slate-400 dark:text-slate-500">no browser preview</p>
-                )}
-                {camera.endpoints.fanout_hls_url && (
-                  <Row k="HLS" v={camera.endpoints.fanout_hls_url} mono />
                 )}
               </Section>
 

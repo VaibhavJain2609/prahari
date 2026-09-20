@@ -136,14 +136,10 @@ export type Camera = {
   codec: string | null;
   native_width: number | null;
   native_height: number | null;
-  endpoints: {
-    rtsp_url: string | null;
-    hls_url: string | null;
-    whep_url: string | null;
-    fanout_rtsp_url: string | null;
-    fanout_hls_url: string | null;
-    fanout_whep_url: string | null;
-  };
+  // The BFF strips `endpoints` from browser payloads — upstream and fan-out
+  // URLs are credential-bearing and never leave the internal plane. `preview`
+  // is the capability flag: "a ticket can be minted for this camera".
+  preview?: { available: boolean };
   storage_location: string | null;
   retention_days: number | null;
   commissioned_at: string | null;
@@ -282,10 +278,29 @@ function purpose(action: string, caseRef?: string): string {
   return ref ? `${action}:${ref}` : action;
 }
 
+// The answer to POST /api/v1/media/preview-ticket: a scoped, expiring JWT the
+// browser presents to MediaMTX (as ?jwt= on the whep_url), minted only after
+// the BFF writes the video_preview audit entry.
+export type PreviewTicket = {
+  camera_id: string;
+  ticket: string;
+  whep_url: string;
+  expires_in: number;
+};
+
 export const api = {
   // Escape hatch for endpoints that don't need a named method yet —
   // useBFF(path) calls this. Same-origin proxy, same 401 handling.
   get: <T>(path: string, init: ApiInit = {}) => request<T>(path, init),
+
+  // Audited live preview: the BFF appends `video_preview` to the hash chain
+  // before the ticket exists, so this call requires a purpose code.
+  getPreviewTicket: (cameraId: string, purposeCode: string) =>
+    request<PreviewTicket>("media/preview-ticket", {
+      method: "POST",
+      body: JSON.stringify({ camera_id: cameraId }),
+      purposeCode,
+    }),
 
   me: () => request<Principal>("auth/me"),
 
