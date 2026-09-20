@@ -53,7 +53,7 @@ jobs:
           uv run ruff format --check .
 
       - name: Tests
-        run: uv run pytest -q
+        run: uv run pytest -q --cov --cov-report=term
 
   helm:
     runs-on: ubuntu-latest

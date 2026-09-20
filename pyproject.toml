@@ -69,6 +69,31 @@ norecursedirs = [".venv", ".git", "*.egg-info", "node_modules"]
 # own path instead, which is what a multi-service workspace needs.
 addopts = ["--import-mode=importlib"]
 
+[tool.coverage.run]
+source = ["packages", "services"]
+# Generated protobuf stubs are compiled artifacts — covering them is testing
+# protoc, not our code. Test files are excluded so the number reflects
+# shipped surface only, not the tests' own execution.
+omit = [
+    "*/prahari/v1/*_pb2*.py",
+    "*/tests/*",
+    "*/test_*.py",
+]
+
+[tool.coverage.report]
+# The number CI enforces (see .github/workflows/ci.yml). Per-module gaps are
+# the target; files that cannot reach it without testing the database or a
+# live bus get a documented exclusion rather than a hollow fake.
+show_missing = true
+# Ratchet, not aspiration: this is the CURRENT measured floor and only moves
+# UP. Target is 90 — raise this as coverage lands; never lower it.
+fail_under = 84
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "pragma: no cover",
+]
+
 [tool.ruff]
 line-length = 100
 
