@@ -147,6 +147,46 @@ def test_a_full_batch_flushes_before_the_clip_ends(monkeypatch):
         worker._match_client.close()
 
 
+def test_a_cascade_error_on_the_size_trigger_does_not_kill_the_pump(monkeypatch):
+    """A non-RpcError failure inside `_handle_batch` on the size-trigger path
+    used to propagate into `_pump` and take the whole camera down with it.
+    Both flush paths now drop the bad batch and keep going — the second batch
+    must still reach the match client, and the pump must record no error."""
+    monkeypatch.setattr("prahari_inference.worker.StreamCapture", FrameYieldingCapture)
+
+    class OnceBrokenPipeline(FakePipeline):
+        def process_batch(self, frames):
+            self.batches.append(list(frames))
+            if len(self.batches) == 1:
+                raise RuntimeError("simulated cascade failure")
+            return list(frames)
+
+    pipeline = OnceBrokenPipeline()
+    match_client = FakeMatchClient()
+    worker = IngestWorker(
+        [CameraAssignment(camera_id="cam-1", url="rtsp://prahari-mediamtx:8554/cam-1")],
+        settings=SETTINGS,
+        detect_settings=DetectorSettings(batch_size=2, batch_timeout_ms=5000),
+        pipeline=pipeline,
+        match_client=match_client,
+    )
+    assignment = worker._assignments["cam-1"]
+
+    try:
+        worker._start_pump(assignment)
+        worker._pump_threads["cam-1"].join(timeout=5.0)
+
+        # Four frames / batch_size 2 → two batches. The first is dropped on
+        # the cascade error; the second must still flow through intact.
+        assert len(pipeline.batches) == 2
+        assert len(match_client.sent) == 1
+        assert len(match_client.sent[0]) == 2
+        assert worker._stats["cam-1"].snapshot()["last_error"] is None
+    finally:
+        worker._batcher.close()
+        worker._match_client.close()
+
+
 def test_publish_disabled_still_runs_the_cascade_but_sends_nothing(monkeypatch):
     """`publish_enabled=False` is for offline throughput profiling: the
     cascade must still run (that is the thing being profiled), only the

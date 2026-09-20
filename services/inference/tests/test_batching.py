@@ -103,6 +103,59 @@ class TestTimeoutTrigger:
             batcher.close()
 
 
+class TestPendingBound:
+    """`max_pending_frames` caps `_pending` — deliberate, counted loss rather
+    than unbounded growth. With `batch_size` above the cap the size trigger
+    can never fire, so everything below relies on the timeout/close path."""
+
+    def test_overflow_drops_the_oldest_frames_and_counts_them(self, batches):
+        batcher = _make_batcher(
+            batches, batch_size=100, batch_timeout_ms=5_000, max_pending_frames=3
+        )
+        try:
+            for i in range(5):
+                batcher.submit(_frame(f"cam-{i}"))
+
+            assert batcher.pending_depth == 3
+            assert batcher.dropped_frames == 2
+            # The bound drops the OLDEST frames — under backpressure the
+            # stalest detections are the least worth keeping.
+            batcher.flush()
+            assert len(batches) == 1
+            assert [f.camera_id for f in batches[0]] == ["cam-2", "cam-3", "cam-4"]
+        finally:
+            batcher.close()
+
+
+class TestSizeTriggerSurvivesExceptions:
+    def test_an_exception_in_on_batch_does_not_reach_the_submitting_thread(self, batches):
+        # Symmetric with the flush-path guarantee above: a bad batch on the
+        # size trigger must be dropped, not propagated into the pump thread —
+        # where it used to kill the camera's whole pump loop.
+        calls = {"n": 0}
+
+        def flaky_on_batch(batch: list[SampledFrame]) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("simulated cascade failure")
+            batches.append(batch)
+
+        settings = DetectorSettings(batch_size=2, batch_timeout_ms=5_000)
+        batcher = CrossCameraBatcher(on_batch=flaky_on_batch, settings=settings)
+        try:
+            batcher.submit(_frame("cam-1"))
+            batcher.submit(_frame("cam-2"))  # fills the batch: on_batch raises here
+            assert calls["n"] == 1
+
+            batcher.submit(_frame("cam-3"))
+            batcher.submit(_frame("cam-4"))  # next batch still flushes
+
+            assert len(batches) == 1
+            assert [f.camera_id for f in batches[0]] == ["cam-3", "cam-4"]
+        finally:
+            batcher.close()
+
+
 class TestManualFlush:
     def test_flush_emits_whatever_is_pending(self, batches):
         batcher = _make_batcher(batches, batch_size=100, batch_timeout_ms=5_000)

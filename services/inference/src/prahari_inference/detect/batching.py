@@ -52,11 +52,26 @@ class CrossCameraBatcher:
         self._lock = threading.Lock()
         self._pending: list[SampledFrame] = []
         self._oldest_arrival: float | None = None
+        self._dropped_frames = 0
+        """Frames discarded by the `max_pending_frames` bound. Exposed for the
+        worker's /metrics surface: a drop is deliberate bounded loss, but only
+        if it is observable — a silent one is indistinguishable from a camera
+        that simply stopped producing detections."""
         self._stop = threading.Event()
         self._flush_thread = threading.Thread(
             target=self._flush_loop, name="batch-flush", daemon=True
         )
         self._flush_thread.start()
+
+    @property
+    def pending_depth(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+    @property
+    def dropped_frames(self) -> int:
+        with self._lock:
+            return self._dropped_frames
 
     def submit(self, frame: SampledFrame) -> None:
         """Add one sampled frame from any camera's pump thread.
@@ -75,9 +90,46 @@ class CrossCameraBatcher:
                 batch = self._pending
                 self._pending = []
                 self._oldest_arrival = None
+            elif len(self._pending) > self._s.max_pending_frames:
+                # `_pending` is already structurally bounded by `batch_size`
+                # (the size trigger drains the whole list), so this only
+                # binds when the cap is set below `batch_size` or the flush
+                # semantics change — exactly the misconfiguration a bound
+                # exists for. Drop the OLDEST frame: under backpressure the
+                # stalest frame is the one whose detections would be most
+                # out of date by the time the cascade reaches it.
+                # `_oldest_arrival` is deliberately kept — an older deadline
+                # flushes the remaining backlog sooner, which is what
+                # draining under overload wants.
+                self._pending.pop(0)
+                self._dropped_frames += 1
+                if self._dropped_frames == 1 or self._dropped_frames % 64 == 0:
+                    log.warning(
+                        "batch pending over cap %d; dropped oldest frame "
+                        "(camera=%s, %d dropped total)",
+                        self._s.max_pending_frames,
+                        frame.camera_id,
+                        self._dropped_frames,
+                    )
 
         if batch is not None:
+            self._run_batch(batch)
+
+    def _run_batch(self, batch: list[SampledFrame]) -> None:
+        """Invoke `on_batch` without letting its failure kill the caller.
+
+        `_flush_loop` already shields its own thread the same way; the size
+        trigger and the manual `flush()` used to call `_on_batch` bare, so a
+        non-RpcError cascade failure (a corrupt frame crashing the detector,
+        a `ValueError` from a closed gRPC channel at shutdown) propagated
+        into the pump thread and took the whole camera down with it — one bad
+        batch killing every future batch for that camera. Both paths now
+        catch, log and drop, identically.
+        """
+        try:
             self._on_batch(batch)
+        except Exception:
+            log.exception("on_batch raised; dropping batch of %d frames", len(batch))
 
     def _flush_loop(self) -> None:
         # Polls at a fraction of the timeout rather than sleeping the full
@@ -113,7 +165,7 @@ class CrossCameraBatcher:
                     self._oldest_arrival = None
 
         if batch is not None:
-            self._on_batch(batch)
+            self._run_batch(batch)
 
     def flush(self) -> None:
         """Force whatever is pending out immediately. For shutdown and tests —
@@ -126,7 +178,7 @@ class CrossCameraBatcher:
                 self._oldest_arrival = None
 
         if batch is not None:
-            self._on_batch(batch)
+            self._run_batch(batch)
 
     def close(self) -> None:
         """Stop the flush thread and drain whatever is still pending.

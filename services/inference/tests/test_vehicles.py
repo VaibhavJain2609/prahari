@@ -10,10 +10,15 @@ grep-checking that the import stays deferred.
 from __future__ import annotations
 
 import ast
+import sys
+import threading
+import time
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 
+from prahari_inference.config import DetectorSettings
 from prahari_inference.detect.types import SampledFrame, VehicleBox
 from prahari_inference.detect.vehicles import ScriptedVehicleDetector, YoloVehicleDetector
 from prahari_inference.timing import FrameTiming
@@ -57,6 +62,62 @@ class TestScriptedVehicleDetector:
         detector = ScriptedVehicleDetector()
         result = detector.detect([_frame("cam-1")])
         assert result == [[]]
+
+
+class TestYoloLoadOnceAndDevice:
+    """`YoloVehicleDetector._load` raced before the lock: `detect()` runs on
+    whichever pump thread fills a batch AND on the batcher's flush thread, so
+    a cold start could construct the model twice. A fake `ultralytics` module
+    stands in — the real one is deliberately absent from the test env."""
+
+    @staticmethod
+    def _install_fake_ultralytics(monkeypatch, load_delay_s: float = 0.05) -> type:
+        class FakeYOLO:
+            loads = 0
+            predict_kwargs: dict | None = None
+
+            def __init__(self, weights: str) -> None:
+                type(self).loads += 1
+                time.sleep(load_delay_s)  # widen the check-then-act window
+
+            def predict(self, images, **kwargs):
+                type(self).predict_kwargs = kwargs
+                return [SimpleNamespace(boxes=[]) for _ in images]
+
+        fake = ModuleType("ultralytics")
+        fake.YOLO = FakeYOLO
+        monkeypatch.setitem(sys.modules, "ultralytics", fake)
+        return FakeYOLO
+
+    def test_concurrent_detect_calls_load_the_model_exactly_once(self, monkeypatch):
+        fake_yolo = self._install_fake_ultralytics(monkeypatch)
+        detector = YoloVehicleDetector(DetectorSettings())
+
+        threads = [
+            threading.Thread(target=detector.detect, args=([_frame("cam-1")],)) for _ in range(8)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+            assert not t.is_alive()
+
+        assert fake_yolo.loads == 1, (
+            f"_load() ran {fake_yolo.loads} times under concurrency — "
+            "check-then-act without the lock"
+        )
+
+    def test_predict_receives_the_device_from_settings_not_autodetect(self, monkeypatch):
+        """Omitting `device=` lets ultralytics silently pick CUDA — backend
+        sniffing, which the profile invariant forbids. The value must be
+        whatever the settings say, verbatim."""
+        fake_yolo = self._install_fake_ultralytics(monkeypatch, load_delay_s=0.0)
+        detector = YoloVehicleDetector(DetectorSettings(device="mps"))
+
+        detector.detect([_frame("cam-1")])
+
+        assert fake_yolo.predict_kwargs is not None
+        assert fake_yolo.predict_kwargs["device"] == "mps"
 
 
 class TestYoloImportDiscipline:
