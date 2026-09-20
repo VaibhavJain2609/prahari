@@ -102,6 +102,13 @@ run directory and git sha, and flip the cell from **unmeasured** to
   district module's `streams_per_gpu = 50` default and every node-count
   derivation from it is an estimate — the variable's own description says so.
 
+  The run must also record which image produced it: `profile=gpu` runs the
+  `services/inference/Dockerfile.gpu` build (tag convention `<tag>-cuda`,
+  selected via `services.inference.image`), not the CPU image. And until
+  NVDEC decode is real — see that Dockerfile's header — `decodeBackend:
+  nvdec` still decodes in software, so the knee is a *CPU-decode* bound and
+  must be labelled as such, not read as what hardware decode would sustain.
+
 ### Extrapolation discipline
 
 The harness measures at the step counts actually run (e.g. 5/50/500). The

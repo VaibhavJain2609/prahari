@@ -1,0 +1,138 @@
+# The inference worker image — GPU variant for `profile=gpu`.
+#
+# Built from the workspace root, same as services/inference/Dockerfile (the
+# workspace packages in packages/ sit outside any narrower build context):
+#
+#   docker build -f services/inference/Dockerfile.gpu \
+#     -t <registry>/prahari-inference:<tag>-cuda .
+#
+# Tag convention: the profile's global.imageTag with a `-cuda` suffix, so a
+# `dev` build becomes `prahari-inference:dev-cuda`. The chart selects it via
+# the per-service override key, in the gpu values file:
+#
+#   services:
+#     inference:
+#       image: <registry>/prahari-inference:dev-cuda
+#
+# Everything else stays a values switch — `inference.device: cuda`,
+# `inference.gpu: true` (runtimeClassName + the nvidia.com/gpu request) are
+# already wired. If a cutover needs more than the image and values, the
+# profile switch is broken.
+#
+# --- torch: why there is no index switch here --------------------------------
+#
+# The worry was that `uv sync --frozen` pins CPU wheels and a cuXXX build
+# needs `--extra-index-url https://download.pytorch.org/whl/cuXXX`. It does
+# not apply: PyPI's *Linux x86_64* torch wheel IS the CUDA build — the lock
+# pins torch 2.13.0 manylinux_2_28_x86_64 plus the nvidia-*-cu13 /
+# cuda-toolkit 13.0.3.0 / triton dependency set, all from pypi.org. The
+# download.pytorch.org index only exists to serve +cpu / +cuXXX *variants*;
+# we need no variant, so `--frozen` stays honest and one lockfile serves both
+# images. The macOS arm64 wheel in the same lock remains the CPU/MPS build —
+# the laptop is unaffected.
+#
+# Consequence: the host driver floor is set by the wheel, not this base —
+# cu13 user-space needs driver >= ~580 (check `nvidia-smi` on the rented GPU
+# node BEFORE Day 4). If the node's driver is older, torch must be re-locked
+# at a cu124-era release; that is a uv.lock change, not an image change.
+#
+# Base is nvidia/cuda:13.0.3-runtime-ubuntu24.04 — matching the locked
+# cuda-toolkit 13.0.3.0 — on Ubuntu 24.04 specifically because noble ships
+# Python 3.12 in main; 22.04 tops out at 3.10 and would need the deadsnakes
+# PPA, an extra network dependency on demo-day's build path. The runtime (not
+# -base) image keeps the CUDA env contract (NVIDIA_VISIBLE_DEVICES,
+# NVIDIA_DRIVER_CAPABILITIES) that the nvidia device plugin and
+# runtimeClassName: nvidia build on; driver libs are injected by the toolkit
+# at pod start, not baked here.
+#
+# --- decodeBackend=nvdec: honestly not yet real ------------------------------
+#
+# The gpu profile sets `decodeBackend: nvdec`. Two gaps mean this image still
+# decodes in SOFTWARE, and SCALE-80K numbers must be reported that way:
+#
+#   1. Nothing in capture.py consumes `decode_backend` — the env var lands
+#      (PRAHARI_DETECT_DECODE_BACKEND), the settings field exists, the code
+#      path does not (docs/NEXT-PHASE-PLAN 1.17 tracks wiring it or deleting
+#      the knob).
+#   2. Even wired, `cv2.VideoCapture(url, CAP_FFMPEG)` uses the ffmpeg
+#      opencv-python-headless bundles, which is built WITHOUT NVDEC/cuvid.
+#      Real NVDEC decode needs an OpenCV built against a CUDA-enabled ffmpeg
+#      (or a PyNvVideoCodec/Video-Processing-Framework pipeline) — a
+#      multi-hour custom build chain deliberately deferred from this branch.
+#
+# What IS real: `device: cuda` model inference on the scheduled GPU, which is
+# the dominant cost lever (detection, not decode, is what scales).
+#
+# syntax=docker/dockerfile:1
+FROM nvidia/cuda:13.0.3-runtime-ubuntu24.04 AS build
+
+# Python 3.12 from Ubuntu main — no PPA, same minor the CPU image's
+# python:3.12-slim provides. ca-certificates so uv's PyPI TLS works.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3.12 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /usr/local/bin/uv
+
+# UV_PYTHON pins uv to the apt interpreter: downloads are off, and a
+# resolution that wanders to another interpreter would break the .venv
+# symlink the runtime stage inherits (uv links .venv/bin/python to the
+# interpreter it found).
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PYTHON=/usr/bin/python3.12
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+COPY packages/prahari-common/pyproject.toml packages/prahari-common/
+COPY packages/prahari-proto/pyproject.toml packages/prahari-proto/
+COPY services/inference/pyproject.toml services/inference/
+# --extra models installs the detection stack — see the CPU Dockerfile for the
+# full rationale (a worker without it decodes frames and produces nothing,
+# forever, while heartbeats report a healthy pod). On this stage the locked
+# linux wheels are the CUDA builds; nothing extra is asked for.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-workspace --package prahari-inference --extra models
+
+COPY packages/prahari-common/ packages/prahari-common/
+COPY packages/prahari-proto/ packages/prahari-proto/
+COPY services/inference/ services/inference/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --package prahari-inference --extra models
+
+
+FROM nvidia/cuda:13.0.3-runtime-ubuntu24.04 AS runtime
+
+# Same interpreter the build stage used — .venv/bin/python is a symlink into
+# /usr/bin/python3.12, so the package must exist at the same path here.
+# libgl1 + libglib2.0-0t64 are what opencv-python-headless links against for
+# the RTSP/HLS demuxers (`-0t64` is the noble name: the 64-bit time_t
+# transition renamed libglib2.0-0). ca-certificates because ultralytics
+# downloads weights over HTTPS on first _load(), and unlike python:slim the
+# CUDA runtime image does not guarantee a CA bundle.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.12 libgl1 libglib2.0-0t64 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --uid 10001 prahari
+WORKDIR /app
+
+COPY --from=build --chown=prahari:prahari /app/.venv /app/.venv
+COPY --from=build --chown=prahari:prahari /app/packages/prahari-common /app/packages/prahari-common
+COPY --from=build --chown=prahari:prahari /app/packages/prahari-proto /app/packages/prahari-proto
+COPY --from=build --chown=prahari:prahari /app/services/inference /app/services/inference
+
+# RTSP over TCP, enforced at the FFmpeg layer rather than trusted to a call
+# site — same contract as the CPU image. UDP transport drops silently under
+# load and produces corrupt frames that look like detections.
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    OPENCV_FFMPEG_CAPTURE_OPTIONS="rtsp_transport;tcp"
+
+USER prahari
+
+CMD ["python", "-m", "prahari_inference"]

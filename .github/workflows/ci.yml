@@ -125,6 +125,14 @@ jobs:
           docker build -f services/bff/Dockerfile          -t prahari-bff:ci          .
           docker build -f web/Dockerfile                   -t prahari-web:ci          .
 
+      # The gpu variant too — always, not gated: the CPU build above already
+      # pays the torch/CUDA wheel download (the lock resolves linux cu13
+      # wheels), the shared uv cache mount makes this mostly layer work, and a
+      # Dockerfile only built on demand rots before Day 4.
+      - name: Build the gpu image
+        run: |
+          docker build -f services/inference/Dockerfile.gpu -t prahari-inference:ci-cuda .
+
   terraform:
     runs-on: ubuntu-latest
     steps:
