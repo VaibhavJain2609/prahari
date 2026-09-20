@@ -12,8 +12,10 @@ the estate actually has:
   `cam-*` paths (embedded in the fan-out URLs `fanout_endpoints` hands to
   inference workers — RTSP consumers have no header channel). `internal:
   <internal-token>` grants `api` (this service's own reconcile client).
-* **Browsers — a BFF preview ticket.** An Ed25519 JWT minted by the BFF's
-  `/api/v1/media/preview-ticket` after an audited scope check. MediaMTX
+* **Browsers — a BFF ticket.** An Ed25519 JWT minted by the BFF's
+  `/api/v1/media/preview-ticket` (grant: `read`) or
+  `/api/v1/evidence/requests/{id}/ticket` (grants: `read` + `playback`,
+  docs/EVIDENCE.md) after an audited scope check. MediaMTX
   rewrites a request's `Authorization: Bearer <jwt>` header into `jwt=` in
   the `query` it forwards (auth/manager.go in 1.9.3), so tickets arrive the
   same way whether the client sent a header or a `?jwt=` URL. Verified
@@ -189,9 +191,13 @@ async def authorize(
         # `require_internal_token` (no internal Secret = local dev).
         return True
 
-    # Publishing and playback are refused outright: we consume streams, never
-    # accept them, and no recording exists to play back.
-    if req.action in ("publish", "playback"):
+    # Publishing is refused outright: we consume streams, never accept them.
+    # Playback is NOT refused here — recordings do not exist yet (reconciled
+    # paths set no `record`), but evidence tickets already carry a `playback`
+    # grant so that enabling recording later changes nothing on this path
+    # (docs/EVIDENCE.md). It remains ticket-only below: no internal credential
+    # can claim it.
+    if req.action == "publish":
         return False
 
     if req.password and hmac.compare_digest(
@@ -206,9 +212,12 @@ async def authorize(
             return req.action == "read" and req.path.startswith(_PATH_PREFIX)
         return False
 
-    if req.action == "read" and req.path.startswith(_PATH_PREFIX):
+    if req.action in ("read", "playback") and req.path.startswith(_PATH_PREFIX):
         token = parse_qs(req.query).get("jwt", [None])[0]
         if token:
-            return await verifier.allows(token, action="read", path=req.path)
+            # `_ticket_grants` matches the action exactly: a preview ticket
+            # (read only) cannot play back, and a playback evidence ticket
+            # reaches only the `cam-<id>` path it names.
+            return await verifier.allows(token, action=req.action, path=req.path)
 
     return False

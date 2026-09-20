@@ -140,6 +140,27 @@ class BFFSettings(BaseSettings):
     is the k3d port map; the gpu profile must set `mediamtx.browserWhepBase`
     to the public ingress URL."""
 
+    # --- evidence clip requests ---------------------------------------------
+    #
+    # docs/EVIDENCE.md. The audited pull path for edge-held video: a request
+    # row (`evidence_requests`, migration 008), then a playback ticket minted
+    # against it. Fulfilment of the actual clip is an edge-side process — the
+    # ticket already grants `playback` so nothing here changes when MediaMTX
+    # recording lands.
+
+    evidence_max_range_s: int = 900
+    """Longest window one evidence request may cover (default 15 min). The
+    bound exists because the request is a scoped grant on someone's footage:
+    an unbounded range would let one purpose code justify an arbitrary
+    surveillance sweep, and the edge-side pull it initiates is human work —
+    bounded windows keep both honest."""
+
+    evidence_ticket_ttl_s: int = 300
+    """Playback-ticket lifetime — longer than the 60 s preview ticket because
+    the consumer is an evidence workflow, not a live viewer, and re-minting
+    mid-review is friction on an audited path. Still short: it is a bearer
+    credential, and every mint is an `evidence_issued` audit row anyway."""
+
     # --- audit -----------------------------------------------------------
 
     audit_db_path: str = "audit.db"

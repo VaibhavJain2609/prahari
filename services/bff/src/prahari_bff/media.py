@@ -98,12 +98,25 @@ class MediaTicketIssuer:
             ]
         }
 
-    def mint(self, *, subject: str, camera_id: str, ttl_s: int) -> str:
+    def mint(
+        self,
+        *,
+        subject: str,
+        camera_id: str,
+        ttl_s: int,
+        actions: tuple[str, ...] = ("read",),
+    ) -> str:
         """One ticket = one principal, one camera path, one short TTL.
 
         `path` is the MediaMTX path name — `cam-<internal camera id>`, the
         same naming `prahari_registry.mediamtx.path_name` produces, so a
         ticket authorises exactly the stream the audit entry names.
+
+        `actions` is the MediaMTX action vocabulary the ticket grants on that
+        one path: `("read",)` for a live preview, `("read", "playback")` for
+        an evidence ticket — the playback grant is minted before any
+        recording exists so that enabling `record` on the paths later changes
+        nothing here (docs/EVIDENCE.md).
         """
         now = int(time.time())
         header = {"alg": "EdDSA", "typ": "JWT", "kid": self._kid}
@@ -114,7 +127,9 @@ class MediaTicketIssuer:
             "iat": now,
             "exp": now + ttl_s,
             "camera_id": camera_id,
-            "mediamtx_permissions": [{"action": "read", "path": f"cam-{camera_id}"}],
+            "mediamtx_permissions": [
+                {"action": action, "path": f"cam-{camera_id}"} for action in actions
+            ],
         }
         signing_input = (
             f"{_b64url(json.dumps(header, separators=(',', ':')).encode())}."

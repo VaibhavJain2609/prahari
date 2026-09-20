@@ -1961,3 +1961,17 @@ async def oidc_logout(request: Request, response: Response) -> dict:
             post_logout_redirect_uri=settings.oidc_redirect_base
         )
     return result
+
+
+# --- evidence: audited clip-retrieval requests --------------------------------
+#
+# The last deferred piece of the privacy invariant — "video never leaves the
+# edge except as an explicit, audited evidence request". The handlers,
+# request/response models and the `evidence_requests` repository live in
+# `evidence.py` (docs/EVIDENCE.md); this block only wires the router on. The
+# import sits at file end deliberately: this whole feature touches app.py in
+# exactly one contiguous place.
+
+from .evidence import router as evidence_router  # noqa: E402
+
+app.include_router(evidence_router)

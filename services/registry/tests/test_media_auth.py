@@ -122,17 +122,20 @@ async def test_wrong_password_is_denied():
     )
 
 
-async def test_publish_and_playback_are_always_denied():
-    """Consume-only is not a credential question — nobody may write into or
-    replay out of the restreamer, token holder included."""
+async def test_publish_and_playback_are_denied_for_internal_credentials():
+    """Consume-only is not a credential question for MACHINES: `internal`
+    and `worker` may neither write into the restreamer nor replay out of it.
+    Playback exists only as a BFF-ticket grant — see the playback block
+    below."""
     settings = RegistrySettings(internal_token=TOKEN)
     verifier = _verifier(settings, {"keys": []})
     for action in ("publish", "playback"):
-        assert not await authorize(
-            settings,
-            verifier,
-            _req(user="internal", password=TOKEN, action=action, path="cam-1"),
-        )
+        for user in ("internal", "worker"):
+            assert not await authorize(
+                settings,
+                verifier,
+                _req(user=user, password=TOKEN, action=action, path="cam-1"),
+            )
 
 
 async def test_no_token_means_enforcement_off():
@@ -197,9 +200,71 @@ async def test_ticket_cannot_do_anything_but_read():
     key = Ed25519PrivateKey.generate()
     verifier = _verifier(settings, _jwks_for(key))
     # A ticket self-describing an api grant must still fail: the ticket path
-    # is only ever consulted for `action: read`.
+    # is only ever consulted for `action: read` or `playback` on `cam-*`.
     ticket = _make_ticket(key, path="", action="api")
     assert not await authorize(settings, verifier, _req(action="api", query=f"jwt={ticket}"))
+
+
+# --- policy: BFF playback (evidence) tickets -----------------------------------
+#
+# Evidence tickets grant `read` + `playback` on `cam-<id>` so that enabling
+# `record` on the reconciled paths later changes nothing here
+# (docs/EVIDENCE.md). The grant is exact-match per action: a preview ticket
+# (read only) can never play back.
+
+
+async def test_playback_ticket_grants_playback_on_its_path():
+    settings = RegistrySettings(internal_token=TOKEN)
+    key = Ed25519PrivateKey.generate()
+    verifier = _verifier(settings, _jwks_for(key))
+    ticket = _make_ticket(key, path="cam-abc", action="playback")
+
+    assert await authorize(
+        settings, verifier, _req(action="playback", path="cam-abc", query=f"jwt={ticket}")
+    )
+
+
+async def test_read_only_ticket_cannot_play_back():
+    """A preview ticket must not become a playback credential — the grant
+    is per-action, so `read` on the path does not imply `playback`."""
+    settings = RegistrySettings(internal_token=TOKEN)
+    key = Ed25519PrivateKey.generate()
+    verifier = _verifier(settings, _jwks_for(key))
+    ticket = _make_ticket(key, path="cam-abc", action="read")
+
+    assert not await authorize(
+        settings, verifier, _req(action="playback", path="cam-abc", query=f"jwt={ticket}")
+    )
+
+
+async def test_playback_ticket_is_scoped_to_the_one_camera_it_names():
+    settings = RegistrySettings(internal_token=TOKEN)
+    key = Ed25519PrivateKey.generate()
+    verifier = _verifier(settings, _jwks_for(key))
+    ticket = _make_ticket(key, path="cam-abc", action="playback")
+
+    assert not await authorize(
+        settings, verifier, _req(action="playback", path="cam-other", query=f"jwt={ticket}")
+    )
+
+
+async def test_expired_playback_ticket_is_denied():
+    settings = RegistrySettings(internal_token=TOKEN)
+    key = Ed25519PrivateKey.generate()
+    verifier = _verifier(settings, _jwks_for(key))
+    ticket = _make_ticket(key, path="cam-abc", action="playback", exp_in=-10)
+
+    assert not await authorize(
+        settings, verifier, _req(action="playback", path="cam-abc", query=f"jwt={ticket}")
+    )
+
+
+async def test_playback_without_a_ticket_is_denied():
+    """No jwt in the query, no internal credential — playback has no other
+    credential shape."""
+    settings = RegistrySettings(internal_token=TOKEN)
+    verifier = _verifier(settings, {"keys": []})
+    assert not await authorize(settings, verifier, _req(action="playback", path="cam-abc"))
 
 
 # --- the HTTP surface ---------------------------------------------------------
