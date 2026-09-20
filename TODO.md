@@ -1,7 +1,10 @@
 # TODO
 
-**Deadline: 7 Sep 2026.** Today is 2 Sep. Event 10–11 Sep.
-Reasoning behind the ordering is in `docs/PLAN.md`; this file is the checklist.
+**Deadline: 7 Sep 2026 — passed.** Today is 20 Sep. Event 10–11 Sep — passed.
+Reasoning behind the ordering is in `docs/PLAN.md`; this file is the checklist
+and now also the record of what the sprint actually delivered. Post-submission
+work is tracked in `docs/NEXT-PHASE-PLAN.md` (lands on branch
+`docs/next-phase-plan`).
 
 Legend: **[you]** needs a human · **[blocked]** waiting on something ·
 **[est]** contains an unverified number that must be replaced with a measurement.
@@ -66,16 +69,22 @@ live gateway** — see "Before Day 2 starts" below.
       installs. Tilt applies no YAML of its own.
 - [x] Dockerfiles for registry and inference, built from the workspace root.
 - [ ] **Gate:** every camera visible on the map with live health. None analysed
-      yet. **Not met** — needs the console (Day 3) and a live catalogue.
+      yet. **Not met** — the console exists now (Stage 5); what is still missing
+      is a live catalogue and a real `make up` run.
 
 ## Before Day 2 starts
 
-Day 1 is code-complete and has never touched a database. These are the things
-that will actually go wrong:
+Day 1 is code-complete and, at the time this list was written, had never touched
+a database. Since then the no-cluster path in `README.md` ("Quick local run")
+has been verified end to end — real Postgres, real migrations, a real login —
+but **the k3d path below has still never run**, and `docs/NEXT-PHASE-PLAN.md` §1
+lists known chart bugs that will bite on the first `make up`.
 
 - [ ] `make cluster && make images && make up` — first real run. Postgres cold
       start vs. the registry's startup probe, PostGIS extension creation, the
-      migration advisory lock.
+      migration advisory lock. (Known blockers first: NEXT-PHASE-PLAN §1.1–1.6 —
+      unmounted watchlist dir, missing env blocks, missing Dockerfiles for
+      bff/correlation/web.)
 - [ ] Confirm `camera_current` returns `effective_health_state` correctly with a
       real `now()` — the staleness overlay is pure SQL and has no unit test.
 - [ ] Register one camera by hand (`POST /api/v1/cameras`), heartbeat it, watch
@@ -84,21 +93,26 @@ that will actually go wrong:
 - [ ] Kill the registry pod mid-heartbeat: workers must keep pulling and recover
       on the next report.
 
-### Gaps Day 1 opened and did not close
+### Gaps Day 1 opened (three since closed; kept here struck-through as the record)
 
-- [ ] **`PRAHARI_INGEST_USE_HLS` is documented in `.env.example` and read by
-      nothing.** `IngestSettings` has no `use_hls` field, so the documented HLS
-      fallback cannot actually be switched on. Either wire it through to
-      `StreamCapture(use_hls=...)` or delete the line — a fallback that only
-      exists in a comment is worse than none, because it will be trusted at the
-      venue when 8554 turns out to be blocked.
-- [ ] **The worker fetches its assignments once, at startup.** Cameras the
-      catalogue sync adds later are never picked up until the pod restarts. Fine
-      for a 5-stream laptop demo; wrong the moment the estate changes during a
-      run. Re-fetch on the heartbeat interval, and diff against the running set.
-- [ ] **`PRAHARI_DETECT_*` is set by the chart and read by nothing yet.** The
-      settings class lands with detection on Day 2. If Day 2 slips, delete the
-      env block rather than leaving dead knobs that look like working ones.
+- [x] ~~**`PRAHARI_INGEST_USE_HLS` is documented and read by nothing.**~~
+      Wired on Day 2: `IngestSettings.use_hls` (`inference/config.py`) is
+      threaded to `StreamCapture(use_hls=...)` in `worker.py`, with tests
+      (`test_use_hls_is_threaded_to_the_capture_construction`). One honest
+      caveat, recorded in the field's docstring: it only affects
+      catalogue-derived URLs — a cluster worker is handed an explicit MediaMTX
+      fan-out URL and ignores the flag. The fallback is real but has still
+      never met a network where 8554 is blocked.
+- [x] ~~**The worker fetches its assignments once, at startup.**~~ Fixed:
+      `IngestSettings.assignment_refresh` (default on) re-reads assignments on
+      every heartbeat tick via `IngestWorker._reconcile_assignments`, which
+      diffs the running set, requests stops for removed cameras and starts
+      pumps for added ones — without tearing a capture handle out from under a
+      blocked `read()`.
+- [x] ~~**`PRAHARI_DETECT_*` is set by the chart and read by nothing yet.**~~
+      `DetectorSettings` (`env_prefix="PRAHARI_DETECT_"`) landed on Day 2 with
+      the cascade, and `tests/test_detector_settings.py` asserts every name the
+      chart sets maps to a real field.
 - [ ] **`make gateway-secret` loads the whole `.env`** into the Secret, not just
       the three gateway keys. Harmless (only three are referenced) and it keeps
       the password off the command line and out of shell history — but narrow it
@@ -131,16 +145,59 @@ that will actually go wrong:
 
 ## Day 3 — 4 Sep · route reconstruction + UI (local) — **GO/NO-GO**
 
-- [ ] `services/correlation/` — cross-camera stitching, spatio-temporal
+Shipped, with one honest carve-out noted inline. The BFF shipped in its
+ORG-TIERS form (sessions + org-tree scoping), which supersedes the static
+`BFF_API_KEYS` shape `docs/DAY3-DESIGN.md §4.1` originally specified — see the
+superseded note at the top of that section.
+
+- [x] `services/correlation/` — cross-camera stitching, spatio-temporal
       feasibility gating (reject 200 km in 3 min), gap interpolation.
-- [ ] `services/bff/` — auth, RBAC, hash-chained audit log with actor +
-      purpose code, SSE to the browser.
-- [ ] `web/` — Next.js + MapLibre, alert console, WHEP live preview
-      (preview only — never an inference source).
-- [ ] **CSV/PDF report export.** Literally required: detected vehicles/plates
-      with corresponding timestamps.
-- [ ] **Gate:** the full vertical slice runs on the laptop. This decides whether
-      any GPU money gets spent.
+      `feasibility.py`, `bridging.py`, `store.py`, plus `test_feasibility.py`
+      et al. Haversine + speed envelope; road-network routing stays a stated
+      limitation.
+- [x] `services/bff/` — auth (argon2id sessions + API keys), org-scoped RBAC,
+      hash-chained audit log with actor + purpose code (denials logged too),
+      SSE to the browser.
+- [x] `web/` — Next.js 16 + MapLibre console: auth-gated board, camera health
+      map, alert console on SSE, plate trace, onboarding + admin panels.
+      **WHEP live preview did not ship** — it remains open below; nothing in
+      the console pulls video today.
+- [ ] `web/` WHEP live preview — one camera at a time, from
+      `StreamEndpoints.whep_url`. Preview only — never an inference source.
+      Carve-out of the line above, not yet built.
+- [x] **CSV/PDF report export.** Literally required: detected vehicles/plates
+      with corresponding timestamps. `bff/export.py` behind
+      `GET /api/v1/routes/{plate}/export?format=csv|pdf`, purpose-coded and
+      audited.
+- [x] **Gate:** the full vertical slice runs on the laptop. This decides whether
+      any GPU money gets spent. `tests/test_day3_gate.py` — plate in,
+      timestamped route out, an injected ~900 km/5 min hop rejected, a
+      non-watchlist plate correctly producing no alert.
+
+## Org tiers — opened after Day 3 (design: `docs/ORG-TIERS-DESIGN.md`)
+
+- [x] Stage 1 — org tree (`ltree`) + required scope predicate in the registry
+      (migration `005_orgs.sql`).
+- [x] Stage 2 — identity: `users`/`sessions`/`api_keys` in Postgres
+      (migration `006_identity.sql`), argon2id passwords, login/logout/me.
+- [x] Stage 3 — BFF scoped surface: org-forced camera/gap proxy, purpose codes,
+      hash-chained audit (denials logged), SSE alert relay, plate→route +
+      CSV/PDF export.
+- [x] Stage 4a–4d — `cameras.adapter`, AES-GCM stream credentials
+      (`PRAHARI_CREDENTIAL_KEY`), org-scoped camera writes, SSRF-hardened RTSP
+      probe, bulk CSV import.
+- [x] Stage 5 — the Next.js console (auth gate, scoped API client, panels).
+- [ ] Stage 4e/5e — on-prem ONVIF discovery agent. Only the `onvif` enum labels
+      exist; no agent code. Highest-risk item in the design, severable by
+      design.
+- [ ] Stage 6 — Helm wiring for the new services. `services.yaml` renders
+      Deployments for `correlation`/`bff`/`web`, but there are no env blocks
+      (`bffEnv`/`correlationEnv`), no `PRAHARI_INTERNAL_TOKEN` /
+      `PRAHARI_CREDENTIAL_KEY` in the chart, no audit `audit.db` PVC, and no
+      Dockerfiles for the three services. Enumerated in
+      `docs/NEXT-PHASE-PLAN.md` §1.3–1.6.
+- [ ] `tests/test_org_tiers_gate.py` — specified in ORG-TIERS-DESIGN §6, not yet
+      in the tree (being added separately).
 
 ## Day 4 — 5 Sep · cloud cutover
 
@@ -157,7 +214,8 @@ that will actually go wrong:
 
 - [ ] Load test to 200–500 virtual cameras; **film KEDA scaling 2 → 20 pods.**
 - [ ] `docs/SCALE-80K.md` — every number traced to a recorded run.
-- [ ] `docs/COST-MODEL.md`, `docs/SECURITY.md` (DPDP Act 2023), `docs/HLD.md`.
+- [ ] `docs/COST-MODEL.md`. (`docs/SECURITY.md` and `docs/HLD.md` now exist —
+      written on `docs/truthfulness`, honestly labelled implemented-vs-planned.)
 - [ ] PPT.
 
 ## Day 6 — 7 Sep · submit
@@ -192,8 +250,10 @@ From the integrator's guide §4 plus our own invariants. Tick only what has been
       unhealthy, pipeline survives.
 - [ ] Registry has run against a real Postgres: PostGIS extension created,
       migrations applied under the advisory lock, `camera_current` staleness
-      overlay correct against a real `now()`. All of it is currently tested
-      against fakes only.
+      overlay correct against a real `now()`. **Partially met** — the verified
+      quick local run exercised real Postgres + real migrations; the staleness
+      overlay against a real `now()` still has no observed heartbeat-driven
+      confirmation.
 - [ ] A camera observed going healthy → stale → healthy without a gateway,
       driven by hand-posted heartbeats.
 - [ ] MediaMTX reconciliation observed adding and removing a real path, and

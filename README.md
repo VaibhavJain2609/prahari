@@ -49,11 +49,12 @@ middleware), with Model 2 direct-connect as one adapter class.
    ┌────────▼────────┐  confusion-aware fuzzy plate match · dedup
    │  match-engine   │
    └────────┬────────┘
-            │ same protobuf on the bus (Redis Streams / Redpanda)
+            │ same protobuf on the bus (Redis Streams today;
+            │ Redpanda planned for the scale profile)
    ┌────────┼────────┬──────────────┐
    ▼        ▼        ▼              ▼
 registry  correlation  BFF ──── Next.js console
-+ PostGIS  route recon  REST+SSE   MapLibre · WHEP preview
++ PostGIS  route recon  REST+SSE   MapLibre (WHEP preview planned)
 ```
 
 ## What is deliberately different
@@ -80,12 +81,15 @@ registry  correlation  BFF ──── Next.js console
 proto/          the vendor-neutral contract (buf-linted, STANDARD)
 packages/       prahari-common — catalogue client, shared by registry + workers
 services/       registry · inference · match-engine · correlation · bff
-web/            Next.js console
+web/            Next.js 16 console (see web/README.md)
 infra/
   helm/         umbrella chart; profile: local | gpu is the ONLY cutover knob
   k3d/          local cluster — same Kubernetes API as the cloud
   terraform/    modules/district — statewide rollout as a runnable artifact
-docs/           HLD · SCALE-80K · SECURITY · COST-MODEL · DEMO-SCRIPT
+docs/           PLAN · HLD · SECURITY · DAY2-DESIGN · DAY3-DESIGN ·
+                ORG-TIERS-DESIGN · NEXT-PHASE-PLAN (on branch
+                docs/next-phase-plan — post-submission hardening plan)
+                Planned, not yet written: SCALE-80K · COST-MODEL · DEMO-SCRIPT
 ```
 
 ## Local first
@@ -190,8 +194,11 @@ Not yet done: the Day 4 cloud cutover (`profile=gpu` Helm switch is written and
 `terraform apply` for a district is `validate`-clean, but neither has been run
 against rented GPU hardware), the measured streams-per-GPU figure that
 `docs/SCALE-80K.md` and the Terraform module's node-count math both depend on,
-and the Day 5/6 load test, cost/security docs, and demo submission artifacts.
+and the Day 5/6 load test, `docs/COST-MODEL.md`, and demo submission
+artifacts. (`docs/HLD.md` and `docs/SECURITY.md` have since been written.)
 See `TODO.md` for the day-by-day checklist and `CLAUDE.md` for the hard
 invariants — several of them (RTSP over TCP, never trust `CAP_PROP_FPS`, feeds
 loop) come straight from the portal's Integrator's Guide and will otherwise
-cost real debugging hours.
+cost real debugging hours. The submission window has now passed; what comes
+next — including the security and deployment gaps this README does not hide —
+is `docs/NEXT-PHASE-PLAN.md` (on branch `docs/next-phase-plan`).

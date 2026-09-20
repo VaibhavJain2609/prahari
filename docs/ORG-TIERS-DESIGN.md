@@ -296,3 +296,53 @@ what else it does.
   department-level access, just generalised to a tree.
 - No row-level security in Postgres. Enforcement is the required `scope`/`org_id` argument in the
   repository layer — weaker than RLS, and stated as such rather than implied to be equivalent.
+
+---
+
+## 8. Status (as of 20 Sep)
+
+What is actually in the tree, checked against source rather than this document's intent.
+
+**Landed**
+
+- **Stage 1** — `orgs` as an `ltree` tree (migration `005_orgs.sql`, seed root `gj`),
+  `cameras.org_id`/`adapter`/`stream_username`/`stream_secret`, `camera_current` rebuilt,
+  and `scope` as a required argument on every read path in `repository.py`/`gaps.py`.
+- **Stage 2** — identity in the shared Postgres (migration `006_identity.sql`):
+  `users` (argon2id), `sessions`, `api_keys` (sha256-keyed, plaintext shown once),
+  `POST /api/v1/auth/login|logout`, `GET /auth/me`, one `Principal` shape for both
+  credential types, bootstrap-admin seeding that no-ops once any user exists.
+- **Stage 3** — the scoped BFF surface: `org_scope` forced server-side on every
+  registry read (`_scoped_params`), purpose-code requirement, the hash-chained SQLite
+  audit log including `action="denied"` entries, per-connection scoped SSE alert relay,
+  and `GET /api/v1/routes/{plate}[/export]` — the mandatory path, deliberately *not*
+  org-filtered (see `app.py`'s comment: redacting hops by org would silently break
+  statewide tracing).
+- **Stage 4a–4d** — `cameras.adapter` labels; AES-256-GCM stream credentials under
+  `PRAHARI_CREDENTIAL_KEY`, absent from every response model; org-scoped camera
+  create/update/decommission; the SSRF-hardened probe (pinned-IP connect, blocked
+  link-local/metadata ranges); bulk CSV import with per-row failure reporting.
+- **Stage 5** — the `web/` console: cookie-gated board, scoped API client via the
+  same-origin `/api/bff/*` proxy, MapLibre health map, alert panel, plate trace,
+  onboarding and admin panels.
+
+**Pending**
+
+- **5e — ONVIF discovery agent.** Only the `onvif`/`onvif_agent` enum labels exist
+  (`models.py` in registry and bff). No agent code, no WS-Discovery — severable by
+  design, and it stayed severed.
+- **Stage 6 — Helm wiring.** `infra/helm/prahari/templates/services.yaml` already
+  renders Deployments/Services for `correlation`, `bff` and `web`, but there is no
+  `bffEnv`/`correlationEnv` block (so no `PRAHARI_INTERNAL_TOKEN`,
+  `PRAHARI_CREDENTIAL_KEY`, session/bootstrap env, or correlation env reach the
+  pods), no PVC for `audit.db`, and no Dockerfiles for the three services. The full
+  list is `docs/NEXT-PHASE-PLAN.md` §1.3–1.6; until it lands, `make up` cannot run
+  this slice.
+- **The internal token is implemented but not armed.** `require_internal_token`
+  exists in the registry (`app.py`) and the BFF sends `X-Internal-Token`, but both
+  default to empty (= off) and no chart sets them; the inference worker's and
+  correlation's registry clients don't send a token at all yet. §3.3's "registry
+  stops being ambiently readable" is therefore *aspirational in every current
+  deployment* — see `docs/SECURITY.md` for the honest boundary map.
+- **Gate test `tests/test_org_tiers_gate.py`** — specified in §6 above but not yet
+  in the tree; being added separately.
