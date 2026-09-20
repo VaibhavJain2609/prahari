@@ -40,6 +40,10 @@ crash.log
 kubeconfig*
 secrets/
 
+# `make backup` output — a full Postgres dump + the audit log. Contains
+# hashed credentials and the whole estate; never for a public repo.
+backups/
+
 # ML weights (pull at build time, do not vendor)
 *.pt
 *.onnx

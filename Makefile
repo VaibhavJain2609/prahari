@@ -119,6 +119,30 @@ internal-secret: ## Create the prahari-internal Secret (service token + credenti
 	    --dry-run=client -o yaml | kubectl apply -f -; \
 	fi
 
+BACKUP_DIR ?= backups/$(shell date +%Y%m%d-%H%M%S)
+
+.PHONY: backup
+backup: ## Dump Postgres + the audit log into $(BACKUP_DIR)
+	# What this covers: Postgres is the system of record (cameras, orgs,
+	# users, alerts, sightings); audit.db is the hash chain. Redis is not
+	# backed up — the streams are MAXLEN-bounded relays, and alerts hit
+	# Postgres before the stream publish. See docs/OPERATIONS.md.
+	@mkdir -p $(BACKUP_DIR)
+	# pg_dump over the pod's local socket — no password needed there.
+	# `prahari`/`prahari` are postgres.user/postgres.database in values.yaml;
+	# override them there and here together if they ever diverge.
+	kubectl exec -n $(NAMESPACE) prahari-postgres-0 -- \
+	  pg_dump -U prahari prahari > $(BACKUP_DIR)/prahari.sql
+	# audit.db is a live SQLite file; a raw kubectl cp can catch a mid-write
+	# page. sqlite3's online backup API copies it consistently first, and the
+	# bff image has python on PATH. BFF is single-replica (single-writer), so
+	# deploy/prahari-bff resolves to the only pod.
+	kubectl exec -n $(NAMESPACE) deploy/prahari-bff -- python -c \
+	  "import sqlite3; s=sqlite3.connect('/var/lib/prahari/audit/audit.db'); d=sqlite3.connect('/tmp/audit-backup.db'); s.backup(d); d.close(); s.close()"
+	kubectl cp -n $(NAMESPACE) deploy/prahari-bff:/tmp/audit-backup.db \
+	  $(BACKUP_DIR)/audit.db
+	@echo "backup written to $(BACKUP_DIR) — verify with /api/v1/audit/verify on a restored audit.db"
+
 .PHONY: down
 down: ## Uninstall the platform
 	helm uninstall prahari --namespace $(NAMESPACE)
