@@ -143,6 +143,13 @@ because a missing credential must not take down camera health as well as sync.
   value: {{ .Values.registry.health.staleAfterSeconds | quote }}
 - name: PRAHARI_HEARTBEAT_RETENTION_DAYS
   value: {{ .Values.registry.health.heartbeatRetentionDays | quote }}
+# Worker sharding lease (workers table, /api/v1/workers/register +
+# /api/v1/assignments). A worker counts toward shard_count while its last_seen
+# is within 2x this; the row is reaped at 3x. Must comfortably exceed
+# inference.assignmentRefreshSeconds — a refresh interval longer than the
+# lease would eject live pods from the pool and leave their slice unpulled.
+- name: PRAHARI_ASSIGNMENT_LEASE_S
+  value: {{ .Values.registry.assignment.leaseSeconds | quote }}
 # Internal API gate (X-Internal-Token) and the AES-256 key for stored camera
 # stream credentials — both real RegistrySettings fields, both optional:true so
 # local dev runs without the Secret. A non-local profile MUST create

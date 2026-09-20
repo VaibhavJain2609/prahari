@@ -37,6 +37,8 @@ from .models import (
     OrgKind,
     StreamEndpoints,
     SyncResult,
+    WorkerAssignment,
+    WorkerRegistration,
 )
 
 log = logging.getLogger(__name__)
@@ -836,6 +838,167 @@ class CameraRepository:
                 url = _with_credentials(url, row["stream_username"], password)
             paths[f"cam-{row['id']}"] = url
         return paths
+
+
+def shard_membership(worker_id: str, alive_worker_ids: Sequence[str]) -> tuple[int, int]:
+    """A worker's modulo-shard coordinates inside the alive fleet.
+
+    `(index, count)`: index is the worker's position in the sorted alive set,
+    count is the set's size. Sorting `worker_id` is what makes the coordinates
+    deterministic — every caller and every worker computes the same partition
+    of the same ordered list, with no leader election and no rendezvous.
+    Raises `ValueError` for a worker that is not in the alive set, which is
+    unreachable in `WorkerRepository.register` (the upsert refreshes
+    `last_seen` first) but must fail loudly rather than silently assign index
+    -1 to a caller that skipped registering.
+    """
+    ordered = sorted(alive_worker_ids)
+    return ordered.index(worker_id), len(ordered)
+
+
+class WorkerRepository:
+    """The `workers` table: ingest-fleet membership and camera sharding.
+
+    Membership is a lease, not a lock. `register` upserts `last_seen`; the
+    alive set is everyone within `2 * assignment_lease_s` of now; and
+    `prune_stale` deletes rows dead for `3 *` the lease. There is no DELETE —
+    the only teardown a killed pod can be relied on to perform is expiring.
+
+    Sharding is modulo, not consistent-hashing: `shard_count` changes on every
+    membership change anyway (KEDA pods in and out), so hash-slot stability
+    would buy nothing. `(row_number - 1) % shard_count` over `ORDER BY id` is
+    deterministic, a one-line proof of full coverage, and rebalances the whole
+    estate on each scale event — a camera briefly claimed by two workers
+    mid-reshard is tolerated: both read the same MediaMTX fan-out path, and a
+    path holds exactly one upstream pull no matter how many readers attach.
+    Only a camera with no fan-out URL (the direct-gateway fallback) can be
+    double-pulled upstream, and only for the seconds the two owners overlap.
+    """
+
+    # Membership horizons, in multiples of assignment_lease_s. Two misses give
+    # a slow-but-alive worker slack; the row itself lingers one more lease so
+    # a worker can be re-registered rather than re-created from nothing.
+    _ALIVE_LEASES = 2
+    _REAP_LEASES = 3
+
+    def __init__(self, pool: asyncpg.Pool, settings: RegistrySettings) -> None:
+        self._pool = pool
+        self._s = settings
+
+    async def register(self, worker_id: str) -> WorkerRegistration:
+        """Upsert the worker's lease and compute its current shard coordinates.
+
+        One round trip of writes plus the membership read, all inside a
+        transaction so a concurrent register cannot observe the table between
+        the upsert and the count. The computed coordinates are persisted back
+        onto the row — `workers.shard_index`/`shard_count` then answer "what
+        was this pod last told" for debugging without replaying the query.
+        """
+        async with self._pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO workers (worker_id, registered_at, last_seen)
+                VALUES ($1, now(), now())
+                ON CONFLICT (worker_id) DO UPDATE SET last_seen = now()
+                """,
+                worker_id,
+            )
+            alive = await self.alive_worker_ids(conn)
+            index, count = shard_membership(worker_id, alive)
+            await conn.execute(
+                "UPDATE workers SET shard_index = $2, shard_count = $3 WHERE worker_id = $1",
+                worker_id,
+                index,
+                count,
+            )
+        return WorkerRegistration(
+            worker_id=worker_id,
+            shard_index=index,
+            shard_count=count,
+            lease_s=self._s.assignment_lease_s,
+        )
+
+    async def alive_worker_ids(self, conn: asyncpg.Connection | None = None) -> list[str]:
+        """Worker ids whose lease is still warm, in shard order.
+
+        Ordered by `worker_id` — not `registered_at`, which would make a
+        pod's shard identity depend on when it happened to boot — so the
+        ordering is a pure function of *who* is alive, and the same set yields
+        the same partition for every caller.
+        """
+        rows = await (conn or self._pool).fetch(
+            """
+            SELECT worker_id FROM workers
+            WHERE last_seen >= now() - make_interval(secs => $1)
+            ORDER BY worker_id
+            """,
+            self._s.assignment_lease_s * self._ALIVE_LEASES,
+        )
+        return [r["worker_id"] for r in rows]
+
+    async def assignment(self, worker_id: str, *, scope: str) -> WorkerAssignment:
+        """Register-or-refresh the worker, then return its slice of the estate.
+
+        The fetch re-registers rather than 404ing an unknown worker: a pod's
+        first call after a cold start IS its registration, and a worker that
+        only ever polls `/assignments` still keeps its lease warm — the same
+        way a camera heartbeat refreshes the camera without a separate
+        keep-alive endpoint.
+        """
+        registration = await self.register(worker_id)
+        cameras = await self.shard_of_cameras(
+            scope=scope,
+            shard_index=registration.shard_index,
+            shard_count=registration.shard_count,
+        )
+        return WorkerAssignment(**registration.model_dump(), cameras=cameras)
+
+    async def shard_of_cameras(
+        self, *, scope: str, shard_index: int, shard_count: int
+    ) -> list[Camera]:
+        """The `shard_index`-of-`shard_count` slice of the active estate.
+
+        `row_number() OVER (ORDER BY id)` numbers the active, in-scope cameras
+        against a key that never changes (the registry's own uuid — external
+        ids rotate, `site_name`/`district` are mutable and nullable). Slice
+        membership is `(rn - 1) % shard_count = shard_index`: consecutive rows
+        land on consecutive workers, so the partition is as even as integer
+        division allows and is recomputed from scratch on every call — no
+        stored assignment to drift from the catalogue between refreshes.
+        """
+        rows = await self._pool.fetch(
+            """
+            SELECT * FROM (
+                SELECT cc.*, row_number() OVER (ORDER BY cc.id) AS shard_rn
+                FROM camera_current cc
+                JOIN orgs o ON o.id = cc.org_id
+                WHERE cc.lifecycle = 'active' AND o.path <@ $1::ltree
+            ) numbered
+            WHERE (numbered.shard_rn - 1) % $2 = $3
+            ORDER BY numbered.shard_rn
+            """,
+            scope,
+            shard_count,
+            shard_index,
+        )
+        return [camera_from_row(r, self._s) for r in rows]
+
+    async def prune_stale(self) -> int:
+        """Delete workers whose lease expired `_REAP_LEASES`x ago; returns count.
+
+        Hygiene only — membership math already ignores anything past
+        `_ALIVE_LEASES`x the lease, so a slow prune can never strand a camera
+        on a dead pod. It exists so `workers` does not accumulate one
+        permanent row per pod a deployment has ever run.
+        """
+        status = await self._pool.execute(
+            """
+            DELETE FROM workers
+            WHERE last_seen < now() - make_interval(secs => $1)
+            """,
+            self._s.assignment_lease_s * self._REAP_LEASES,
+        )
+        return int(status.rsplit(" ", 1)[-1]) if status.startswith("DELETE") else 0
 
 
 def _org_from_row(row: asyncpg.Record) -> Org:

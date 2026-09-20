@@ -73,6 +73,20 @@ spec:
               value: "http://prahari-registry:{{ .Values.services.registry.port }}"
             - name: PRAHARI_INGEST_HEARTBEAT_INTERVAL_S
               value: {{ .Values.inference.heartbeatIntervalSeconds | quote }}
+            # Worker identity for registry sharding: the pod name, explicitly —
+            # the same value every camera heartbeat carries, so "which pod owns
+            # this camera" and "which slice is this pod pulling" share one id.
+            # fieldRef, not a hostname lookup, so the contract does not depend
+            # on the runtime setting $HOSTNAME the same way.
+            - name: PRAHARI_INGEST_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Register + re-fetch this worker's shard on this cadence — the
+            # lease keep-alive. Must stay below registry.assignment.leaseSeconds
+            # (default 60) or this pod drops out of shard_count while alive.
+            - name: PRAHARI_INGEST_ASSIGNMENT_REFRESH_S
+              value: {{ .Values.inference.assignmentRefreshSeconds | quote }}
             # PRAHARI_DETECT_* is read by DetectorSettings — asserted by
             # tests/test_detector_settings.py.
             - name: PRAHARI_DETECT_MODEL

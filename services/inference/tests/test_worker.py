@@ -7,6 +7,7 @@ that a registry outage does not stop ingest.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -23,6 +24,7 @@ from prahari_inference.worker import (
     RegistryClient,
     _assignment,
     _initial_assignments,
+    worker_id,
 )
 
 SETTINGS = IngestSettings(max_active_cameras=3, heartbeat_interval_s=0.01)
@@ -126,20 +128,70 @@ class SlowStopCapture:
     measured_fps = None
 
 
-def _registry_serving(camera_lists: list[list[dict]], settings: IngestSettings) -> RegistryClient:
-    """A `RegistryClient` whose GET (assignments) responses walk through
-    `camera_lists` one call at a time, repeating the last entry once
-    exhausted. POSTs (heartbeats) always ack healthy."""
+def _sharded_handler(
+    camera_lists: list[list[dict]],
+    *,
+    register_status: int = 200,
+    assignments_status: int = 200,
+):
+    """A mock-registry request handler that speaks the sharded contract:
+    POST /api/v1/workers/register, GET /api/v1/assignments, the legacy
+    GET /api/v1/cameras list, and heartbeat POSTs.
+
+    `camera_lists` walks whichever camera GET fires, one call at a time,
+    repeating the last entry once exhausted. `register_status` /
+    `assignments_status` simulate a registry that predates the endpoints —
+    a 404 there is what latches the worker's unsharded fallback.
+
+    Returns the raw handler (not a MockTransport) so tests can wrap it to
+    observe requests; `httpx.MockTransport(_sharded_handler(...))` is the
+    usual usage.
+    """
     calls = {"n": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v1/workers/register":
+            if register_status != 200:
+                return httpx.Response(register_status, json={"detail": "not found"})
+            wid = json.loads(request.content)["worker_id"]
+            return httpx.Response(
+                200,
+                json={
+                    "worker_id": wid,
+                    "shard_index": 0,
+                    "shard_count": 1,
+                    "lease_s": 60,
+                },
+            )
         if request.method == "POST":
             return httpx.Response(200, json={"camera_id": "x", "state": "healthy", "reason": "ok"})
         idx = min(calls["n"], len(camera_lists) - 1)
         calls["n"] += 1
+        if path == "/api/v1/assignments":
+            if assignments_status != 200:
+                return httpx.Response(assignments_status, json={"detail": "not found"})
+            return httpx.Response(
+                200,
+                json={
+                    "worker_id": request.url.params.get("worker_id", "w"),
+                    "shard_index": 0,
+                    "shard_count": 1,
+                    "lease_s": 60,
+                    "cameras": camera_lists[idx],
+                },
+            )
         return httpx.Response(200, json=camera_lists[idx])
 
-    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
+    return handler
+
+
+def _registry_serving(camera_lists: list[list[dict]], settings: IngestSettings) -> RegistryClient:
+    """A `RegistryClient` against a fully sharded mock registry."""
+    http = httpx.Client(
+        transport=httpx.MockTransport(_sharded_handler(camera_lists)),
+        base_url="http://registry",
+    )
     return RegistryClient(settings, client=http)
 
 
@@ -200,7 +252,7 @@ def test_assignments_are_capped_at_max_active_cameras():
     degrades the shared feed for every other consumer on it."""
     cameras = [camera(id=f"cam-{i}") for i in range(10)]
     http = httpx.Client(
-        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=cameras)),
+        transport=httpx.MockTransport(_sharded_handler([cameras])),
         base_url="http://registry",
     )
     assert len(RegistryClient(SETTINGS, client=http).assignments()) == 3
@@ -209,7 +261,7 @@ def test_assignments_are_capped_at_max_active_cameras():
 def test_a_urlless_camera_does_not_consume_a_slot():
     cameras = [camera(id="cam-bad", endpoints={})] + [camera(id=f"cam-{i}") for i in range(3)]
     http = httpx.Client(
-        transport=httpx.MockTransport(lambda r: httpx.Response(200, json=cameras)),
+        transport=httpx.MockTransport(_sharded_handler([cameras])),
         base_url="http://registry",
     )
     ids = [a.camera_id for a in RegistryClient(SETTINGS, client=http).assignments()]
@@ -224,11 +276,31 @@ def test_assignments_are_not_filtered_by_health_state():
     seen: list[httpx.URL] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/workers/register":
+            return httpx.Response(
+                200,
+                json={
+                    "worker_id": json.loads(request.content)["worker_id"],
+                    "shard_index": 0,
+                    "shard_count": 1,
+                    "lease_s": 60,
+                },
+            )
         seen.append(request.url)
-        return httpx.Response(200, json=[])
+        return httpx.Response(
+            200,
+            json={
+                "worker_id": "w",
+                "shard_index": 0,
+                "shard_count": 1,
+                "lease_s": 60,
+                "cameras": [],
+            },
+        )
 
     http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
     RegistryClient(SETTINGS, client=http).assignments()
+    assert seen[0].path == "/api/v1/assignments"
     assert "state" not in seen[0].params
 
 
@@ -237,16 +309,16 @@ def test_assignments_are_not_filtered_by_health_state():
 
 def test_registry_client_sends_x_internal_token_when_set():
     """Once the registry arms `require_internal_token`, a worker that does not
-    send the credential gets 401 on assignments AND heartbeats -- the whole
-    health contract silently dies. The header goes on the client, so both
-    calls carry it."""
-    seen: list[str | None] = []
+    send the credential gets 401 on register, assignments AND heartbeats -- the
+    whole health contract silently dies. The header goes on the client, so
+    every call carries it."""
+    seen: list[tuple[str, str | None]] = []
+
+    base = _sharded_handler([[camera(id="cam-1")]])
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request.headers.get("x-internal-token"))
-        if request.method == "POST":
-            return httpx.Response(200, json={"camera_id": "x", "state": "healthy", "reason": "ok"})
-        return httpx.Response(200, json=[])
+        seen.append((request.url.path, request.headers.get("x-internal-token")))
+        return base(request)
 
     settings = IngestSettings(internal_token="tok-1")
     http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
@@ -255,7 +327,13 @@ def test_registry_client_sends_x_internal_token_when_set():
     client.assignments()
     client.heartbeat("cam-1", {"connected": True})
 
-    assert seen == ["tok-1", "tok-1"]
+    paths = [p for p, _ in seen]
+    assert paths == [
+        "/api/v1/workers/register",
+        "/api/v1/assignments",
+        "/api/v1/cameras/cam-1/heartbeat",
+    ]
+    assert all(token == "tok-1" for _, token in seen)
 
 
 def test_registry_client_sends_no_credential_when_token_is_unset():
@@ -263,14 +341,16 @@ def test_registry_client_sends_no_credential_when_token_is_unset():
     empty header would be a credential-shaped lie, not a no-op."""
     seen: list[str | None] = []
 
+    base = _sharded_handler([[]])
+
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request.headers.get("x-internal-token"))
-        return httpx.Response(200, json=[])
+        return base(request)
 
     http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
     RegistryClient(SETTINGS, client=http).assignments()
 
-    assert seen == [None]
+    assert seen == [None, None]
 
 
 # --- what gets reported ------------------------------------------------------
@@ -377,13 +457,14 @@ def test_boot_retries_the_assignment_fetch_until_the_registry_answers():
     """Rollout order is not guaranteed: the registry pod may still be
     starting when the worker boots. The fetch retries with backoff instead
     of crashing the process."""
-    gets = {"n": 0}
+    calls = {"n": 0}
+    base = _sharded_handler([[camera(id="cam-1")]])
 
     def handler(request: httpx.Request) -> httpx.Response:
-        gets["n"] += 1
-        if gets["n"] < 3:
+        calls["n"] += 1
+        if calls["n"] < 3:
             raise httpx.ConnectError("registry not up yet")
-        return httpx.Response(200, json=[camera(id="cam-1")])
+        return base(request)
 
     settings = IngestSettings(backoff_initial_s=0.001, backoff_max_s=0.002)
     http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
@@ -391,7 +472,9 @@ def test_boot_retries_the_assignment_fetch_until_the_registry_answers():
     assignments = _initial_assignments(RegistryClient(settings, client=http), settings)
 
     assert [a.camera_id for a in assignments] == ["cam-1"]
-    assert gets["n"] == 3
+    # Two failures, then register + assignments: four requests, three calls
+    # into assignments().
+    assert calls["n"] == 4
 
 
 def test_boot_starts_empty_after_bounded_retries_not_a_crash():
@@ -409,6 +492,8 @@ def test_boot_starts_empty_after_bounded_retries_not_a_crash():
 
     assignments = _initial_assignments(RegistryClient(settings, client=http), settings)
 
+    # register() is the first request inside assignments(), so each of the
+    # bounded attempts is one ConnectError — the count is unchanged.
     assert assignments == []
     assert gets["n"] == _BOOT_FETCH_ATTEMPTS
 
@@ -854,3 +939,151 @@ def test_stop_asks_captures_to_finish_rather_than_releasing_them():
 
     assert asked == ["stop"]
     assert released == []
+
+
+# --- worker sharding: register, shard fetch, and the 404 fallback ------------
+
+
+def test_worker_registers_with_its_configured_worker_id():
+    """`worker_id` is the caller-supplied identity — the pod name in the
+    cluster — and it is what the registry's modulo shard is keyed on."""
+    posted: list[dict] = []
+
+    base = _sharded_handler([[]])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/workers/register":
+            posted.append(json.loads(request.content))
+        return base(request)
+
+    settings = IngestSettings(worker_id="inference-6f9c4d7b5-x2abc")
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
+    RegistryClient(settings, client=http).assignments()
+
+    assert posted == [{"worker_id": "inference-6f9c4d7b5-x2abc"}]
+
+
+def test_worker_id_defaults_to_the_pod_hostname():
+    """Empty `worker_id` derives HOSTNAME (the pod name) — the id the chart
+    pins via fieldRef on the same Deployment."""
+    assert RegistryClient(SETTINGS).worker_id
+    assert RegistryClient(SETTINGS, client=None).worker_id == worker_id(SETTINGS)
+
+
+def test_assignments_queries_the_shard_endpoint_with_the_worker_id():
+    seen: list[httpx.URL] = []
+    base = _sharded_handler([[camera(id="cam-1")]])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/assignments":
+            seen.append(request.url)
+        return base(request)
+
+    settings = IngestSettings(worker_id="pod-7")
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
+    assignments = RegistryClient(settings, client=http).assignments()
+
+    assert [a.camera_id for a in assignments] == ["cam-1"]
+    assert seen[0].params["worker_id"] == "pod-7"
+
+
+def test_every_refresh_re_registers_to_keep_the_lease_alive():
+    """Register is the keep-alive: each assignment cycle must refresh
+    `last_seen`, or a pod that stops refreshing silently drops out of
+    shard_count and its slice is reassigned out from under it."""
+    registers = {"n": 0}
+    base = _sharded_handler([[]])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/workers/register":
+            registers["n"] += 1
+        return base(request)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
+    client = RegistryClient(SETTINGS, client=http)
+    client.assignments()
+    client.assignments()
+
+    assert registers["n"] == 2
+
+
+def test_a_registry_without_the_endpoints_falls_back_to_unsharded(caplog):
+    """A new worker against a pre-sharding registry must still function —
+    404 on register means take the old estate-list path, loudly, because two
+    unsharded workers racing the same first-N cameras is the defect this
+    feature exists to remove."""
+    paths: list[str] = []
+    base = _sharded_handler([[camera(id="cam-1")]], register_status=404)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return base(request)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
+    client = RegistryClient(SETTINGS, client=http)
+    with caplog.at_level(logging.WARNING, logger="prahari_inference.worker"):
+        assignments = client.assignments()
+
+    assert [a.camera_id for a in assignments] == ["cam-1"]
+    assert paths == ["/api/v1/workers/register", "/api/v1/cameras"]
+    assert "UNSHARDED" in caplog.text
+    assert client._unsharded
+
+
+def test_the_unsharded_fallback_is_latched_not_retried_every_cycle(caplog):
+    """A 404'd registry does not grow the endpoints mid-run — once latched,
+    the worker must not pay a register round-trip on every refresh."""
+    paths: list[str] = []
+    base = _sharded_handler([[]], register_status=404)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return base(request)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
+    client = RegistryClient(SETTINGS, client=http)
+    with caplog.at_level(logging.WARNING, logger="prahari_inference.worker"):
+        client.assignments()
+        client.assignments()
+
+    assert paths.count("/api/v1/workers/register") == 1
+    assert paths.count("/api/v1/cameras") == 2
+    # Loud, but once — not a warning per refresh tick.
+    assert caplog.text.count("UNSHARDED") == 1
+
+
+def test_a_404_on_assignments_also_falls_back(caplog):
+    """Register can exist while the assignments fetch does not (a partial
+    deploy); the fallback must trigger on either endpoint."""
+    paths: list[str] = []
+    base = _sharded_handler([[camera(id="cam-1")]], assignments_status=404)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return base(request)
+
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
+    client = RegistryClient(SETTINGS, client=http)
+    with caplog.at_level(logging.WARNING, logger="prahari_inference.worker"):
+        assignments = client.assignments()
+
+    assert [a.camera_id for a in assignments] == ["cam-1"]
+    assert paths == [
+        "/api/v1/workers/register",
+        "/api/v1/assignments",
+        "/api/v1/cameras",
+    ]
+    assert "UNSHARDED" in caplog.text
+
+
+def test_a_registry_error_still_propagates_as_an_outage():
+    """A 500 (or a dropped connection) on register is an outage, not a
+    pre-sharding registry: it must raise so reconciliation keeps the camera
+    set it already has rather than degrading to unsharded."""
+    base = _sharded_handler([[]], register_status=500)
+    http = httpx.Client(transport=httpx.MockTransport(base), base_url="http://registry")
+    client = RegistryClient(SETTINGS, client=http)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        client.assignments()
+    assert not client._unsharded

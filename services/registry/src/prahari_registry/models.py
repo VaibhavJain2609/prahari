@@ -391,6 +391,48 @@ class HeartbeatSample(BaseModel):
     last_error: str | None = None
 
 
+class WorkerRegister(BaseModel):
+    """An ingest worker announcing itself to the sharding pool.
+
+    `worker_id` is caller-supplied — the pod name under Kubernetes, the
+    hostname otherwise — and is the same identity the worker stamps on every
+    camera heartbeat, so "which pod owned this camera" is one column, not a
+    log correlation exercise. Registration is idempotent: re-registering is
+    the keep-alive and refreshes `last_seen`.
+    """
+
+    worker_id: str = Field(min_length=1, max_length=253)
+
+
+class WorkerRegistration(BaseModel):
+    """What a worker learns from registering: its shard coordinates and how
+    long the lease it just refreshed lives.
+
+    `shard_index`/`shard_count` are modulo coordinates over the fleet's alive
+    set (workers whose `last_seen` is within 2x the lease, ordered by
+    worker_id). They are advisory, not a lock — membership changes as pods
+    come and go, and a camera briefly claimed by two workers during a
+    reshard is tolerated: both read the same MediaMTX fan-out path, which
+    holds one upstream pull regardless of reader count.
+    """
+
+    worker_id: str
+    shard_index: int = Field(ge=0)
+    shard_count: int = Field(ge=1)
+    lease_s: int = Field(ge=1)
+
+
+class WorkerAssignment(WorkerRegistration):
+    """A registration plus the camera slice it entitles the worker to pull.
+
+    `cameras` carries the same `Camera` shape as `GET /api/v1/cameras` —
+    including the MediaMTX fan-out endpoints — so the worker builds its
+    `CameraAssignment`s identically whichever endpoint served them.
+    """
+
+    cameras: list[Camera] = Field(default_factory=list)
+
+
 class SyncResult(BaseModel):
     source: str
     ok: bool

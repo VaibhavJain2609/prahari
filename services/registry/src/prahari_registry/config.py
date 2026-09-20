@@ -140,6 +140,19 @@ class RegistrySettings(BaseSettings):
 
     heartbeat_prune_interval_s: float = 3600.0
 
+    # --- worker assignment ---------------------------------------------------
+
+    assignment_lease_s: int = 60
+    """How long a registered inference worker's membership lasts without a
+    re-register (`POST /api/v1/workers/register` doubles as the keep-alive).
+
+    Two windows derive from it: a worker counts toward `shard_count` while its
+    `last_seen` is within 2x this lease, and its `workers` row is reaped once
+    stale for 3x — the first shrinks the pool promptly when a pod dies, the
+    second is just table hygiene. The chart sets it well above the worker's
+    own refresh cadence (`PRAHARI_INGEST_ASSIGNMENT_REFRESH_S`) so one missed
+    refresh does not eject a live pod from the pool."""
+
     # --- gap analysis --------------------------------------------------------
 
     gap_dark_zone_radius_m: float = 500.0
