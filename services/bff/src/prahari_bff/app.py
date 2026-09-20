@@ -37,11 +37,14 @@ from .correlation_client import CorrelationClient
 from .db import create_pool
 from .export import route_to_csv, route_to_pdf
 from .match_engine_client import MatchEngineClient
+from .media import MediaTicketIssuer
 from .models import (
     ApiKey,
     ApiKeyCreate,
     ApiKeyCreated,
     LoginRequest,
+    PreviewTicket,
+    PreviewTicketRequest,
     Principal,
     User,
     UserCreate,
@@ -117,6 +120,7 @@ async def lifespan(app: FastAPI):
         ttl_s=settings.camera_org_cache_ttl_s,
     )
     audit = AuditLog(settings.audit_db_path)
+    media_issuer = MediaTicketIssuer(settings)
 
     app.state.pool = pool
     app.state.settings = settings
@@ -128,6 +132,7 @@ async def lifespan(app: FastAPI):
     app.state.match_engine = match_engine
     app.state.scope_resolver = scope_resolver
     app.state.audit = audit
+    app.state.media_issuer = media_issuer
     app.state.login_limiter = SlidingWindowRateLimiter(
         settings.login_rate_limit_attempts, settings.login_rate_limit_window_s
     )
@@ -661,6 +666,22 @@ def _upstream_detail(response: httpx.Response) -> str:
     return body.get("detail", response.text) if isinstance(body, dict) else response.text
 
 
+def _public_camera(camera: dict) -> dict:
+    """The browser-facing projection of a registry `Camera`.
+
+    `endpoints` is dropped wholesale: on the registry it now carries
+    credential-bearing fan-out URLs meant for inference workers only
+    (`StreamEndpoints` docstring), and no response to a browser may contain a
+    stream URL — the audited path is `POST /api/v1/media/preview-ticket`. The
+    registry's `preview` capability flag stays; it is exactly as much as the
+    console needs to decide whether to offer the button.
+    """
+    if isinstance(camera, dict):
+        camera = dict(camera)
+        camera.pop("endpoints", None)
+    return camera
+
+
 def _scoped_params(request: Request, principal: Principal) -> dict:
     """Every filter a client sent, minus any `org_scope` it tried to set
     itself — the scope is always the caller's own org, never negotiable. This
@@ -682,7 +703,10 @@ def _scoped_params(request: Request, principal: Principal) -> dict:
 
 @app.get("/api/v1/cameras", tags=["cameras"])
 async def list_cameras(principal: PrincipalDep, registry: RegistryDep, request: Request) -> list:
-    return _forward_json(await registry.get("/api/v1/cameras", _scoped_params(request, principal)))
+    cameras = _forward_json(
+        await registry.get("/api/v1/cameras", _scoped_params(request, principal))
+    )
+    return [_public_camera(c) for c in cameras]
 
 
 @app.get("/api/v1/cameras/summary", tags=["cameras"])
@@ -762,7 +786,7 @@ async def get_camera(
         resource=f"camera:{camera_id}",
         action="read" if response.status_code < 400 else "read_failed",
     )
-    return _forward_json(response)
+    return _public_camera(_forward_json(response))
 
 
 @app.get("/api/v1/cameras/{camera_id}/health-history", tags=["cameras"])
@@ -857,7 +881,7 @@ async def create_camera(
         resource=resource,
         action="camera_create" if response.status_code < 400 else "camera_create_failed",
     )
-    return _forward_json(response)
+    return _public_camera(_forward_json(response))
 
 
 @app.patch("/api/v1/cameras/{camera_id}", tags=["cameras"])
@@ -899,7 +923,7 @@ async def update_camera(
         resource=f"camera:{camera_id}",
         action="camera_update" if response.status_code < 400 else "camera_update_failed",
     )
-    return _forward_json(response)
+    return _public_camera(_forward_json(response))
 
 
 @app.delete("/api/v1/cameras/{camera_id}", tags=["cameras"])
@@ -930,7 +954,7 @@ async def decommission_camera(
         resource=f"camera:{camera_id}",
         action="camera_delete" if response.status_code < 400 else "camera_delete_failed",
     )
-    return _forward_json(response)
+    return _public_camera(_forward_json(response))
 
 
 @app.post("/api/v1/cameras/probe", tags=["cameras"])
@@ -957,6 +981,78 @@ async def probe_camera(
         action="probe" if response.status_code < 400 else "probe_failed",
     )
     return _forward_json(response)
+
+
+# --- media: the audited video path -------------------------------------------
+#
+# "Every video access is written to the hash-chained audit log, with an actor
+# and a purpose code." The browser never receives a stream URL — it receives
+# a ticket: an Ed25519 JWT scoped to exactly one `cam-<id>` path and ~60s of
+# validity, minted only after the scope check passes and the audit entry is
+# durable. MediaMTX validates it by asking the registry (`authMethod: http`),
+# which verifies the signature against the public key served at /jwks — so a
+# stolen or out-of-scope ticket dies at the restreamer, not at the browser.
+
+
+@app.get("/api/v1/media/jwks", tags=["media"])
+async def media_jwks(request: Request) -> dict:
+    """The public half of the ticket keypair. Deliberately unauthenticated —
+    it is a public key, and the registry fetches it without credentials."""
+    issuer: MediaTicketIssuer = request.app.state.media_issuer
+    return issuer.jwks()
+
+
+@app.post("/api/v1/media/preview-ticket", response_model=PreviewTicket, tags=["media"])
+async def preview_ticket(
+    payload: PreviewTicketRequest,
+    principal: PrincipalDep,
+    purpose_code: PurposeCodeDep,
+    scope_resolver: ScopeResolverDep,
+    audit: AuditDep,
+    request: Request,
+) -> PreviewTicket:
+    """Mint a one-camera, ~60s preview ticket.
+
+    Scoped like the camera-detail read (a camera outside the caller's subtree
+    is 403, audited, not 404), but heavier: a video access, so the purpose
+    code is mandatory and the audit append happens *before* the credential
+    exists — a failed append fails closed and no ticket is minted.
+    """
+    settings: BFFSettings = request.app.state.settings
+    issuer: MediaTicketIssuer = request.app.state.media_issuer
+
+    org_path = await scope_resolver.org_path_for_camera(payload.camera_id)
+    if org_path is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no camera {payload.camera_id}")
+    if not in_scope(org_path, principal.org_path):
+        await _audit_access(
+            audit,
+            principal,
+            purpose_code=purpose_code,
+            resource=f"camera:{payload.camera_id}",
+            action="video_preview_denied",
+        )
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "camera is outside your org subtree")
+
+    await _audit_access(
+        audit,
+        principal,
+        purpose_code=purpose_code,
+        resource=f"camera:{payload.camera_id}",
+        action="video_preview",
+    )
+    ticket = issuer.mint(
+        subject=principal.subject,
+        camera_id=payload.camera_id,
+        ttl_s=settings.media_ticket_ttl_s,
+    )
+    whep_base = settings.media_whep_base_url.rstrip("/")
+    return PreviewTicket(
+        camera_id=payload.camera_id,
+        ticket=ticket,
+        whep_url=f"{whep_base}/cam-{payload.camera_id}/whep",
+        expires_in=settings.media_ticket_ttl_s,
+    )
 
 
 # --- cameras: bulk CSV import -------------------------------------------------

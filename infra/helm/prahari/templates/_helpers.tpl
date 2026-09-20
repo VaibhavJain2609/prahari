@@ -30,6 +30,32 @@ Name of the Secret carrying the Postgres password. Out of band when
 {{- end -}}
 
 {{/*
+Name of the Secret carrying the Redis password (`key: password`). Same
+contract as postgres: out of band via `redis.existingSecret`, else the
+chart-generated `prahari-redis-auth` (helm.sh/resource-policy: keep).
+*/}}
+{{- define "prahari.redisSecretName" -}}
+{{- .Values.redis.existingSecret | default "prahari-redis-auth" -}}
+{{- end -}}
+
+{{/*
+REDIS_PASSWORD plus the `redis://:$(REDIS_PASSWORD)@...` URL pattern, shared
+by every bus consumer's env block. The URL references the env var so the
+password appears nowhere in rendered YAML. Empty expansion (`optional: true`
+secret absent) yields `redis://:@host` — redis-py treats an empty password as
+"no AUTH", matching `--requirepass ""` on the server side: both ends degrade
+to passwordless together.
+*/}}
+{{- define "prahari.redisPasswordEnv" -}}
+- name: REDIS_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "prahari.redisSecretName" . }}
+      key: password
+      optional: true
+{{- end -}}
+
+{{/*
 Environment shared by every service: how to reach the database.
 
 Deliberately minimal. The repo invariant is that every PRAHARI_* name the chart
@@ -138,14 +164,18 @@ because a missing credential must not take down camera health as well as sync.
   value: "true"
 - name: PRAHARI_MEDIAMTX_API_URL
   value: "http://prahari-mediamtx:{{ .Values.mediamtx.apiPort }}"
-# One host field feeds every fan-out URL — browser WHEP/HLS previews AND the
-# URLs workers are assigned (worker.py prefers fanout_rtsp_url). `localhost`
-# makes browser preview work through k3d's port maps; a profile with only
-# in-cluster consumers can set mediamtx.publicHost=prahari-mediamtx, and a
-# cloud profile needs the ingress host reachable from BOTH. Splitting
-# internal/public fan-out hosts is a registry-settings follow-up.
+# publicHost feeds the fan-out URLs the registry hands to in-cluster
+# consumers — inference workers (worker.py prefers fanout_rtsp_url). It no
+# longer feeds browsers: the WHEP URL a browser gets comes from the BFF's
+# preview-ticket response (PRAHARI_MEDIA_WHEP_BASE_URL in bffEnv), so this
+# host only needs to resolve from inside the cluster.
 - name: PRAHARI_MEDIAMTX_PUBLIC_HOST
   value: {{ .Values.mediamtx.publicHost | quote }}
+# Where the registry verifies BFF-minted preview tickets (the JWKS the BFF
+# publishes). With the BFF disabled this URL simply never resolves — machine
+# credentials are checked locally and are unaffected.
+- name: PRAHARI_MEDIA_AUTH_JWKS_URL
+  value: "http://prahari-bff:{{ .Values.services.bff.port }}/api/v1/media/jwks"
 - name: PRAHARI_MEDIAMTX_RTSP_PORT
   value: {{ .Values.mediamtx.rtspPort | quote }}
 - name: PRAHARI_MEDIAMTX_HLS_PORT
@@ -221,8 +251,11 @@ password.
 # PRAHARI_MATCH_REDIS_URL, not a shared PRAHARI_REDIS_URL) and "one schema,
 # two transports" silently degrades to "one transport": alerts never leave
 # /api/v1/alerts.
+# REDIS_PASSWORD must be declared BEFORE the URL that expands it — Kubernetes
+# only resolves $(VAR) against earlier entries in the same env list.
+{{ include "prahari.redisPasswordEnv" . }}
 - name: PRAHARI_MATCH_REDIS_URL
-  value: "redis://prahari-redis:6379"
+  value: "redis://:$(REDIS_PASSWORD)@prahari-redis:6379"
 - name: PRAHARI_MATCH_INTERNAL_TOKEN
   valueFrom:
     secretKeyRef:
@@ -246,8 +279,10 @@ is what it sends to a gated registry for camera-location lookups.
 {{- define "prahari.correlationEnv" -}}
 - name: PRAHARI_CORRELATION_HTTP_PORT
   value: {{ .Values.services.correlation.port | quote }}
+# REDIS_PASSWORD before the URL — see matchEngineEnv for the expansion rule.
+{{ include "prahari.redisPasswordEnv" . }}
 - name: PRAHARI_CORRELATION_REDIS_URL
-  value: "redis://prahari-redis:6379"
+  value: "redis://:$(REDIS_PASSWORD)@prahari-redis:6379"
 - name: PRAHARI_CORRELATION_REGISTRY_BASE_URL
   value: "http://prahari-registry:{{ .Values.services.registry.port }}"
 - name: PRAHARI_CORRELATION_INTERNAL_TOKEN
@@ -299,13 +334,30 @@ registry, relays alerts off Redis Streams, and owns the hash-chained audit log
 # The SSE alert relay reads the `prahari:alerts` stream. BFFSettings is the only
 # settings class that reads the bare PRAHARI_REDIS_URL — everyone else's Redis
 # env is service-prefixed — which is why it lives here and not in commonEnv.
+# REDIS_PASSWORD before the URL — see matchEngineEnv for the expansion rule.
+{{ include "prahari.redisPasswordEnv" . }}
 - name: PRAHARI_REDIS_URL
-  value: "redis://prahari-redis:6379"
+  value: "redis://:$(REDIS_PASSWORD)@prahari-redis:6379"
 # Append-only, hash-chained, single-writer — deliberately a SQLite file on the
 # prahari-audit PVC, not a table in the shared Postgres. There is no "audit off"
 # switch in any profile; the old PRAHARI_AUDIT_* flags gated nothing.
 - name: PRAHARI_AUDIT_DB_PATH
   value: "/var/lib/prahari/audit/audit.db"
+# Media preview tickets (BFFSettings.media_*). The signing key rides in the
+# existing prahari-internal Secret under `media-jwt-private-key`; optional so
+# the local profile still boots — the BFF then generates an ephemeral keypair
+# and warns (a restart invalidates outstanding tickets, which are ~60s lived).
+- name: PRAHARI_MEDIA_JWT_PRIVATE_KEY
+  valueFrom:
+    secretKeyRef:
+      name: prahari-internal
+      key: media-jwt-private-key
+      optional: true
+# The WHEP URL handed to browsers is the one the BROWSER can reach — the k3d
+# port map locally, the ingress host in the cloud. In-cluster mediamtx access
+# (workers, the auth callback) never uses it.
+- name: PRAHARI_MEDIA_WHEP_BASE_URL
+  value: {{ .Values.mediamtx.browserWhepBase | quote }}
 # Secure cookies only where TLS terminates. Local k3d serves plain HTTP; every
 # other profile must have TLS in front or sessions ship in the clear.
 - name: PRAHARI_SESSION_COOKIE_SECURE

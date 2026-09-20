@@ -20,14 +20,16 @@ profile: gpu
 postgres:
   storage: 50Gi
 
-# mediamtx.publicHost MUST be set for this profile — the base default
-# `localhost` only works through k3d's port maps. It is the host embedded in
-# the fan-out URLs handed to consumers, reachable from browsers AND in-cluster
-# workers (one field serves both; see PRAHARI_MEDIAMTX_PUBLIC_HOST in
-# _helpers.tpl). Left commented: an uncommented-but-empty `mediamtx:` map would
-# null out every base mediamtx value.
+# mediamtx.browserWhepBase MUST be set for this profile — the base default
+# `http://localhost:8889` only works through k3d's port maps. It is the WHEP
+# base the BFF embeds in preview tickets, i.e. the URL the demo laptops'
+# browsers actually POST to; it must be the public ingress host:port that
+# reaches MediaMTX's WHEP listener (8889). `publicHost` needs no override —
+# it only feeds in-cluster worker fan-out URLs now. Left commented: an
+# uncommented-but-empty `mediamtx:` map would null out every base mediamtx
+# value.
 # mediamtx:
-#   publicHost: streams.example.gov.in
+#   browserWhepBase: https://streams.example.gov.in
 
 inference:
   replicas: 2

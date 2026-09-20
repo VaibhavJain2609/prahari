@@ -58,6 +58,26 @@ class RegistrySettings(BaseSettings):
     mediamtx_hls_port: int = 8888
     mediamtx_whep_port: int = 8889
 
+    # --- MediaMTX auth callback ------------------------------------------------
+    # The restreamer runs `authMethod: http` and POSTs every credential check
+    # to this service's /api/v1/mediamtx/auth (see media_auth.py). Browser
+    # preview tickets are Ed25519 JWTs minted by the BFF; this service verifies
+    # them against the BFF's public JWKS, fetched on demand and cached.
+
+    media_auth_jwks_url: str = "http://prahari-bff:8080/api/v1/media/jwks"
+    """Where the BFF publishes the public half of its media-ticket keypair.
+    Unreachable simply means no preview tickets can be verified — machine
+    credentials (worker reads, the reconcile API) are checked locally against
+    `internal_token` and are unaffected."""
+
+    media_auth_jwks_ttl_s: float = 300.0
+    """How long a fetched JWKS is trusted before re-pulling. Bounds how fast a
+    rotated BFF keypair (ephemeral when PRAHARI_MEDIA_JWT_PRIVATE_KEY is unset)
+    takes effect here; a ticket minted under a key this cache has not seen is
+    refused, never silently accepted."""
+
+    media_auth_jwks_timeout_s: float = 5.0
+
     # --- connectivity probe ----------------------------------------------------
 
     probe_allowed_ports: set[int] = {554}

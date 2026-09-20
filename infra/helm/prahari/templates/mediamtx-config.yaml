@@ -19,6 +19,36 @@ data:
     logLevel: info
     logDestinations: [stdout]
 
+    # --- Authentication -----------------------------------------------------
+    #
+    # authMethod is EXCLUSIVE in mediamtx 1.9.x (internal | http | jwt — an
+    # internal-users-plus-JWT hybrid does not exist), so we delegate every
+    # credential check to the registry over HTTP. That one endpoint
+    # (media_auth.py) recognises both shapes the estate needs:
+    #
+    #   * machines  — HTTP basic. Inference workers read with
+    #     `worker:<internal-token>` embedded in the fan-out URL the registry
+    #     hands them; the registry's own reconcile calls the control API as
+    #     `internal:<internal-token>`. The shared secret is the
+    #     `prahari-internal` Secret's `internal-token` key — no second
+    #     credential is minted.
+    #   * browsers  — a short-lived Ed25519 JWT minted by the BFF's audited
+    #     /api/v1/media/preview-ticket. The client sends it as
+    #     `Authorization: Bearer` or `?jwt=`; mediamtx forwards it in the auth
+    #     request's `query` field and the registry verifies it against the
+    #     BFF's public JWKS.
+    #
+    # Metrics are excluded — Prometheus scrapes carry no credentials; the
+    # listener stays cluster-internal regardless (networkpolicy.yaml).
+    # `api` is deliberately NOT excluded: the control API leaks the
+    # credentialed upstream source URLs it is configured with, so it goes
+    # through the same check as everything else.
+    authMethod: http
+    authHTTPAddress: http://prahari-registry:{{ .Values.services.registry.port }}/api/v1/mediamtx/auth
+    authHTTPExclude:
+    - action: metrics
+    - action: pprof
+
     # Read timeouts sized for the reconnect policy: 2s start, 30s cap, jittered.
     readTimeout: 10s
     writeTimeout: 10s

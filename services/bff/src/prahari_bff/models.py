@@ -95,3 +95,20 @@ class ApiKeyCreated(ApiKey):
     plaintext: str
     """Shown exactly once, in the response to the creating request. Not
     recoverable afterward — only the hash is stored."""
+
+
+class PreviewTicketRequest(BaseModel):
+    camera_id: str = Field(min_length=1)
+
+
+class PreviewTicket(BaseModel):
+    """The answer to `POST /api/v1/media/preview-ticket`: a scoped, expiring
+    credential plus where to spend it. `ticket` is the bearer JWT the client
+    presents to MediaMTX (`Authorization: Bearer`, or the `?jwt=` query
+    parameter where a header cannot be set); `whep_url` is the restreamer's
+    browser-reachable WHEP endpoint for this camera's path."""
+
+    camera_id: str
+    ticket: str
+    whep_url: str
+    expires_in: int
