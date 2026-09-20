@@ -124,15 +124,30 @@ enum WatchlistReason {
 }
 
 // Camera health heartbeat, emitted continuously by ingest workers.
+//
+// The vocabulary is the live REST Heartbeat's (`measured_fps`, `loop_epoch`) —
+// that is what workers actually implement, and this message exists so the same
+// report can ride the gRPC/bus transport unchanged. The earlier draft's
+// `observed_fps`/`loop_boundary` fields were removed; their numbers and names
+// are reserved so they can never be silently reused for a different meaning.
 message HealthEvent {
+  reserved 3, 6;
+  reserved "observed_fps", "loop_boundary";
+
   string camera_id = 1;
   google.protobuf.Timestamp emitted_at = 2;
-  float observed_fps = 3;
+
+  // Measured from PTS, never from a reported FPS. Proto3 `optional` because
+  // absence is meaningful: a worker reports no rate until it has seen enough
+  // frames to measure one, and "not yet measured" must not read as zero.
+  optional float measured_fps = 7;
+
   float black_frame_ratio = 4;
   bool tamper_suspected = 5;
 
-  // True when the source recording wrapped. Set so tamper detection can suppress
-  // the abrupt scene cut at a loop point instead of firing on every camera,
-  // every cycle.
-  bool loop_boundary = 6;
+  // Which pass through the source recording this report belongs to. A live
+  // feed loops, so the epoch is a counter, not a flag — motion gating and the
+  // tamper detector are scoped to one epoch and reset across its boundary,
+  // since the background model is invalid after the scene cut.
+  int64 loop_epoch = 8;
 }
