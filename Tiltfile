@@ -27,45 +27,48 @@ allow_k8s_contexts('k3d-prahari')
 # service depends on packages/prahari-common as a uv workspace member, which
 # would sit outside a narrower build context.
 
-docker_build(
-    REGISTRY + '/prahari-registry',
-    context='.',
-    dockerfile='services/registry/Dockerfile',
-    only=[
-        'pyproject.toml',
-        'uv.lock',
-        'packages/prahari-common/',
-        'services/registry/',
-    ],
-    # Sync source without a rebuild. The dependency layer is the slow one and it
-    # does not change when a handler does.
-    live_update=[
-        sync('services/registry/src/', '/app/services/registry/src/'),
-        sync('packages/prahari-common/src/', '/app/packages/prahari-common/src/'),
-        # Migrations are applied on startup under an advisory lock, so a new .sql
-        # file needs the process restarted, not just synced. Restarting is the
-        # correct response — re-running an already-applied migration is a no-op,
-        # and an edited applied migration is rejected by checksum rather than
-        # silently ignored.
-        run('kill -HUP 1', trigger=['services/registry/migrations/']),
-    ],
-)
+# (service values key, image name, build deps that change the image, live_update)
+SERVICES = [
+    ('registry', 'prahari-registry', 'services/registry/'),
+    ('matchEngine', 'prahari-match-engine', 'services/match-engine/'),
+    ('correlation', 'prahari-correlation', 'services/correlation/'),
+    ('bff', 'prahari-bff', 'services/bff/'),
+    ('inference', 'prahari-inference', 'services/inference/'),
+    ('web', 'prahari-web', 'web/'),
+]
 
-docker_build(
-    REGISTRY + '/prahari-inference',
-    context='.',
-    dockerfile='services/inference/Dockerfile',
-    only=[
-        'pyproject.toml',
-        'uv.lock',
-        'packages/prahari-common/',
-        'services/inference/',
-    ],
-    # No live_update. The worker holds open RTSP connections; hot-swapping code
-    # underneath them leaves captures pointing at unloaded modules. A rebuild is
-    # slower and honest — and every reconnect is exercised, which is the one path
-    # that has never met a real disconnect.
-)
+# Every first-party service gets a real image — not just the two that existed
+# when this file was written. A service enabled in the values but unbuilt here
+# ImagePullBackOffs against `dev`-tagged images that were never pushed.
+for svc_key, image, src in SERVICES:
+    deps = ['pyproject.toml', 'uv.lock', src]
+    if svc_key != 'web':
+        deps.append('packages/prahari-common/')
+    if svc_key in ('match-engine', 'matchEngine', 'inference'):
+        deps.append('packages/prahari-proto/')
+    live = []
+    if svc_key == 'registry':
+        # Sync source without a rebuild — the dependency layer is the slow part
+        # and does not change when a handler does. Migrations restart the
+        # process (applied under advisory lock; re-running is a no-op, an edited
+        # applied file is rejected by checksum).
+        live = [
+            sync('services/registry/src/', '/app/services/registry/src/'),
+            sync('packages/prahari-common/src/', '/app/packages/prahari-common/src/'),
+            run('kill -HUP 1', trigger=['services/registry/migrations/']),
+        ]
+    # inference gets no live_update on purpose: the worker holds open RTSP
+    # connections and hot-swapping code under them leaves captures pointing at
+    # unloaded modules. web rebuilds: Next dev-in-docker is slower than the
+    # image build.
+    docker_build(
+        REGISTRY + '/' + image,
+        context='.',
+        dockerfile='services/{}/Dockerfile'.format(src.rstrip('/').split('/')[-1])
+            if svc_key != 'web' else 'web/Dockerfile',
+        only=deps,
+        live_update=live,
+    )
 
 # --- the release -------------------------------------------------------------
 
@@ -77,21 +80,24 @@ helm_resource(
         '--create-namespace',
         '--values', CHART + '/values-' + PROFILE + '.yaml',
         '--set', 'profile=' + PROFILE,
-        '--set', 'global.imageTag=tilt',
     ],
-    image_deps=[
-        REGISTRY + '/prahari-registry',
-        REGISTRY + '/prahari-inference',
-    ],
-    image_keys=[
-        ('global.imageRegistry', 'global.imageTag'),
-        ('global.imageRegistry', 'global.imageTag'),
+    # The chart composes {registry}/prahari-{name}:{tag} from ONE shared pair —
+    # a tuple-keyed image_keys mapping cannot express six different refs into
+    # two keys (the last write wins). services.<key>.image is a full-ref
+    # override in the chart for exactly this; image_json_paths sets each built
+    # image's generated ref into its own service's key.
+    image_deps=[REGISTRY + '/' + image for _, image, _ in SERVICES],
+    image_json_paths=[
+        '{.services.%s.image}' % svc_key for svc_key, _, _ in SERVICES
     ],
     port_forwards=[
-        # The registry API and its OpenAPI page. The BFF fronts this for the
-        # browser; direct access is for curl and for the map before the console
-        # exists.
+        # Direct pod access for curl/debugging. Browser reachability comes from
+        # the LoadBalancer service types the local profile sets (k3d's port
+        # maps hit them); these forwards are the fallback that always works.
         port_forward(8000, 8000, name='registry'),
+        port_forward(8080, 8080, name='bff'),
+        port_forward(3000, 3000, name='web'),
+        port_forward(8889, 8889, name='mediamtx-whep'),
     ],
     labels=['platform'],
 )

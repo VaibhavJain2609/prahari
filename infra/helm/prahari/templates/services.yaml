@@ -33,7 +33,11 @@ spec:
           type: RuntimeDefault
       containers:
         - name: {{ $name }}
-          image: {{ include "prahari.image" (dict "registry" $.Values.global.imageRegistry "name" $name "tag" $.Values.global.imageTag) }}
+          # Per-service `image` is a full-ref override — Tilt injects its
+          # generated refs there (services.<key>.image), since a single
+          # global registry+tag pair cannot express six independently built
+          # images.
+          image: {{ $cfg.image | default (include "prahari.image" (dict "registry" $.Values.global.imageRegistry "name" $name "tag" $.Values.global.imageTag)) }}
           imagePullPolicy: {{ $.Values.global.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
