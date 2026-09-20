@@ -3,6 +3,7 @@ CLUSTER  := prahari
 NAMESPACE := prahari
 CHART    := infra/helm/prahari
 PROFILE  ?= local
+LTARGS   ?= selftest
 
 .PHONY: help
 help: ## Show this help
@@ -118,6 +119,10 @@ internal-secret: ## Create the prahari-internal Secret (service token + credenti
 .PHONY: down
 down: ## Uninstall the platform
 	helm uninstall prahari --namespace $(NAMESPACE)
+
+.PHONY: loadtest
+loadtest: ## Run the load-test harness (infra/loadtest; args via LTARGS, e.g. LTARGS="run --cameras 5,50 --duration-s 60"; default: selftest)
+	cd infra/loadtest && ./run.sh $(LTARGS)
 
 .PHONY: nuke
 nuke: ## Delete the local cluster entirely
