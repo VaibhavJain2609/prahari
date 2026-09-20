@@ -5,6 +5,8 @@ import { useRouter } from "next/navigation";
 import CameraMap from "@/components/CameraMap";
 import Sidebar from "@/components/Sidebar";
 import { api, ApiError, Org, Principal } from "@/lib/api";
+import { useSSEStatus } from "@/lib/alerts";
+import { useTheme } from "@/lib/theme";
 
 // One console, three boards — global, organization, local body — chosen
 // here by the signed-in principal's own org `kind`, never by a client-side
@@ -15,6 +17,8 @@ export default function Home() {
   const [principal, setPrincipal] = useState<Principal | null>(null);
   const [org, setOrg] = useState<Org | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const { theme, toggle } = useTheme();
+  const sse = useSSEStatus();
 
   useEffect(() => {
     let cancelled = false;
@@ -27,6 +31,8 @@ export default function Home() {
         setOrg(orgs.find((o) => o.id === me.org_id) ?? null);
       } catch (err) {
         if (cancelled) return;
+        // A 401 already triggered the global redirect to /login inside
+        // api.ts; this is the fallback for every other failure.
         if (err instanceof ApiError && err.status === 401) {
           router.replace("/login");
           return;
@@ -53,19 +59,41 @@ export default function Home() {
             {org ? `${boardLabel(org.kind)} — ${org.name}` : "Gujarat Sentinel"}
           </span>
         </div>
-        {principal && (
-          <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
-            <span>
-              {principal.subject} · {principal.role}
-            </span>
-            <button
-              onClick={onLogout}
-              className="rounded border border-slate-300 px-2 py-1 text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
-            >
-              Sign out
-            </button>
-          </div>
-        )}
+        <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
+          <span
+            role="status"
+            aria-label={`alert stream ${sseLabel(sse)}`}
+            title={`Alert stream: ${sseLabel(sse)}`}
+            className={`inline-block h-2 w-2 rounded-full ${
+              sse === "open"
+                ? "bg-emerald-500"
+                : sse === "connecting" || sse === "error"
+                  ? "bg-amber-500"
+                  : "bg-red-500"
+            }`}
+          />
+          <button
+            onClick={toggle}
+            aria-label={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+            title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+            className="rounded border border-slate-300 px-2 py-1 text-slate-700 hover:bg-slate-100 focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+          >
+            {theme === "dark" ? "Light" : "Dark"}
+          </button>
+          {principal && (
+            <>
+              <span>
+                {principal.subject} · {principal.role}
+              </span>
+              <button
+                onClick={onLogout}
+                className="rounded border border-slate-300 px-2 py-1 text-slate-700 hover:bg-slate-100 focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+              >
+                Sign out
+              </button>
+            </>
+          )}
+        </div>
       </header>
       <div className="flex flex-1 overflow-hidden">
         <main className="flex-1">
@@ -87,4 +115,11 @@ function boardLabel(kind: Org["kind"]): string {
   if (kind === "state") return "Statewide";
   if (kind === "organization") return "Organization";
   return "Local body";
+}
+
+function sseLabel(state: ReturnType<typeof useSSEStatus>): string {
+  if (state === "open") return "live";
+  if (state === "connecting") return "connecting";
+  if (state === "error") return "reconnecting";
+  return "unavailable";
 }

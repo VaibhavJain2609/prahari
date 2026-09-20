@@ -48,18 +48,21 @@ function CreateOrg({ parentId }: { parentId: string }) {
         value={name}
         onChange={(e) => setName(e.target.value)}
         placeholder="display name"
-        className="w-full rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-800"
+        aria-label="Display name"
+        className="w-full rounded border border-slate-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500"
       />
       <input
         value={label}
         onChange={(e) => setLabel(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, "_"))}
         placeholder="path label (e.g. zone_4)"
-        className="w-full rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-800"
+        aria-label="Path label"
+        className="w-full rounded border border-slate-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500"
       />
       <select
         value={kind}
         onChange={(e) => setKind(e.target.value as OrgKind)}
-        className="w-full rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-800"
+        aria-label="Org kind"
+        className="w-full rounded border border-slate-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500"
       >
         <option value="organization">organization</option>
         <option value="local_body">local body</option>
@@ -67,7 +70,7 @@ function CreateOrg({ parentId }: { parentId: string }) {
       <button
         type="submit"
         disabled={busy || !label.trim() || !name.trim()}
-        className="rounded bg-slate-900 px-3 py-1 text-xs font-medium text-white disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900"
+        className="rounded bg-slate-900 px-3 py-1 text-xs font-medium text-white disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-slate-400 dark:bg-slate-100 dark:text-slate-900"
       >
         {busy ? "Creating…" : "Create org"}
       </button>
@@ -112,25 +115,29 @@ function CreateUser({ defaultOrgId }: { defaultOrgId: string }) {
         value={username}
         onChange={(e) => setUsername(e.target.value)}
         placeholder="username"
-        className="w-full rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-800"
+        aria-label="Username"
+        className="w-full rounded border border-slate-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500"
       />
       <input
         type="password"
         value={password}
         onChange={(e) => setPassword(e.target.value)}
         placeholder="password"
-        className="w-full rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-800"
+        aria-label="Password"
+        className="w-full rounded border border-slate-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500"
       />
       <input
         value={orgId}
         onChange={(e) => setOrgId(e.target.value)}
         placeholder="org id"
-        className="w-full rounded border border-slate-300 px-2 py-1 font-mono text-[11px] dark:border-slate-700 dark:bg-slate-800"
+        aria-label="Org ID"
+        className="w-full rounded border border-slate-300 px-2 py-1 font-mono text-[11px] focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500"
       />
       <select
         value={role}
         onChange={(e) => setRole(e.target.value as Role)}
-        className="w-full rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-800"
+        aria-label="Role"
+        className="w-full rounded border border-slate-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500"
       >
         <option value="viewer">viewer</option>
         <option value="operator">operator</option>
@@ -139,7 +146,7 @@ function CreateUser({ defaultOrgId }: { defaultOrgId: string }) {
       <button
         type="submit"
         disabled={busy || !username.trim() || !password}
-        className="rounded bg-slate-900 px-3 py-1 text-xs font-medium text-white disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900"
+        className="rounded bg-slate-900 px-3 py-1 text-xs font-medium text-white disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-slate-400 dark:bg-slate-100 dark:text-slate-900"
       >
         {busy ? "Creating…" : "Create user"}
       </button>
@@ -185,12 +192,14 @@ function CreateApiKey({ defaultOrgId }: { defaultOrgId: string }) {
         value={orgId}
         onChange={(e) => setOrgId(e.target.value)}
         placeholder="org id"
-        className="w-full rounded border border-slate-300 px-2 py-1 font-mono text-[11px] dark:border-slate-700 dark:bg-slate-800"
+        aria-label="Org ID"
+        className="w-full rounded border border-slate-300 px-2 py-1 font-mono text-[11px] focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500"
       />
       <select
         value={role}
         onChange={(e) => setRole(e.target.value as Role)}
-        className="w-full rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-800"
+        aria-label="Role"
+        className="w-full rounded border border-slate-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500"
       >
         <option value="viewer">viewer</option>
         <option value="operator">operator</option>
@@ -199,7 +208,8 @@ function CreateApiKey({ defaultOrgId }: { defaultOrgId: string }) {
       <select
         value={purpose}
         onChange={(e) => setPurpose(e.target.value as ApiKeyPurpose)}
-        className="w-full rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-800"
+        aria-label="Key purpose"
+        className="w-full rounded border border-slate-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500"
       >
         <option value="local_body_registration">local body registration</option>
         <option value="onvif_agent">ONVIF agent</option>
@@ -210,12 +220,13 @@ function CreateApiKey({ defaultOrgId }: { defaultOrgId: string }) {
         value={label}
         onChange={(e) => setLabel(e.target.value)}
         placeholder="label"
-        className="w-full rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-800"
+        aria-label="Key label"
+        className="w-full rounded border border-slate-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500"
       />
       <button
         type="submit"
         disabled={busy || !label.trim()}
-        className="rounded bg-slate-900 px-3 py-1 text-xs font-medium text-white disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900"
+        className="rounded bg-slate-900 px-3 py-1 text-xs font-medium text-white disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-slate-400 dark:bg-slate-100 dark:text-slate-900"
       >
         {busy ? "Creating…" : "Create key"}
       </button>
