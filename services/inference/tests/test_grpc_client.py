@@ -138,7 +138,7 @@ class TestSendDetections:
         calls: list[dict] = []
 
         class _RecordingStub:
-            def StreamDetections(self, request_iterator, timeout=None):
+            def StreamDetections(self, request_iterator, timeout=None, metadata=None):
                 calls.append({"timeout": timeout})
                 list(request_iterator)
                 return SimpleNamespace(ack=adapter_pb2.IngestAck(accepted=1, rejected=0, detail=""))

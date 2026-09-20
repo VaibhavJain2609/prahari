@@ -14,8 +14,9 @@ help: ## Show this help
 .PHONY: proto
 proto: ## Regenerate protobuf stubs from proto/
 	# Python stubs land in packages/prahari-proto/ (an installable workspace
-	# package, because generated protobuf imports are absolute); TypeScript in
-	# gen/ts for the Next.js build. Both are gitignored — the contract is the
+	# package, because generated protobuf imports are absolute). The TS target
+	# was dropped — the web console consumes REST/SSE, not generated stubs.
+	# Stubs are gitignored — the contract is the
 	# .proto file. A fresh clone must run this before the imports resolve.
 	cd proto && buf generate
 

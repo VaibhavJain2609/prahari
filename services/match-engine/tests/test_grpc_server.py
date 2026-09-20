@@ -295,9 +295,9 @@ class TestServe:
         captured: dict = {}
         real_server = grpc.server
 
-        def _spy(executor, options=None):  # noqa: ANN001, ANN202
+        def _spy(executor, options=None, interceptors=()):  # noqa: ANN001, ANN202
             captured["options"] = dict(options or [])
-            return real_server(executor, options=options)
+            return real_server(executor, options=options, interceptors=interceptors)
 
         monkeypatch.setattr("prahari_match.grpc_server.grpc.server", _spy)
 

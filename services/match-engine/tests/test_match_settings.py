@@ -82,16 +82,6 @@ _DELIBERATELY_INTERNAL = {
         "a memory/retention safety cap on the higher-rate stream, not something a "
         "profile tunes -- same reasoning as dedup_max_entries"
     ),
-    # TRANSITIONAL, not a real deliberately-internal field: `internal_token` is
-    # meant to be chart-exposed, and the Helm change that wires
-    # PRAHARI_MATCH_INTERNAL_TOKEN is a separate in-flight workstream. It is
-    # listed here only so this field can land before the env does -- the
-    # overlap assertion below forces this entry out the moment the chart sets
-    # the name, which is exactly the bookkeeping this test exists for.
-    "internal_token": (
-        "transitional: becomes chart-exposed as PRAHARI_MATCH_INTERNAL_TOKEN "
-        "when the internal-token chart wiring lands -- remove this entry then"
-    ),
 }
 
 

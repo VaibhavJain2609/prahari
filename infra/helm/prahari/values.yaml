@@ -206,6 +206,8 @@ inference:
   # Overridden per profile. See values-local.yaml / values-gpu.yaml.
   model: yolov8n.pt
   decodeBackend: cpu          # cpu | videotoolbox | nvdec
+  device: cpu                 # cpu | cuda | mps — model device, never sniffed
+  metricsPort: 9090           # worker /metrics endpoint; 0 disables
   samplingFps: 2              # never native rate — most CCTV frames are static
   maxStreamsPerWorker: 5
   batchSize: 4                # batch ACROSS cameras, not within one

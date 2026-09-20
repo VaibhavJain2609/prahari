@@ -49,7 +49,12 @@ historical casualties of putting speculative knobs here:
     match-engine and correlation take theirs as PRAHARI_MATCH_REDIS_URL /
     PRAHARI_CORRELATION_REDIS_URL. It lives in bffEnv now.
 */}}
-{{- define "prahari.commonEnv" -}}
+{{/*
+Database env — only for services that open a Postgres connection (registry
+and bff). Emitted into the worker/match-engine/correlation pods it would be a
+dead env, which the chart↔settings parity test now fails on.
+*/}}
+{{- define "prahari.databaseEnv" -}}
 - name: PRAHARI_DATABASE_URL
   value: "postgresql://{{ .Values.postgres.user }}:$(POSTGRES_PASSWORD)@prahari-postgres:5432/{{ .Values.postgres.database }}"
 - name: POSTGRES_PASSWORD
@@ -61,6 +66,9 @@ historical casualties of putting speculative knobs here:
       # don't touch Postgres must still start in that configuration. When
       # postgres.enabled, a missing Secret SHOULD fail loudly.
       optional: {{ not .Values.postgres.enabled }}
+{{- end -}}
+
+{{- define "prahari.commonEnv" -}}
 {{- end -}}
 
 {{/*
@@ -93,6 +101,7 @@ it still comes up — the registry logs the absence loudly and serves the map,
 because a missing credential must not take down camera health as well as sync.
 */}}
 {{- define "prahari.registryEnv" -}}
+{{- include "prahari.databaseEnv" . }}
 - name: PRAHARI_CATALOGUE_SOURCE
   value: {{ .Values.registry.catalogueSource | quote }}
 - name: PRAHARI_SYNC_ENABLED
@@ -179,11 +188,10 @@ deliberately-internal allowlist (M3 found the reverse direction matters:
 `PRAHARI_MATCH_REDIS_URL` was missing here and alerts silently never reached
 the shared Redis bus in any deployed profile).
 
-NOTE — no PRAHARI_MATCH_ internal-token env here on purpose: MatchSettings has
-no `internal_token` field today, and that parity test fails on any
-PRAHARI_MATCH_* name without one. When the field lands (to authenticate
-worker→match-engine gRPC, or to let this service call a gated registry), wire
-it to secret `prahari-internal` key `internal-token`.
+PRAHARI_MATCH_INTERNAL_TOKEN gates the HTTP admin surface AND the
+MetadataIngestService gRPC port (the InternalTokenInterceptor). Same shared
+Secret key as the registry's gate — every service reads the same value so a
+rotation is one Secret update, not five.
 
 Note what else is absent: no gateway credential. The match engine sees plate
 strings, never pixels and never the feed, so it has no business holding the
@@ -215,6 +223,12 @@ password.
 # /api/v1/alerts.
 - name: PRAHARI_MATCH_REDIS_URL
   value: "redis://prahari-redis:6379"
+- name: PRAHARI_MATCH_INTERNAL_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: prahari-internal
+      key: internal-token
+      optional: true
 {{- end -}}
 
 {{/*
@@ -224,10 +238,10 @@ redis_url unset means "the detection consumer never starts" and /readyz says so
 honestly — so it is set here, pointed at the same Redis the match engine
 publishes `prahari:detections` on.
 
-NOTE — CorrelationSettings has no `internal_token` field yet. When it gains one
-(the service calls the registry for camera locations, and a gated registry will
-401 it), wire PRAHARI_CORRELATION_INTERNAL_TOKEN to secret `prahari-internal`
-key `internal-token`.
+Two token fields, same Secret key: INTERNAL_TOKEN gates this service's own
+/api/* (route reconstruction is surveillance capability — it must not be
+callable by any pod that can reach the Service), and REGISTRY_INTERNAL_TOKEN
+is what it sends to a gated registry for camera-location lookups.
 */}}
 {{- define "prahari.correlationEnv" -}}
 - name: PRAHARI_CORRELATION_HTTP_PORT
@@ -236,6 +250,18 @@ key `internal-token`.
   value: "redis://prahari-redis:6379"
 - name: PRAHARI_CORRELATION_REGISTRY_BASE_URL
   value: "http://prahari-registry:{{ .Values.services.registry.port }}"
+- name: PRAHARI_CORRELATION_INTERNAL_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: prahari-internal
+      key: internal-token
+      optional: true
+- name: PRAHARI_CORRELATION_REGISTRY_INTERNAL_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: prahari-internal
+      key: internal-token
+      optional: true
 {{- end -}}
 
 {{/*
@@ -246,6 +272,7 @@ registry, relays alerts off Redis Streams, and owns the hash-chained audit log
 — which is why it is the one Deployment with a persistent volume.
 */}}
 {{- define "prahari.bffEnv" -}}
+{{- include "prahari.databaseEnv" . }}
 - name: PRAHARI_REGISTRY_BASE_URL
   value: "http://prahari-registry:{{ .Values.services.registry.port }}"
 - name: PRAHARI_CORRELATION_BASE_URL

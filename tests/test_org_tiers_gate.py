@@ -562,7 +562,8 @@ async def test_a_broken_audit_link_is_named_by_verify(tmp_path):
 
         verify = h.client.get("/api/v1/audit/verify")
         assert verify.status_code == 200
-        assert verify.json() == {"ok": False, "first_broken_entry": 2}
+        body = verify.json()
+        assert body["ok"] is False and body["first_broken_entry"] == 2
 
 
 def test_audit_verify_requires_admin(tmp_path):

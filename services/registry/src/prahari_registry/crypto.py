@@ -50,8 +50,7 @@ def _load_key(key_b64: str) -> bytes:
         raise CredentialKeyError("PRAHARI_CREDENTIAL_KEY is not valid base64") from exc
     if len(key) != _KEY_LEN:
         raise CredentialKeyError(
-            f"PRAHARI_CREDENTIAL_KEY must decode to {_KEY_LEN} bytes (AES-256), "
-            f"got {len(key)}"
+            f"PRAHARI_CREDENTIAL_KEY must decode to {_KEY_LEN} bytes (AES-256), got {len(key)}"
         )
     return key
 

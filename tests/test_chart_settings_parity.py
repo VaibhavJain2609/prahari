@@ -83,82 +83,12 @@ _THIRD_PARTY_TEMPLATES = ("infra.yaml", "mediamtx-config.yaml")
 
 # The exact set of dead env names as of this branch, per deployment. See the
 # module docstring: this must shrink to empty as the chart fix lands.
-_KNOWN_DRIFT: dict[str, frozenset[str]] = {
-    # commonEnv is emitted into every service-loop deployment. On the
-    # registry itself only PRAHARI_DATABASE_URL resolves (PRAHARI_ +
-    # `database_url`); the bus kind, Redis URL, registry URL, audit knobs and
-    # the profile label are written into the pod but read by nothing.
-    "registry": frozenset(
-        {
-            "PRAHARI_AUDIT_ENABLED",
-            "PRAHARI_AUDIT_REQUIRE_PURPOSE",
-            "PRAHARI_BUS_KIND",
-            "PRAHARI_PROFILE",
-            "PRAHARI_REDIS_URL",
-            "PRAHARI_REGISTRY_URL",
-        }
-    ),
-    # MatchSettings' prefix is PRAHARI_MATCH_, so ALL of commonEnv is dead on
-    # the match engine — including PRAHARI_REDIS_URL, which is exactly why
-    # `PRAHARI_MATCH_REDIS_URL` had to be added separately (M3's bug class).
-    "match-engine": frozenset(
-        {
-            "PRAHARI_AUDIT_ENABLED",
-            "PRAHARI_AUDIT_REQUIRE_PURPOSE",
-            "PRAHARI_BUS_KIND",
-            "PRAHARI_DATABASE_URL",
-            "PRAHARI_PROFILE",
-            "PRAHARI_REDIS_URL",
-            "PRAHARI_REGISTRY_URL",
-        }
-    ),
-    # The chart sets no PRAHARI_CORRELATION_* at all, so commonEnv is fully
-    # dead here — and CorrelationSettings.redis_url stays None in every
-    # deployed profile, meaning the detection consumer never starts. Same
-    # silent-no-transport failure mode M3 found on the match engine.
-    "correlation": frozenset(
-        {
-            "PRAHARI_AUDIT_ENABLED",
-            "PRAHARI_AUDIT_REQUIRE_PURPOSE",
-            "PRAHARI_BUS_KIND",
-            "PRAHARI_DATABASE_URL",
-            "PRAHARI_PROFILE",
-            "PRAHARI_REDIS_URL",
-            "PRAHARI_REGISTRY_URL",
-        }
-    ),
-    # The BFF's prefix is PRAHARI_, so PRAHARI_DATABASE_URL and
-    # PRAHARI_REDIS_URL do resolve (database_url, redis_url). The rest of
-    # commonEnv does not — note PRAHARI_REGISTRY_URL in particular is dead:
-    # the field is `registry_base_url` (PRAHARI_REGISTRY_BASE_URL), so the
-    # BFF's registry address is not actually chart-set today.
-    "bff": frozenset(
-        {
-            "PRAHARI_AUDIT_ENABLED",
-            "PRAHARI_AUDIT_REQUIRE_PURPOSE",
-            "PRAHARI_BUS_KIND",
-            "PRAHARI_PROFILE",
-            "PRAHARI_REGISTRY_URL",
-        }
-    ),
-    # All of commonEnv is dead on the worker (its prefixes are
-    # PRAHARI_INGEST_/PRAHARI_DETECT_/PRAHARI_GATEWAY_), plus the two
-    # PRAHARI_MEDIAMTX_* base URLs inference.yaml sets directly — no service
-    # reads a PRAHARI_MEDIAMTX_-prefixed settings class.
-    "inference": frozenset(
-        {
-            "PRAHARI_AUDIT_ENABLED",
-            "PRAHARI_AUDIT_REQUIRE_PURPOSE",
-            "PRAHARI_BUS_KIND",
-            "PRAHARI_DATABASE_URL",
-            "PRAHARI_MEDIAMTX_HLS",
-            "PRAHARI_MEDIAMTX_RTSP",
-            "PRAHARI_PROFILE",
-            "PRAHARI_REDIS_URL",
-            "PRAHARI_REGISTRY_URL",
-        }
-    ),
-}
+# Reached EMPTY on the Wave-A merge: the chart-parity fix deleted or wired
+# every dead env this list used to name (PRAHARI_BUS_KIND, PRAHARI_PROFILE,
+# PRAHARI_AUDIT_*, PRAHARI_REGISTRY_URL, PRAHARI_MEDIAMTX_RTSP/HLS, and the
+# absent correlation envs). It must stay empty — any entry reappearing here
+# is a regression, not a backlog item.
+_KNOWN_DRIFT: dict[str, frozenset[str]] = {}
 
 
 def _read(template: str) -> str:
@@ -166,13 +96,29 @@ def _read(template: str) -> str:
 
 
 def _env_helper_blocks() -> dict[str, set[str]]:
-    """define-block name -> PRAHARI_* env names it emits, for every `*Env`
-    helper in _helpers.tpl."""
-    return {
-        name: set(_ENV_NAME.findall(body))
+    """define-block name -> every PRAHARI_* env name it emits, for every
+    `*Env` helper in _helpers.tpl. Nested `include "prahari.XEnv"` calls are
+    expanded transitively — a shared sub-block (e.g. databaseEnv inside
+    registryEnv) counts toward every block that includes it."""
+    raw = {
+        name: body
         for name, body in _DEFINE_BLOCK.findall(_read("_helpers.tpl"))
         if name.endswith("Env")
     }
+    blocks: dict[str, set[str]] = {}
+
+    def expand(name: str, seen: frozenset[str] = frozenset()) -> set[str]:
+        if name in seen:
+            return set()  # a template cannot include itself — don't loop
+        body = raw.get(name, "")
+        names = set(_ENV_NAME.findall(body))
+        for sub in re.findall(r'include "prahari\.(\w+)"', body):
+            names |= expand(sub, seen | {name})
+        return names
+
+    for name in raw:
+        blocks[name] = expand(name)
+    return blocks
 
 
 def _service_loop_names(services_yaml: str) -> list[str]:
@@ -237,10 +183,15 @@ def test_every_env_helper_block_is_included_by_a_template():
     the parity check — the parse must prove each block is wired in."""
     blocks = _env_helper_blocks()
     assert blocks, "found no prahari.*Env define blocks in _helpers.tpl"
+    # Includes may come from a template OR from another helper block — a
+    # shared sub-block like databaseEnv is wired in via registryEnv/bffEnv.
     included = {
         name
-        for template in _TEMPLATES.glob("*.yaml")
-        for name in re.findall(r'include "prahari\.(\w+)"', template.read_text())
+        for path in _TEMPLATES.glob("*.yaml")
+        for name in re.findall(r'include "prahari\.(\w+)"', path.read_text())
+    } | {
+        name
+        for name in re.findall(r'include "prahari\.(\w+)"', _read("_helpers.tpl"))
     }
     orphan = set(blocks) - included
     assert not orphan, f"env helper block(s) never included by any template: {orphan}"

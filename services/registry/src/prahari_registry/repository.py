@@ -209,9 +209,7 @@ class CameraRepository:
         )
         return camera_from_row(row, self._s) if row else None
 
-    async def get_by_external(
-        self, source: str, external_id: str, *, scope: str
-    ) -> Camera | None:
+    async def get_by_external(self, source: str, external_id: str, *, scope: str) -> Camera | None:
         row = await self._pool.fetchrow(
             """
             SELECT cc.* FROM camera_current cc
@@ -320,9 +318,7 @@ class CameraRepository:
         return str(row) if row is not None else None
 
     async def org_path_for_id(self, org_id: str) -> str | None:
-        row = await self._pool.fetchval(
-            "SELECT path::text FROM orgs WHERE id = $1::uuid", org_id
-        )
+        row = await self._pool.fetchval("SELECT path::text FROM orgs WHERE id = $1::uuid", org_id)
         return row
 
     async def _resolve_org(self, org_id: str | None) -> tuple[str, str]:
@@ -440,7 +436,7 @@ class CameraRepository:
 
         row = await self._pool.fetchrow(
             f"""
-            UPDATE cameras SET {', '.join(sets)}
+            UPDATE cameras SET {", ".join(sets)}
             WHERE id = ${len(args) - 1}::uuid
               AND org_id IN (SELECT id FROM orgs WHERE path <@ ${len(args)}::ltree)
             RETURNING id

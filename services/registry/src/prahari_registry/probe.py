@@ -95,13 +95,7 @@ def _guard_ip(ip_str: str) -> None:
     mapped = ip.ipv4_mapped if isinstance(ip, ipaddress.IPv6Address) else None
     if mapped is not None:
         _guard_ip(str(mapped))
-    if (
-        ip.is_link_local
-        or ip.is_loopback
-        or ip.is_multicast
-        or ip.is_unspecified
-        or ip.is_reserved
-    ):
+    if ip.is_link_local or ip.is_loopback or ip.is_multicast or ip.is_unspecified or ip.is_reserved:
         raise SSRFBlockedError(f"resolved address {ip_str} is not a permitted probe target")
 
 
@@ -109,9 +103,7 @@ def _guard_port(port: int, allowed_ports: Iterable[int]) -> None:
     """Second SSRF leg: the IP may be a legitimate DVR address and the port
     still be a Redis or a metadata sidecar living on it."""
     if port not in allowed_ports:
-        raise SSRFBlockedError(
-            f"port {port} is not in the probe allowlist {sorted(allowed_ports)}"
-        )
+        raise SSRFBlockedError(f"port {port} is not in the probe allowlist {sorted(allowed_ports)}")
 
 
 async def _resolve_pinned_ip(host: str) -> str:

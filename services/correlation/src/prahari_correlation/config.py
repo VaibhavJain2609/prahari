@@ -25,7 +25,7 @@ class CorrelationSettings(BaseSettings):
 
     # --- HTTP surface ----------------------------------------------------
 
-    http_port: int = 8003
+    http_port: int = 8002
 
     # --- detections bus (DAY3-DESIGN.md §3.1) -----------------------------
 
@@ -100,7 +100,7 @@ class CorrelationSettings(BaseSettings):
 
     # --- registry client -----------------------------------------------------
 
-    registry_base_url: str = "http://registry:8000"
+    registry_base_url: str = "http://prahari-registry:8000"
     registry_timeout_s: float = 5.0
 
     registry_internal_token: str = ""

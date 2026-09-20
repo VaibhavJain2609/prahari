@@ -76,10 +76,24 @@ spec:
             # fanout_rtsp_url), so the old PRAHARI_MEDIAMTX_RTSP/_HLS fallbacks
             # here were dead env — deleted, not re-pointed.
             #
-            # NOTE: no PRAHARI_INGEST_INTERNAL_TOKEN yet — IngestSettings has no
-            # internal_token field. When it lands (to authenticate worker
-            # heartbeats against a gated registry), wire it to secret
-            # `prahari-internal` key `internal-token`.
+            # One token authenticates the worker to BOTH gated peers —
+            # X-Internal-Token on registry heartbeats/assignments and
+            # x-internal-token metadata on the match-engine gRPC stream.
+            # optional:true so a local profile without the Secret still runs
+            # (empty token = enforcement off, warned at startup).
+            - name: PRAHARI_INGEST_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: prahari-internal
+                  key: internal-token
+                  optional: true
+            # Model device — selected here, never sniffed at runtime. The gpu
+            # profile sets cuda; local stays cpu.
+            - name: PRAHARI_DETECT_DEVICE
+              value: {{ .Values.inference.device | quote }}
+            # Plaintext /metrics endpoint for the worker counters. 0 = off.
+            - name: PRAHARI_INGEST_METRICS_PORT
+              value: {{ .Values.inference.metricsPort | quote }}
           resources:
             {{- toYaml .Values.inference.resources | nindent 12 }}
           # No HTTP probe: a worker serves no traffic and has no port to GET.

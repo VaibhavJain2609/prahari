@@ -75,7 +75,7 @@ class BFFSettings(BaseSettings):
 
     # --- correlation ---------------------------------------------------------
 
-    correlation_base_url: str = "http://prahari-correlation:8003"
+    correlation_base_url: str = "http://prahari-correlation:8002"
     correlation_timeout_s: float = 10.0
     """Route reconstruction walks more rows than a camera lookup; the plate
     export endpoint (the mandatory submission path) gets a longer budget."""

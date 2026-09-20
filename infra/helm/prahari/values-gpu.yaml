@@ -33,6 +33,7 @@ inference:
   replicas: 2
   model: yolov8s.pt
   decodeBackend: nvdec        # hardware decode — the single biggest lever
+  device: cuda                # model device for the GPU profile
   samplingFps: 4
   maxStreamsPerWorker: 50     # WORKING ESTIMATE — replace with the measured value
   batchSize: 16               # batch across cameras: worth 3-5x over per-frame
