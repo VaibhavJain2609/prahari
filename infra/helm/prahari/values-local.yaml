@@ -9,6 +9,19 @@ profile: local
 
 # The bus is Redis Streams; a Redpanda switch is deferred (see values.yaml).
 
+# auth.kind stays `builtin` locally on purpose: a plain `make up` keeps the
+# password login and bootstrap admin untouched, and the console IA is unchanged
+# until the web SSO work lands. To try Keycloak end-to-end:
+#   helm upgrade prahari infra/helm/prahari -f infra/helm/prahari/values-local.yaml \
+#     --set auth.kind=keycloak --set auth.keycloak.enabled=true
+# plus the prahari-oidc Secret and a port-forward — docs/KEYCLOAK.md has the
+# full walkthrough.
+auth:
+  kind: builtin
+  redirectBase: http://localhost:3000
+  # keycloak:
+  #   enabled: true   # renders the in-chart dev IdP (start-dev, admin/admin)
+
 postgres:
   storage: 5Gi
 

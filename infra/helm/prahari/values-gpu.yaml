@@ -8,6 +8,16 @@
 
 profile: gpu
 
+# auth.kind stays `builtin` until a real external IdP exists. When it does:
+# kind=keycloak + keycloak.url — the in-chart Keycloak is a start-dev laptop
+# IdP and must NEVER render under this profile. docs/KEYCLOAK.md.
+# auth:
+#   kind: keycloak
+#   redirectBase: https://console.example.gov.in
+#   keycloak:
+#     url: https://sso.example.gov.in
+#     enabled: false
+
 # global.imageRegistry must be set to a registry the cloud cluster can pull
 # from (a real ECR/GAR/etc. endpoint) — localhost:5555 is the k3d registry and
 # does not exist off the laptop.

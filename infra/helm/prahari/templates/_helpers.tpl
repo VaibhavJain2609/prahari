@@ -329,6 +329,34 @@ registry, relays alerts off Redis Streams, and owns the hash-chained audit log
       name: prahari-bff-bootstrap
       key: admin-password
       optional: true
+{{- if eq .Values.auth.kind "keycloak" }}
+# --- oidc: emitted only when auth.kind=keycloak -----------------------------
+# All BFFSettings.oidc_* fields. The ISSUER is the public realm base — what the
+# browser navigates to for authorize/logout AND what `iss` must equal
+# (KC_HOSTNAME pins it). INTERNAL is where the pod's token exchange and JWKS
+# fetch actually go: the in-chart Service name locally, the same external URL
+# when auth.keycloak.url is set. The client secret is out of band, same pattern
+# as prahari-gateway:
+#   kubectl create secret generic prahari-oidc --from-literal=client-secret=...
+# optional: true so the pods still boot before the Secret exists — OIDC login
+# then fails at the token exchange, loudly, while builtin login is unaffected.
+- name: PRAHARI_OIDC_ENABLED
+  value: "true"
+- name: PRAHARI_OIDC_ISSUER_URL
+  value: {{ include "prahari.oidcIssuer" . | quote }}
+- name: PRAHARI_OIDC_INTERNAL_URL
+  value: {{ include "prahari.oidcInternalIssuer" . | quote }}
+- name: PRAHARI_OIDC_CLIENT_ID
+  value: {{ .Values.auth.keycloak.clientId | quote }}
+- name: PRAHARI_OIDC_CLIENT_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: prahari-oidc
+      key: client-secret
+      optional: true
+- name: PRAHARI_OIDC_REDIRECT_BASE
+  value: {{ required "auth.redirectBase must be set when auth.kind=keycloak" .Values.auth.redirectBase | quote }}
+{{- end }}
 {{- end -}}
 
 {{/*
@@ -338,4 +366,31 @@ in-cluster (web/src/app/api/bff/[...path]/route.ts reads PRAHARI_BFF_URL).
 {{- define "prahari.webEnv" -}}
 - name: PRAHARI_BFF_URL
   value: "http://prahari-bff:{{ .Values.services.bff.port }}"
+{{- end -}}
+
+{{/*
+oidc: the PUBLIC realm issuer — what the browser navigates to (authorize,
+RP-initiated logout) and what `iss` must equal. Keycloak pins iss to
+KC_HOSTNAME, which the keycloak.yaml deployment sets to auth.keycloak.publicUrl;
+an external IdP (auth.keycloak.url) is already its own public name.
+*/}}
+{{- define "prahari.oidcIssuer" -}}
+{{- if .Values.auth.keycloak.url -}}
+{{- printf "%s/realms/%s" (.Values.auth.keycloak.url | trimSuffix "/") .Values.auth.keycloak.realm -}}
+{{- else -}}
+{{- printf "%s/realms/%s" (.Values.auth.keycloak.publicUrl | trimSuffix "/") .Values.auth.keycloak.realm -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+oidc: the INTERNAL realm base — where the BFF pod's token exchange and JWKS
+fetch go. Equal to the public issuer when one URL serves both (external IdP);
+the in-chart Service name for the local dev deployment.
+*/}}
+{{- define "prahari.oidcInternalIssuer" -}}
+{{- if .Values.auth.keycloak.url -}}
+{{- printf "%s/realms/%s" (.Values.auth.keycloak.url | trimSuffix "/") .Values.auth.keycloak.realm -}}
+{{- else -}}
+{{- printf "http://prahari-keycloak:8080/realms/%s" .Values.auth.keycloak.realm -}}
+{{- end -}}
 {{- end -}}

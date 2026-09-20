@@ -246,3 +246,51 @@ networkPolicies:
   # enforceable the day the cluster runs a CNI that is — check the probe
   # caveat in that file before enabling on such a CNI.
   enabled: true
+
+# --- auth --------------------------------------------------------------------
+
+# Console authentication, switched like a deployment knob (`kind`), mirroring
+# the `bus.kind` convention. `builtin` is the argon2 + prahari_session login
+# that already exists — it stays the default in EVERY profile so a plain
+# `make up` changes nothing and the bootstrap admin remains the break-glass
+# path during an IdP outage. `keycloak` puts the console on OIDC
+# Authorization Code + PKCE: the BFF does the code exchange server-side and
+# still mints the same session cookie, so the console downstream is unchanged.
+# See docs/KEYCLOAK.md.
+auth:
+  kind: builtin # builtin | keycloak
+
+  # Public origin of the console — Keycloak sends the browser back to
+  # `{redirectBase}/api/bff/auth/oidc/callback`, which the console's own BFF
+  # proxy forwards here. Required when kind=keycloak (the template fails
+  # loudly without it rather than rendering a redirect to nowhere); unused
+  # under builtin.
+  redirectBase: ""
+
+  keycloak:
+    # The IN-CHART dev IdP — rendered only when kind=keycloak AND url is
+    # empty. It runs `start-dev` (H2, no TLS, bootstrap admin/admin): a
+    # laptop-profile convenience, never a production IdP. The gpu profile
+    # points `url` at a real external Keycloak and leaves this off.
+    enabled: false
+    image: keycloak/keycloak:26.7
+    realm: prahari
+    # External Keycloak base URL (browser-reachable AND pod-reachable) —
+    # e.g. https://sso.example.gov.in. Empty means "use the in-chart
+    # deployment". When set, keycloak.enabled is ignored.
+    url: ""
+    # Browser-facing base of the in-chart deployment. The browser and the BFF
+    # pod reach the realm through different URLs, and Keycloak pins `iss` to
+    # this public one (KC_HOSTNAME); the BFF uses the Service name for the
+    # token/JWKS calls. The default expects
+    # `kubectl port-forward svc/prahari-keycloak 8081:8080`.
+    publicUrl: http://localhost:8081
+    # The one confidential client the BFF exchanges codes as. Its secret is
+    # NEVER here — it comes from the out-of-band `prahari-oidc` Secret
+    # (`kubectl create secret generic prahari-oidc
+    #   --from-literal=client-secret=...`), matching the realm import's
+    # dev-only value for the in-chart IdP.
+    clientId: prahari-bff
+    resources:
+      requests: { cpu: 250m, memory: 768Mi }
+      limits:   { cpu: "1",  memory: 1536Mi }
