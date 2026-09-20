@@ -46,7 +46,13 @@ data:
     # We consume only. Never publish to the government gateway, never call its
     # control API.
     api: yes
-    apiAddress: :9997
+    apiAddress: :{{ .Values.mediamtx.apiPort }}
+
+    # Prometheus-compatible metrics (mediamtx 1.9.x top-level `metrics` /
+    # `metricsAddress` — confirmed against the v1.9 config reference). Cluster-
+    # internal only, same posture as the control API.
+    metrics: yes
+    metricsAddress: :{{ .Values.mediamtx.metricsPort }}
 
     pathDefaults:
       # Pull on demand and release when idle, so we hold connections only to

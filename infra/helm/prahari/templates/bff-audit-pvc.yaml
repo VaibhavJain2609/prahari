@@ -1,0 +1,20 @@
+{{- if .Values.services.bff.enabled }}
+{{/*
+The hash-chained audit log is the platform's evidence trail — it must survive
+pod reschedules, so it lives on a PVC rather than the container filesystem.
+Deliberately NOT the shared Postgres (append-only, single-writer, never joined —
+see docs/ORG-TIERS-DESIGN.md §4 and BFFSettings.audit_db_path).
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prahari-audit
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+    app.kubernetes.io/name: bff
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ .Values.services.bff.auditStorage }}
+{{- end }}

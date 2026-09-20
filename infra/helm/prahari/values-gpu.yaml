@@ -8,12 +8,26 @@
 
 profile: gpu
 
-bus:
-  kind: redpanda      # durability, replay and backpressure for the scale test
-  retentionHours: 48
+# global.imageRegistry must be set to a registry the cloud cluster can pull
+# from (a real ECR/GAR/etc. endpoint) — localhost:5555 is the k3d registry and
+# does not exist off the laptop.
+# global:
+#   imageRegistry: <your cloud registry>
+
+# The bus is Redis Streams; a Redpanda switch for the scale test is deferred
+# (see values.yaml — it needs a deployment and a settings field together).
 
 postgres:
   storage: 50Gi
+
+# mediamtx.publicHost MUST be set for this profile — the base default
+# `localhost` only works through k3d's port maps. It is the host embedded in
+# the fan-out URLs handed to consumers, reachable from browsers AND in-cluster
+# workers (one field serves both; see PRAHARI_MEDIAMTX_PUBLIC_HOST in
+# _helpers.tpl). Left commented: an uncommented-but-empty `mediamtx:` map would
+# null out every base mediamtx value.
+# mediamtx:
+#   publicHost: streams.example.gov.in
 
 inference:
   replicas: 2
@@ -44,5 +58,6 @@ inference:
     maxReplicas: 20
     queueLengthTarget: 100
 
-ingest:
-  maxActiveCameras: 50        # the full government catalogue
+# The full government catalogue per worker pool is governed by
+# inference.maxStreamsPerWorker above (→ PRAHARI_INGEST_MAX_ACTIVE_CAMERAS);
+# the old top-level `ingest.maxActiveCameras` was read by nothing.

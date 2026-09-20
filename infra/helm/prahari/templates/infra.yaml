@@ -5,20 +5,35 @@ one `helm install` on a laptop with no registry access.
 
 Under the gpu profile these are still cluster-local — the scale story lives in
 the metadata plane's size, not in a managed database.
+
+securityContext note: the upstream postgres/redis/mediamtx images start as root
+and drop privileges internally (gosu/su-exec), so `runAsNonRoot` cannot be
+asserted on them without breaking their entrypoints. RuntimeDefault seccomp is
+applied to every pod; first-party services get the full uid-10001 non-root
+context in services.yaml/inference.yaml.
 */}}
-{{- if .Values.postgres.enabled }}
+{{- if and .Values.postgres.enabled (not .Values.postgres.existingSecret) }}
 apiVersion: v1
 kind: Secret
 metadata:
   name: prahari-postgres
   labels:
     {{- include "prahari.labels" . | nindent 4 }}
+  annotations:
+    # Keep the generated password across upgrades. Without this, every
+    # `helm upgrade` re-rolls randAlphaNum while Postgres auth lives in the
+    # PVC's PGDATA — the StatefulSet then restarts with a password that does
+    # not match and every client is broken permanently. The escape hatch for a
+    # managed credential is `postgres.existingSecret` (see values.yaml).
+    "helm.sh/resource-policy": keep
 type: Opaque
 stringData:
   # Dev-only credential, generated per install. Real deployments source this
   # from the cloud secret store via Terraform — never from values.yaml, and
   # never committed.
   password: {{ randAlphaNum 24 | quote }}
+{{- end }}
+{{- if .Values.postgres.enabled }}
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -40,6 +55,12 @@ spec:
         {{- include "prahari.labels" . | nindent 8 }}
         app.kubernetes.io/name: postgres
     spec:
+      securityContext:
+        # The postgres entrypoint starts as root and gosus down to the postgres
+        # user (uid 999) — fsGroup keeps the mounted data dir writable by it.
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: postgres
           # PostGIS for the registry's spatial queries; TimescaleDB extension is
@@ -55,10 +76,12 @@ spec:
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: prahari-postgres
+                  name: {{ include "prahari.postgresSecretName" . }}
                   key: password
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
@@ -67,6 +90,11 @@ spec:
               command: ["pg_isready", "-U", "{{ .Values.postgres.user }}"]
             initialDelaySeconds: 10
             periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "{{ .Values.postgres.user }}"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -111,16 +139,26 @@ spec:
         {{- include "prahari.labels" . | nindent 8 }}
         app.kubernetes.io/name: redis
     spec:
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: redis
           image: {{ .Values.redis.image }}
           ports:
             - containerPort: 6379
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
           readinessProbe:
             exec:
               command: ["redis-cli", "ping"]
             initialDelaySeconds: 5
             periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 15
+            periodSeconds: 20
 ---
 apiVersion: v1
 kind: Service
@@ -157,6 +195,9 @@ spec:
         {{- include "prahari.labels" . | nindent 8 }}
         app.kubernetes.io/name: mediamtx
     spec:
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: mediamtx
           image: {{ .Values.mediamtx.image }}
@@ -169,10 +210,28 @@ spec:
               containerPort: {{ .Values.mediamtx.whepPort }}
             - name: api
               containerPort: {{ .Values.mediamtx.apiPort }}
+            - name: metrics
+              containerPort: {{ .Values.mediamtx.metricsPort }}
+          resources:
+            {{- toYaml .Values.mediamtx.resources | nindent 12 }}
           volumeMounts:
             - name: config
               mountPath: /mediamtx.yml
               subPath: mediamtx.yml
+          # TCP probes: the API answers HTTP but there is no guaranteed-200
+          # health endpoint, so we probe what must be listening. Readiness on
+          # the RTSP listener (the port consumers actually use), liveness on
+          # the API listener.
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.mediamtx.rtspPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.mediamtx.apiPort }}
+            initialDelaySeconds: 15
+            periodSeconds: 20
       volumes:
         - name: config
           configMap:
@@ -200,4 +259,6 @@ spec:
     # operation only.
     - name: api
       port: {{ .Values.mediamtx.apiPort }}
+    - name: metrics
+      port: {{ .Values.mediamtx.metricsPort }}
 {{- end }}

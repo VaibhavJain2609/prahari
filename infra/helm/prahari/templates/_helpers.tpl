@@ -22,31 +22,61 @@ morning of 7 Sep because an upstream tag moved is an unrecoverable loss.
 {{- end -}}
 
 {{/*
-Environment shared by every service: how to reach the bus, the database and the
-registry. Services must hold no state outside these, so any pod can be killed
-and rescheduled at any moment.
+Name of the Secret carrying the Postgres password. Out of band when
+`postgres.existingSecret` is set; the chart-generated Secret otherwise.
+*/}}
+{{- define "prahari.postgresSecretName" -}}
+{{- .Values.postgres.existingSecret | default "prahari-postgres" -}}
+{{- end -}}
+
+{{/*
+Environment shared by every service: how to reach the database.
+
+Deliberately minimal. The repo invariant is that every PRAHARI_* name the chart
+sets exists as a settings field — so this block carries only what is genuinely
+common (Postgres is read by every service that keeps state: registry and bff via
+PRAHARI_DATABASE_URL). Per-service env lives in the per-service blocks below;
+
+historical casualties of putting speculative knobs here:
+  - PRAHARI_PROFILE / PRAHARI_BUS_KIND — no settings field ever read them. The
+    bus is Redis Streams; a Redpanda switch is deferred (see values.yaml).
+  - PRAHARI_REGISTRY_URL — every client addresses the registry under its own
+    prefix (PRAHARI_INGEST_REGISTRY_URL, PRAHARI_REGISTRY_BASE_URL,
+    PRAHARI_CORRELATION_REGISTRY_BASE_URL).
+  - PRAHARI_AUDIT_* — the audit log is the BFF's SQLite file, configured in
+    bffEnv; there was never an audit subsystem these flags gated.
+  - PRAHARI_REDIS_URL — only the BFF's `redis_url` field reads the bare prefix;
+    match-engine and correlation take theirs as PRAHARI_MATCH_REDIS_URL /
+    PRAHARI_CORRELATION_REDIS_URL. It lives in bffEnv now.
 */}}
 {{- define "prahari.commonEnv" -}}
-- name: PRAHARI_PROFILE
-  value: {{ .Values.profile | quote }}
-- name: PRAHARI_BUS_KIND
-  value: {{ .Values.bus.kind | quote }}
-- name: PRAHARI_REDIS_URL
-  value: "redis://prahari-redis:6379"
 - name: PRAHARI_DATABASE_URL
   value: "postgresql://{{ .Values.postgres.user }}:$(POSTGRES_PASSWORD)@prahari-postgres:5432/{{ .Values.postgres.database }}"
 - name: POSTGRES_PASSWORD
   valueFrom:
     secretKeyRef:
-      name: prahari-postgres
+      name: {{ include "prahari.postgresSecretName" . }}
       key: password
-- name: PRAHARI_REGISTRY_URL
-  value: "http://prahari-registry:{{ .Values.services.registry.port }}"
-- name: PRAHARI_AUDIT_ENABLED
-  value: {{ .Values.audit.enabled | quote }}
-- name: PRAHARI_AUDIT_REQUIRE_PURPOSE
-  value: {{ .Values.audit.requirePurposeCode | quote }}
+      # Optional only when the in-chart Postgres is off entirely — services that
+      # don't touch Postgres must still start in that configuration. When
+      # postgres.enabled, a missing Secret SHOULD fail loudly.
+      optional: {{ not .Values.postgres.enabled }}
 {{- end -}}
+
+{{/*
+Out-of-band Secret shared by the internal-token callers. Created once, by hand
+or Terraform, never from values.yaml:
+
+  kubectl create secret generic prahari-internal \
+    --from-literal=internal-token=$(openssl rand -base64 32) \
+    --from-literal=credential-key=$(openssl rand -base64 32)
+
+optional: true so the local profile still comes up without it — the registry
+treats an empty internal_token as "enforcement off" (see
+RegistrySettings.internal_token). Non-local profiles MUST create it: without
+internal-token the registry's org-scope gate is decorative, and without
+credential-key camera stream credentials cannot be written or read.
+*/}}
 
 {{/*
 Registry-only environment.
@@ -56,7 +86,7 @@ the one service the credential Secret is mounted into. Every other service
 reaches cameras through the registry's catalogue and never needs the password —
 which is the point: the blast radius of that credential is one Deployment.
 
-The Secret is created out of band (`kubectl create secret generic
+The gateway Secret is created out of band (`kubectl create secret generic
 prahari-gateway --from-env-file=.env`) or by Terraform from the cloud secret
 store. It is NEVER in values.yaml, and `optional: true` means a cluster without
 it still comes up — the registry logs the absence loudly and serves the map,
@@ -75,6 +105,22 @@ because a missing credential must not take down camera health as well as sync.
   value: {{ .Values.registry.health.staleAfterSeconds | quote }}
 - name: PRAHARI_HEARTBEAT_RETENTION_DAYS
   value: {{ .Values.registry.health.heartbeatRetentionDays | quote }}
+# Internal API gate (X-Internal-Token) and the AES-256 key for stored camera
+# stream credentials — both real RegistrySettings fields, both optional:true so
+# local dev runs without the Secret. A non-local profile MUST create
+# `prahari-internal`; enforcement off in the cloud is a silent no-op.
+- name: PRAHARI_INTERNAL_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: prahari-internal
+      key: internal-token
+      optional: true
+- name: PRAHARI_CREDENTIAL_KEY
+  valueFrom:
+    secretKeyRef:
+      name: prahari-internal
+      key: credential-key
+      optional: true
 {{- if .Values.mediamtx.enabled }}
 # The registry writes MediaMTX paths from the catalogue at runtime. The
 # ConfigMap ships with `paths:` empty on purpose — a hardcoded path passes
@@ -83,8 +129,14 @@ because a missing credential must not take down camera health as well as sync.
   value: "true"
 - name: PRAHARI_MEDIAMTX_API_URL
   value: "http://prahari-mediamtx:{{ .Values.mediamtx.apiPort }}"
+# One host field feeds every fan-out URL — browser WHEP/HLS previews AND the
+# URLs workers are assigned (worker.py prefers fanout_rtsp_url). `localhost`
+# makes browser preview work through k3d's port maps; a profile with only
+# in-cluster consumers can set mediamtx.publicHost=prahari-mediamtx, and a
+# cloud profile needs the ingress host reachable from BOTH. Splitting
+# internal/public fan-out hosts is a registry-settings follow-up.
 - name: PRAHARI_MEDIAMTX_PUBLIC_HOST
-  value: "prahari-mediamtx"
+  value: {{ .Values.mediamtx.publicHost | quote }}
 - name: PRAHARI_MEDIAMTX_RTSP_PORT
   value: {{ .Values.mediamtx.rtspPort | quote }}
 - name: PRAHARI_MEDIAMTX_HLS_PORT
@@ -127,8 +179,15 @@ deliberately-internal allowlist (M3 found the reverse direction matters:
 `PRAHARI_MATCH_REDIS_URL` was missing here and alerts silently never reached
 the shared Redis bus in any deployed profile).
 
-Note what is absent: no gateway credential. The match engine sees plate strings,
-never pixels and never the feed, so it has no business holding the password.
+NOTE — no PRAHARI_MATCH_ internal-token env here on purpose: MatchSettings has
+no `internal_token` field today, and that parity test fails on any
+PRAHARI_MATCH_* name without one. When the field lands (to authenticate
+worker→match-engine gRPC, or to let this service call a gated registry), wire
+it to secret `prahari-internal` key `internal-token`.
+
+Note what else is absent: no gateway credential. The match engine sees plate
+strings, never pixels and never the feed, so it has no business holding the
+password.
 */}}
 {{- define "prahari.matchEngineEnv" -}}
 - name: PRAHARI_MATCH_GRPC_PORT
@@ -149,11 +208,93 @@ never pixels and never the feed, so it has no business holding the password.
 # within a minute.
 - name: PRAHARI_MATCH_DEDUP_BUCKET_S
   value: {{ .Values.matchEngine.dedupBucketSeconds | quote }}
-# Same Redis every other service fans out to (see commonEnv) -- without this,
+# Same Redis every other service fans out to -- without this,
 # MatchSettings.redis_url stays None in every deployed profile (it reads
-# PRAHARI_MATCH_REDIS_URL, not the shared PRAHARI_REDIS_URL) and "one schema,
+# PRAHARI_MATCH_REDIS_URL, not a shared PRAHARI_REDIS_URL) and "one schema,
 # two transports" silently degrades to "one transport": alerts never leave
 # /api/v1/alerts.
 - name: PRAHARI_MATCH_REDIS_URL
   value: "redis://prahari-redis:6379"
+{{- end -}}
+
+{{/*
+Correlation-only environment (PRAHARI_CORRELATION_* = CorrelationSettings).
+
+redis_url unset means "the detection consumer never starts" and /readyz says so
+honestly — so it is set here, pointed at the same Redis the match engine
+publishes `prahari:detections` on.
+
+NOTE — CorrelationSettings has no `internal_token` field yet. When it gains one
+(the service calls the registry for camera locations, and a gated registry will
+401 it), wire PRAHARI_CORRELATION_INTERNAL_TOKEN to secret `prahari-internal`
+key `internal-token`.
+*/}}
+{{- define "prahari.correlationEnv" -}}
+- name: PRAHARI_CORRELATION_HTTP_PORT
+  value: {{ .Values.services.correlation.port | quote }}
+- name: PRAHARI_CORRELATION_REDIS_URL
+  value: "redis://prahari-redis:6379"
+- name: PRAHARI_CORRELATION_REGISTRY_BASE_URL
+  value: "http://prahari-registry:{{ .Values.services.registry.port }}"
+{{- end -}}
+
+{{/*
+BFF-only environment (PRAHARI_* = BFFSettings).
+
+The BFF is the service the browser's data flows through: it proxies the
+registry, relays alerts off Redis Streams, and owns the hash-chained audit log
+— which is why it is the one Deployment with a persistent volume.
+*/}}
+{{- define "prahari.bffEnv" -}}
+- name: PRAHARI_REGISTRY_BASE_URL
+  value: "http://prahari-registry:{{ .Values.services.registry.port }}"
+- name: PRAHARI_CORRELATION_BASE_URL
+  value: "http://prahari-correlation:{{ .Values.services.correlation.port }}"
+# X-Internal-Token the BFF sends the registry; must match PRAHARI_INTERNAL_TOKEN
+# there. Same Secret, same key, same optional-local rule.
+- name: PRAHARI_REGISTRY_INTERNAL_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: prahari-internal
+      key: internal-token
+      optional: true
+# The SSE alert relay reads the `prahari:alerts` stream. BFFSettings is the only
+# settings class that reads the bare PRAHARI_REDIS_URL — everyone else's Redis
+# env is service-prefixed — which is why it lives here and not in commonEnv.
+- name: PRAHARI_REDIS_URL
+  value: "redis://prahari-redis:6379"
+# Append-only, hash-chained, single-writer — deliberately a SQLite file on the
+# prahari-audit PVC, not a table in the shared Postgres. There is no "audit off"
+# switch in any profile; the old PRAHARI_AUDIT_* flags gated nothing.
+- name: PRAHARI_AUDIT_DB_PATH
+  value: "/var/lib/prahari/audit/audit.db"
+# Secure cookies only where TLS terminates. Local k3d serves plain HTTP; every
+# other profile must have TLS in front or sessions ship in the clear.
+- name: PRAHARI_SESSION_COOKIE_SECURE
+  value: {{ eq .Values.profile "local" | ternary "false" "true" | quote }}
+# First-user seeding: created only when the users table is empty. Out of band,
+# never in values:
+#   kubectl create secret generic prahari-bff-bootstrap \
+#     --from-literal=admin-username=... --from-literal=admin-password=...
+- name: PRAHARI_BOOTSTRAP_ADMIN_USERNAME
+  valueFrom:
+    secretKeyRef:
+      name: prahari-bff-bootstrap
+      key: admin-username
+      optional: true
+- name: PRAHARI_BOOTSTRAP_ADMIN_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: prahari-bff-bootstrap
+      key: admin-password
+      optional: true
+{{- end -}}
+
+{{/*
+Web-only environment. The Next.js route handlers proxy /api/bff/* to the BFF
+in-cluster (web/src/app/api/bff/[...path]/route.ts reads PRAHARI_BFF_URL).
+*/}}
+{{- define "prahari.webEnv" -}}
+- name: PRAHARI_BFF_URL
+  value: "http://prahari-bff:{{ .Values.services.bff.port }}"
 {{- end -}}

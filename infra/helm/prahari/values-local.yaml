@@ -7,8 +7,7 @@
 
 profile: local
 
-bus:
-  kind: redis
+# The bus is Redis Streams; a Redpanda switch is deferred (see values.yaml).
 
 postgres:
   storage: 5Gi
@@ -30,7 +29,7 @@ inference:
   keda:
     enabled: false
 
-# Trim the estate so a laptop can keep up. The registry still onboards and
-# health-tracks the full catalogue — only inference is limited.
-ingest:
-  maxActiveCameras: 5
+# The laptop estate is trimmed by inference.maxStreamsPerWorker above — that is
+# the value the chart wires to PRAHARI_INGEST_MAX_ACTIVE_CAMERAS. The old
+# top-level `ingest.maxActiveCameras` was read by nothing; the registry still
+# onboards and health-tracks the full catalogue.

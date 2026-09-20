@@ -1,0 +1,19 @@
+PRAHARI ({{ .Values.profile }} profile) installed as release {{ .Release.Name }}.
+
+On k3d, the console and API are already host-mapped by infra/k3d/cluster.yaml:
+  web console:   http://localhost:{{ .Values.services.web.port }}
+  BFF (REST/SSE): http://localhost:{{ .Values.services.bff.port }}
+  MediaMTX:      rtsp://localhost:{{ .Values.mediamtx.rtspPort }} ·
+                 http://localhost:{{ .Values.mediamtx.hlsPort }} (HLS) ·
+                 http://localhost:{{ .Values.mediamtx.whepPort }} (WHEP)
+
+Without k3d port maps, port-forward instead:
+  kubectl port-forward svc/prahari-web {{ .Values.services.web.port }}:{{ .Values.services.web.port }}
+  kubectl port-forward svc/prahari-bff {{ .Values.services.bff.port }}:{{ .Values.services.bff.port }}
+
+Out-of-band Secrets this release expects (created by hand or Terraform, never
+by the chart):
+  prahari-gateway        — gateway credentials for the registry (registry.gatewaySecret)
+  prahari-internal       — internal-token + credential-key (optional locally, REQUIRED in non-local profiles)
+  prahari-bff-bootstrap  — admin-username + admin-password, seeds the first BFF admin once
+  prahari-postgres-auth  — only if postgres.existingSecret is set

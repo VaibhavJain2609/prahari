@@ -27,10 +27,20 @@ spec:
         {{- include "prahari.labels" . | nindent 8 }}
         app.kubernetes.io/name: inference
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: inference
           image: {{ include "prahari.image" (dict "registry" .Values.global.imageRegistry "name" "inference" "tag" .Values.global.imageTag) }}
           imagePullPolicy: {{ .Values.global.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           env:
             {{- include "prahari.commonEnv" . | nindent 12 }}
             # PRAHARI_INGEST_* is the env_prefix of IngestSettings. The names
@@ -46,9 +56,8 @@ spec:
               value: "http://prahari-registry:{{ .Values.services.registry.port }}"
             - name: PRAHARI_INGEST_HEARTBEAT_INTERVAL_S
               value: {{ .Values.inference.heartbeatIntervalSeconds | quote }}
-            # PRAHARI_DETECT_* is read by the detector settings landing on Day 2.
-            # Set now so the profile switch is complete on the day the code
-            # arrives, rather than needing a chart change alongside it.
+            # PRAHARI_DETECT_* is read by DetectorSettings — asserted by
+            # tests/test_detector_settings.py.
             - name: PRAHARI_DETECT_MODEL
               value: {{ .Values.inference.model | quote }}
             # cpu | videotoolbox | nvdec — selected here, never sniffed at runtime.
@@ -61,12 +70,16 @@ spec:
               value: {{ .Values.inference.motionGate | quote }}
             - name: PRAHARI_DETECT_MATCH_ENGINE_GRPC
               value: "prahari-match-engine:{{ .Values.services.matchEngine.grpcPort }}"
-            # Workers never connect to the government feed directly; the registry
-            # hands out MediaMTX fan-out URLs and these are the fallback bases.
-            - name: PRAHARI_MEDIAMTX_RTSP
-              value: "rtsp://prahari-mediamtx:{{ .Values.mediamtx.rtspPort }}"
-            - name: PRAHARI_MEDIAMTX_HLS
-              value: "http://prahari-mediamtx:{{ .Values.mediamtx.hlsPort }}"
+            # Workers never connect to the government feed directly and never
+            # need a MediaMTX URL from the chart: the registry hands each worker
+            # its fan-out URL in the assignment response (worker.py prefers
+            # fanout_rtsp_url), so the old PRAHARI_MEDIAMTX_RTSP/_HLS fallbacks
+            # here were dead env — deleted, not re-pointed.
+            #
+            # NOTE: no PRAHARI_INGEST_INTERNAL_TOKEN yet — IngestSettings has no
+            # internal_token field. When it lands (to authenticate worker
+            # heartbeats against a gated registry), wire it to secret
+            # `prahari-internal` key `internal-token`.
           resources:
             {{- toYaml .Values.inference.resources | nindent 12 }}
           # No HTTP probe: a worker serves no traffic and has no port to GET.
@@ -93,6 +106,9 @@ spec:
       {{- end }}
 {{- if .Values.inference.keda.enabled }}
 ---
+# Requires the KEDA CRDs — a gpu-profile prerequisite that must be installed on
+# the cluster BEFORE this chart (`helm install keda kedacore/keda`), or this
+# ScaledObject fails to apply.
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -109,9 +125,21 @@ spec:
   # grows is not elasticity.
   cooldownPeriod: 120
   triggers:
-    - type: redis
+    # The bus is Redis Streams, not a list — the previous `redis` scaler watched
+    # `prahari:frames:pending`, a key nothing produces, so the trigger would
+    # have read zero forever.
+    #
+    # This scales on the pending-entries backlog of consumer group
+    # `prahari-correlation` on the detections stream: the deepest queue in the
+    # metadata plane and the honest "the pipeline is saturated" signal. Caveats:
+    # the consumer group must actually exist (the correlation service creates it
+    # on connect — with correlation disabled there is no group and nothing to
+    # measure), and worker count is an indirect lever on a downstream backlog.
+    # Revisit against a measured run before citing scale numbers from it.
+    - type: redis-streams
       metadata:
         address: prahari-redis:6379
-        listName: prahari:frames:pending
-        listLength: {{ .Values.inference.keda.queueLengthTarget | quote }}
+        stream: prahari:detections
+        consumerGroup: prahari-correlation
+        pendingEntriesCount: {{ .Values.inference.keda.queueLengthTarget | quote }}
 {{- end }}
