@@ -201,13 +201,16 @@ async def require_internal_token(request: Request, call_next):
     separately, by `InternalTokenInterceptor` in `grpc_server.py`.
 
     `/healthz` and `/readyz` are exempt — a probe carries no data and must not
-    depend on a secret being wired correctly to answer. Empty
-    `internal_token` disables the gate entirely (`expected_token_ok`)."""
+    depend on a secret being wired correctly to answer. `/metrics` is exempt
+    too: Prometheus cannot hold a bearer credential for a pod scrape (and the
+    observability NetworkPolicy restricts the port to the monitoring
+    namespace on any CNI that enforces it). Empty `internal_token` disables
+    the gate entirely (`expected_token_ok`)."""
     # Tests that build the app without lifespan never set app.state.settings —
     # an absent settings object means an absent token, which is gate-off anyway.
     settings: MatchSettings | None = getattr(request.app.state, "settings", None)
     token = settings.internal_token if settings else ""
-    if token and request.url.path not in ("/healthz", "/readyz"):
+    if token and request.url.path not in ("/healthz", "/readyz", "/metrics"):
         if not expected_token_ok(provided_token(request.headers), token):
             return Response(
                 status_code=status.HTTP_401_UNAUTHORIZED, content="internal token required"
