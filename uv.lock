@@ -1182,6 +1182,7 @@ name = "prahari-correlation"
 version = "0.1.0"
 source = { editable = "services/correlation" }
 dependencies = [
+    { name = "asyncpg" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "prahari-common" },
@@ -1204,6 +1205,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "asyncpg", specifier = ">=0.29" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },

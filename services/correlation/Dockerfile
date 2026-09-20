@@ -38,8 +38,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 FROM python:3.12-slim AS runtime
 
-# No compiler, no uv, no build cache. Correlation holds the detection ring
-# buffers and route-reconstruction state in memory; the smaller the image, the
+# No compiler, no uv, no build cache. Correlation's detection ring buffers are
+# still in-memory (Postgres holds the durable copy); the smaller the image, the
 # less there is to audit in `docs/SECURITY.md`.
 RUN useradd --create-home --uid 10001 prahari
 WORKDIR /app
@@ -54,17 +54,10 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1
 
 USER prahari
-EXPOSE 8003
+EXPOSE 8002
 
 # Shell form, not exec-array: the bind port must follow
-# PRAHARI_CORRELATION_HTTP_PORT (default 8003, matching
-# CorrelationSettings.http_port) so a profile that sets the env is not silently
-# ignored by the process itself.
-#
-# KNOWN MISMATCH: the chart's services.correlation.port is 8002 while the
-# settings default here is 8003, and the chart does not currently inject
-# PRAHARI_CORRELATION_HTTP_PORT — under the shipped chart the process listens
-# on 8003 while probes and the Service target 8002. The env is honoured, so
-# setting it (or aligning values.yaml) fixes the deployment without an image
-# rebuild.
-CMD ["sh", "-c", "exec uvicorn prahari_correlation.app:app --host 0.0.0.0 --port ${PRAHARI_CORRELATION_HTTP_PORT:-8003}"]
+# PRAHARI_CORRELATION_HTTP_PORT (the chart's correlationEnv sets it to
+# services.correlation.port; the fallback matches CorrelationSettings.http_port)
+# so a profile that sets the env is not silently ignored by the process itself.
+CMD ["sh", "-c", "exec uvicorn prahari_correlation.app:app --host 0.0.0.0 --port ${PRAHARI_CORRELATION_HTTP_PORT:-8002}"]

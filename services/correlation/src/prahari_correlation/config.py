@@ -40,6 +40,29 @@ class CorrelationSettings(BaseSettings):
     only by convention today (each is chart-exposed under its own service
     prefix), not by a shared test."""
 
+    # --- persistence (correlation_sightings, db.py) --------------------------
+
+    database_url: str | None = None
+    """`None` means no Postgres: sightings live only in the in-memory
+    `DetectionStore`, a restart loses all route history, and `/readyz`
+    reports `persistence: in-memory` rather than pretending otherwise — same
+    honesty rule as `redis_url`. When set, the service applies
+    `services/correlation/migrations` on startup (same database as the
+    registry, `correlation_`-prefixed tables — the schema boundary is the
+    prefix, not a second Postgres), the consumer persists before XACK, and
+    route queries read the durable table."""
+
+    route_history_lookback_s: float = 86_400.0
+    """How far back `/api/v1/routes/{plate}` searches. A hard bound matters now
+    that history is durable: without one a route query scans everything the
+    plate ever did. 24h covers the demo scenario (a stolen vehicle's day);
+    the store's own per-plate bound still applies in memory-only mode."""
+
+    route_history_max_sightings: int = 5_000
+    """Cap on sightings pulled for one route build, applied against the most
+    recent end of history (db.py orders DESC then reverses). A taxi-scale
+    plate must be bounded rather than unbounded."""
+
     # --- detection store (DAY3-DESIGN.md §3.1) -----------------------------
 
     max_detections_per_plate: int = 500

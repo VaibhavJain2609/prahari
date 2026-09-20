@@ -7,6 +7,7 @@ the registry.
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -16,10 +17,11 @@ from prahari_common.internal_auth import expected_token_ok, provided_token
 
 from .config import CorrelationSettings, correlation_settings
 from .consumer import DetectionConsumer
+from .db import PostgresSightings, apply_migrations, create_pool
 from .metrics import Metrics
 from .registry_client import RegistryClient
 from .routes import RouteResult, build_route
-from .store import DetectionStore
+from .store import DetectionStore, SightingSource
 
 __all__ = ["app"]
 
@@ -38,8 +40,37 @@ async def lifespan(app: FastAPI):
         future_skew_allowance_s=settings.clock_skew_allowance_s,
         metrics=metrics,
     )
-    consumer = DetectionConsumer(settings.redis_url, settings.redis_detection_stream_key, store)
+
+    # Durable sightings, when Postgres is configured. The schema is applied
+    # in-process — same posture as the registry: either up with a correct
+    # schema or not up at all. When unset the service runs memory-only and
+    # /readyz says so.
+    db: PostgresSightings | None = None
+    if settings.database_url:
+        pool = await create_pool(settings.database_url)
+        applied = await apply_migrations(pool)
+        if applied:
+            log.info("applied migrations: %s", ", ".join(applied))
+        db = PostgresSightings(pool)
+    else:
+        log.warning(
+            "PRAHARI_CORRELATION_DATABASE_URL not set: sightings are memory-only "
+            "and a restart loses all route history (stream position still "
+            "survives via the consumer group, once Redis is reachable)"
+        )
+
+    consumer = DetectionConsumer(
+        settings.redis_url,
+        settings.redis_detection_stream_key,
+        store,
+        db=db,
+        metrics=metrics,
+    )
     consumer.start()
+
+    # What route queries read: Postgres when configured (survives restarts,
+    # unbounded by the LRU), the in-memory store otherwise.
+    sightings: SightingSource = db if db is not None else store
 
     if not settings.internal_token:
         log.warning(
@@ -58,9 +89,12 @@ async def lifespan(app: FastAPI):
     metrics.gauge("store_plates", store.tracked_plate_count)
     metrics.gauge("store_unplated", store.unplated_count)
     metrics.gauge("detections_stream_length", consumer.stream_length)
+    metrics.gauge("detections_pending", consumer.pending_count)
 
     app.state.settings = settings
     app.state.store = store
+    app.state.sightings = sightings
+    app.state.db = db
     app.state.consumer = consumer
     app.state.registry = registry
     app.state.metrics = metrics
@@ -68,8 +102,10 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        consumer.stop()
+        await consumer.stop()
         await registry.aclose()
+        if db is not None:
+            await db.close()
 
 
 app = FastAPI(
@@ -105,8 +141,16 @@ async def require_internal_token(request: Request, call_next):
 # --- dependencies ------------------------------------------------------------
 
 
-def get_store(request: Request) -> DetectionStore:
-    return request.app.state.store
+def get_sightings(request: Request) -> SightingSource:
+    """The sightings backend route queries read — `PostgresSightings` when
+    `database_url` is configured, the in-memory `DetectionStore` otherwise.
+    Named for what it is: overriding this in tests injects the query source,
+    whatever its durability."""
+    return request.app.state.sightings
+
+
+def get_db(request: Request) -> PostgresSightings | None:
+    return getattr(request.app.state, "db", None)
 
 
 def get_settings(request: Request) -> CorrelationSettings:
@@ -125,7 +169,8 @@ def get_metrics(request: Request) -> Metrics:
     return request.app.state.metrics
 
 
-StoreDep = Annotated[DetectionStore, Depends(get_store)]
+SightingsDep = Annotated[SightingSource, Depends(get_sightings)]
+DbDep = Annotated[PostgresSightings | None, Depends(get_db)]
 SettingsDep = Annotated[CorrelationSettings, Depends(get_settings)]
 ConsumerDep = Annotated[DetectionConsumer, Depends(get_consumer)]
 RegistryDep = Annotated[RegistryClient, Depends(get_registry)]
@@ -145,11 +190,32 @@ async def healthz() -> dict:
 
 
 @app.get("/readyz", tags=["ops"])
-async def readyz(consumer: ConsumerDep, response: Response) -> dict:
+async def readyz(consumer: ConsumerDep, db: DbDep, response: Response) -> dict:
+    """Ready means: consuming, and persistence is what it claims to be.
+
+    The consumer check is unchanged — a service that cannot consume returns
+    empty routes forever. On top of it, `persistence` reports which sightings
+    backend queries read: `postgres` (and the DB is actually reachable — a
+    configured-but-down database means the consumer can only build pending
+    backlog, which is not ready) or `in-memory` (no `database_url`: still
+    serving, but a restart loses all route history — said out loud rather
+    than implied)."""
     if not consumer.is_connected():
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return {"status": "unavailable", "reason": "detection consumer not connected to redis"}
-    return {"status": "ready"}
+    if db is not None:
+        try:
+            if not await db.ping():
+                raise ConnectionError("postgres ping returned falsy")
+        except Exception:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            return {
+                "status": "unavailable",
+                "reason": "postgres unreachable",
+                "persistence": "postgres",
+            }
+        return {"status": "ready", "persistence": "postgres"}
+    return {"status": "ready", "persistence": "in-memory"}
 
 
 # --- metrics -----------------------------------------------------------------
@@ -215,7 +281,7 @@ def _route_to_dict(result: RouteResult) -> dict:
 @app.get("/api/v1/routes/{plate}", tags=["routes"])
 async def get_route(
     plate: str,
-    store: StoreDep,
+    sightings: SightingsDep,
     registry: RegistryDep,
     settings: SettingsDep,
     metrics: MetricsDep,
@@ -223,11 +289,13 @@ async def get_route(
     metrics.inc("route_queries")
     result = await build_route(
         plate,
-        store,
+        sightings,
         registry,
         settings.max_speed_kmh,
         settings.appearance_similarity_threshold,
         clock_skew_allowance_s=settings.clock_skew_allowance_s,
+        since_s=time.time() - settings.route_history_lookback_s,
+        max_sightings=settings.route_history_max_sightings,
     )
     metrics.inc("rejected_hops", len(result.rejected))
     metrics.inc("ungated_hops", result.ungated_hops)

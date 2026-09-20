@@ -50,7 +50,7 @@ from prahari_common.plates import normalise_plate
 from .bridging import cosine_similarity, is_bridge_candidate
 from .feasibility import check_feasibility
 from .registry_client import DarkZone, GeoPoint, RegistryClient
-from .store import DetectionStore, wall_clock_s
+from .store import SightingSource, wall_clock_s
 
 __all__ = ["LinkKind", "RouteHop", "RejectedHop", "RouteResult", "build_route"]
 
@@ -182,7 +182,7 @@ def _consecutive_runs(
 
 
 async def _find_bridge(
-    store: DetectionStore,
+    sightings: SightingSource,
     registry: RegistryClient,
     left: events_pb2.VehicleDetection,
     left_loc: GeoPoint,
@@ -196,9 +196,10 @@ async def _find_bridge(
     and `right`, that is both feasibility-gated against *both* neighbours and
     appearance-similar to both. Returns the candidate, its location, and the
     bridge confidence (the weaker of the two cosine similarities), or `None`
-    if nothing in the store closes the gap."""
+    if nothing in the sightings source closes the gap."""
     for candidate in sorted(
-        store.unplated_between(wall_clock_s(left), wall_clock_s(right)), key=wall_clock_s
+        await sightings.unplated_in_range(wall_clock_s(left), wall_clock_s(right)),
+        key=wall_clock_s,
     ):
         if not candidate.appearance_embedding:
             continue
@@ -250,15 +251,23 @@ async def _find_bridge(
 
 async def build_route(
     raw_plate_text: str,
-    store: DetectionStore,
+    sightings: SightingSource,
     registry: RegistryClient,
     max_speed_kmh: float,
     appearance_threshold: float,
     *,
     clock_skew_allowance_s: float = 0.0,
+    since_s: float | None = None,
+    max_sightings: int | None = None,
 ) -> RouteResult:
     plate = normalise_plate(raw_plate_text).text or raw_plate_text
-    detections = store.by_plate(raw_plate_text)
+    # `sightings` is whichever backend the app wired in — `PostgresSightings`
+    # (durable: a restart changes nothing a query can see) or the in-memory
+    # `DetectionStore` (memory-only mode). The assembly below is identical
+    # either way; only the retention differs.
+    detections = await sightings.sightings_for_plate(
+        raw_plate_text, since_s=since_s, limit=max_sightings
+    )
     dark_zones = await registry.dark_zones()
 
     if not detections:
@@ -295,7 +304,7 @@ async def build_route(
         # first of this one: while the vehicle was still in the previous
         # camera's frame it was not yet travelling this leg.
         bridge = await _find_bridge(
-            store,
+            sightings,
             registry,
             prev_run[-1],
             prev_loc,
