@@ -247,6 +247,15 @@ spec:
       labels:
         {{- include "prahari.labels" . | nindent 8 }}
         app.kubernetes.io/name: mediamtx
+      {{- if and .Values.observability.enabled .Values.observability.prometheusScrape }}
+      # MediaMTX's own Prometheus exposition (metrics: yes in
+      # mediamtx-config.yaml) — unauthenticated by design (the auth callback
+      # excludes the metrics action), so the NetworkPolicy is the boundary.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.mediamtx.metricsPort }}"
+        prometheus.io/path: /metrics
+      {{- end }}
     spec:
       securityContext:
         seccompProfile:

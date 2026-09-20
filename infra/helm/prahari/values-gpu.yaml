@@ -83,6 +83,18 @@ inference:
     maxReplicas: 20
     queueLengthTarget: 100
 
+# The cloud cluster is where scraping actually matters — this is the profile
+# whose numbers reach docs/SCALE-80K.md. Install kube-prometheus-stack into
+# `monitoring` (matching observability.monitoringNamespace), then flip
+# serviceMonitor.enabled and set labels to the stack's serviceMonitorSelector.
+# Without the operator the prometheus.io/* annotations still work with any
+# kubernetes_sd scrape config — docs/OBSERVABILITY.md.
+observability:
+  enabled: true
+  serviceMonitor:
+    enabled: false
+    # labels: { release: prometheus }
+
 # The full government catalogue per worker pool is governed by
 # inference.maxStreamsPerWorker above (→ PRAHARI_INGEST_MAX_ACTIVE_CAMERAS);
 # the old top-level `ingest.maxActiveCameras` was read by nothing.

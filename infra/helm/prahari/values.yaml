@@ -158,6 +158,11 @@ services:
     replicas: 1
     port: 8001
     grpcPort: 9001
+    # /metrics is served on the HTTP port itself (prahari_match/metrics.py) —
+    # metricsPort deliberately repeats `port`: it is the scraper-facing key
+    # that drives the prometheus.io/port pod annotation when
+    # observability.prometheusScrape is on, and must move WITH `port`.
+    metricsPort: 8001
     resources:
       requests: { cpu: 200m, memory: 512Mi }
       limits:   { cpu: "2",  memory: 2Gi }
@@ -166,6 +171,9 @@ services:
     enabled: false
     replicas: 1
     port: 8002
+    # Same as matchEngine: /metrics rides the main HTTP port (a route on the
+    # FastAPI app, not a side listener). Repeats `port` on purpose.
+    metricsPort: 8002
     resources:
       requests: { cpu: 100m, memory: 512Mi }
       limits:   { cpu: "2",  memory: 2Gi }
@@ -268,6 +276,38 @@ networkPolicies:
   # enforceable the day the cluster runs a CNI that is — check the probe
   # caveat in that file before enabling on such a CNI.
   enabled: true
+
+# --- observability -----------------------------------------------------------
+
+# Everything under here is OPT-IN and additive: with `enabled: false` the
+# chart renders none of templates/observability.yaml, adds no pod
+# annotations, and writes no extra NetworkPolicy rules — the flag being off
+# is a true no-op, because a plain `make up` cluster has no scraper and the
+# annotations would be decoration. See docs/OBSERVABILITY.md.
+observability:
+  enabled: false
+
+  # The namespace a Prometheus / OTel-collector scrape workload is expected
+  # to run in — it feeds ONLY the NetworkPolicy namespaceSelector
+  # (kubernetes.io/metadata.name). A scraper deployed into the release
+  # namespace is covered separately, by the podSelector:{} rule.
+  monitoringNamespace: monitoring
+
+  # The zero-CRD scrape contract: prometheus.io/* pod annotations on every
+  # Deployment that serves /metrics (match-engine :8001, correlation :8002,
+  # mediamtx :9998, inference :9090). Works with a plain Prometheus
+  # kubernetes_sd pod-role scrape config or the OTel collector's prometheus
+  # receiver — the operator is not required for this path.
+  prometheusScrape: true
+
+  serviceMonitor:
+    # Prometheus Operator ServiceMonitor CRDs, rendered only when explicitly
+    # enabled: a cluster without the operator fails `helm install` on the
+    # unknown Kind, so this stays off until the CRDs are installed first.
+    enabled: false
+    # kube-prometheus-stack discovers ServiceMonitors by label — set this to
+    # match the stack's serviceMonitorSelector (e.g. {release: prometheus}).
+    labels: {}
 
 # --- auth --------------------------------------------------------------------
 

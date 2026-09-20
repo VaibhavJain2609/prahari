@@ -21,6 +21,15 @@ spec:
       labels:
         {{- include "prahari.labels" $ | nindent 8 }}
         app.kubernetes.io/name: {{ $name }}
+      {{- if and $.Values.observability.enabled $.Values.observability.prometheusScrape $cfg.metricsPort }}
+      # prometheus.io/* scrape contract (observability.prometheusScrape) —
+      # emitted only for services with a metricsPort, i.e. ones that actually
+      # serve /metrics (match-engine, correlation; registry/bff/web do not).
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ $cfg.metricsPort }}"
+        prometheus.io/path: /metrics
+      {{- end }}
     spec:
       # First-party images create uid 10001 `prahari` and drop to it
       # (services/*/Dockerfile). Services without a Dockerfile yet
@@ -49,6 +58,12 @@ spec:
             {{- if $cfg.grpcPort }}
             - name: grpc
               containerPort: {{ $cfg.grpcPort }}
+            {{- end }}
+            {{- if $cfg.metricsPort }}
+            {{- if ne (toString $cfg.metricsPort) (toString $cfg.port) }}
+            - name: metrics
+              containerPort: {{ $cfg.metricsPort }}
+            {{- end }}
             {{- end }}
           env:
             {{- include "prahari.commonEnv" $ | nindent 12 }}

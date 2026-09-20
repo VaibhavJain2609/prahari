@@ -1,0 +1,158 @@
+{{- if .Values.observability.enabled }}
+{{/*
+Observability wiring — everything in this file renders only under
+observability.enabled (off by default: a plain k3d cluster has no scraper,
+and all of this would be inert decoration).
+
+What lives here vs. elsewhere:
+  * pod-level prometheus.io/* annotations are emitted in-place on each
+    Deployment's pod template (services.yaml, inference.yaml, infra.yaml)
+    when observability.prometheusScrape is on — the annotation has to sit on
+    the pod, not in a sidecar manifest.
+  * the NetworkPolicy ingress for the metrics ports is in networkpolicy.yaml
+    next to every other allow rule.
+  * this file holds the objects that only exist FOR scraping: the inference
+    metrics Service (the KEDA-scaled workers have no Service otherwise) and
+    the optional ServiceMonitors.
+
+TOKEN CAVEAT, worth reading before wiring a scraper: match-engine and
+correlation serve /metrics on their main HTTP port, behind the same
+X-Internal-Token middleware that gates their /api/* routes — when
+PRAHARI_MATCH_INTERNAL_TOKEN / PRAHARI_CORRELATION_INTERNAL_TOKEN are armed
+(i.e. the prahari-internal Secret exists), a bare scrape gets a 401. The
+scrape must send the header (e.g. the OTel prometheus receiver's
+`headers`, or the ServiceMonitor endpoint's header/auth fields where the
+operator version supports them). Inference (:9090) and MediaMTX (:9998)
+are unauthenticated plaintext — the NetworkPolicy is what keeps them
+cluster-scoped on an enforcing CNI.
+*/}}
+{{- if .Values.inference.metricsPort }}
+---
+# The inference workers' /metrics listener (PRAHARI_INGEST_METRICS_PORT,
+# stdlib http.server — no auth, no TLS) gets a Service so scrapers and
+# ServiceMonitors have a stable target. The Deployment has no Service
+# otherwise: it serves no RPC, and under the gpu profile KEDA owns its
+# replica count. ClusterIP only — nothing outside the cluster has any
+# business reading worker counters.
+apiVersion: v1
+kind: Service
+metadata:
+  name: prahari-inference-metrics
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+    app.kubernetes.io/name: inference
+    app.kubernetes.io/component: metrics
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "prahari.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/name: inference
+  ports:
+    # targetPort is the named container port, so it tracks the
+    # inference.metricsPort value rather than duplicating it.
+    - name: metrics
+      port: {{ .Values.inference.metricsPort }}
+      targetPort: metrics
+{{- end }}
+{{- if .Values.observability.serviceMonitor.enabled }}
+{{- /*
+Prometheus Operator CRDs — render-gated on observability.serviceMonitor.enabled
+because a cluster without the operator fails `helm install` on the unknown
+kind, not at template time. Selector matches the target Service's labels;
+the ServiceMonitor lands in the release namespace, so the default
+(same-namespace) namespaceSelector is right.
+*/}}
+{{- if .Values.services.matchEngine.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: prahari-match-engine
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+    app.kubernetes.io/name: match-engine
+    {{- with .Values.observability.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: match-engine
+  endpoints:
+    # /metrics rides the `http` port — behind the X-Internal-Token middleware
+    # when prahari-internal is armed, so this endpoint needs the token as a
+    # header in that configuration (see the comment at the top of this file).
+    - port: http
+      path: /metrics
+{{- end }}
+{{- if .Values.services.correlation.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: prahari-correlation
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+    app.kubernetes.io/name: correlation
+    {{- with .Values.observability.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: correlation
+  endpoints:
+    # Same token caveat as match-engine: /metrics shares the gated `http`
+    # port (PRAHARI_CORRELATION_INTERNAL_TOKEN).
+    - port: http
+      path: /metrics
+{{- end }}
+{{- if .Values.mediamtx.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: prahari-mediamtx
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+    app.kubernetes.io/name: mediamtx
+    {{- with .Values.observability.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mediamtx
+  endpoints:
+    # MediaMTX's own Prometheus exposition (metrics: yes in mediamtx.yml);
+    # unauthenticated — the registry's auth callback excludes the metrics
+    # action (authHTTPExclude in mediamtx-config.yaml).
+    - port: metrics
+      path: /metrics
+{{- end }}
+{{- if .Values.inference.metricsPort }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: prahari-inference
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+    app.kubernetes.io/name: inference
+    {{- with .Values.observability.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: inference
+      app.kubernetes.io/component: metrics
+  endpoints:
+    # The worker metrics server has no auth — plaintext counters on a
+    # dedicated port. One target per KEDA pod, which is exactly the
+    # granularity the scale-up story needs.
+    - port: metrics
+      path: /metrics
+{{- end }}
+{{- end }}
+{{- end }}

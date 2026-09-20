@@ -26,6 +26,15 @@ spec:
       labels:
         {{- include "prahari.labels" . | nindent 8 }}
         app.kubernetes.io/name: inference
+      {{- if and .Values.observability.enabled .Values.observability.prometheusScrape .Values.inference.metricsPort }}
+      # prometheus.io/* scrape contract for the worker /metrics listener —
+      # the prahari-inference-metrics Service (observability.yaml) is the
+      # stable target; these annotations cover pod-role scrapers.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.inference.metricsPort }}"
+        prometheus.io/path: /metrics
+      {{- end }}
     spec:
       securityContext:
         runAsNonRoot: true
@@ -41,6 +50,14 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
+          {{- if .Values.inference.metricsPort }}
+          ports:
+            # Plaintext /metrics (PRAHARI_INGEST_METRICS_PORT below, 0 = off).
+            # Named so the prahari-inference-metrics Service and the
+            # NetworkPolicy rule can target it without duplicating the number.
+            - name: metrics
+              containerPort: {{ .Values.inference.metricsPort }}
+          {{- end }}
           env:
             {{- include "prahari.commonEnv" . | nindent 12 }}
             # PRAHARI_INGEST_* is the env_prefix of IngestSettings. The names
