@@ -5,32 +5,67 @@
 # Kubernetes API, so the Helm charts install unchanged in either place — that
 # is the entire local -> cloud cutover story. If this script has to install
 # anything the charts depend on, the charts are wrong.
+#
+# Topology: node_index 0 is the k3s SERVER at a deterministic private IP;
+# every other node is an AGENT that joins it. The cluster token is generated
+# by Terraform and handed to all nodes via user_data, so agents need no IAM
+# or SSM round-trip to find their cluster — just the server IP and the token.
 set -euo pipefail
 
 DISTRICT="${district}"
 NODE_INDEX="${node_index}"
 K3S_VERSION="${k3s_version}"
+K3S_TOKEN_VALUE="${k3s_token}"
+SERVER_IP="${server_ip}"
+IS_SERVER="${is_server}"
+
+LABELS="--node-label district=$DISTRICT --node-label plane=edge --node-label prahari.gujarat.gov.in/gpu=true"
 
 # --- k3s ---------------------------------------------------------------------
 # Pinned version. A floating channel means an upstream release can break a
 # deployment we cannot roll back under time pressure.
-curl -sfL https://get.k3s.io | \
-  INSTALL_K3S_VERSION="$K3S_VERSION" \
-  INSTALL_K3S_EXEC="server \
-    --disable traefik \
-    --disable servicelb \
-    --node-label district=$DISTRICT \
-    --node-label plane=edge \
-    --node-label prahari.gujarat.gov.in/gpu=true" \
-  sh -
+if [ "$IS_SERVER" = "true" ]; then
+  # Advertise the node's public IP as a TLS SAN so the fetched kubeconfig
+  # works against the public address, not just 127.0.0.1 / the private IP.
+  # IMDSv2 first; if metadata is unreachable we simply skip the SAN.
+  IMDS="http://169.254.169.254/latest"
+  IMDS_TOKEN="$(curl -sf -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' "$IMDS/api/token" || true)"
+  PUBLIC_IP="$(curl -sf -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" "$IMDS/meta-data/public-ipv4" || true)"
+  TLS_SAN=""
+  [ -n "$PUBLIC_IP" ] && TLS_SAN="--tls-san $PUBLIC_IP"
 
-until kubectl get nodes >/dev/null 2>&1; do sleep 2; done
+  curl -sfL https://get.k3s.io | \
+    INSTALL_K3S_VERSION="$K3S_VERSION" \
+    K3S_TOKEN="$K3S_TOKEN_VALUE" \
+    INSTALL_K3S_EXEC="server \
+      --disable traefik \
+      --disable servicelb \
+      $TLS_SAN \
+      $LABELS" \
+    sh -
+
+  until kubectl get nodes >/dev/null 2>&1; do sleep 2; done
+else
+  # Agents race the server's first boot — wait for its API before installing,
+  # or the install script registers an agent that can never reach a server.
+  until timeout 3 bash -c "echo > /dev/tcp/$SERVER_IP/6443" 2>/dev/null; do
+    sleep 5
+  done
+
+  curl -sfL https://get.k3s.io | \
+    INSTALL_K3S_VERSION="$K3S_VERSION" \
+    K3S_TOKEN="$K3S_TOKEN_VALUE" \
+    K3S_URL="https://$SERVER_IP:6443" \
+    INSTALL_K3S_EXEC="agent $LABELS" \
+    sh -
+fi
 
 # --- GPU runtime -------------------------------------------------------------
 # The AMI ships the NVIDIA driver; k3s needs the container runtime shim and the
 # device plugin before `nvidia.com/gpu` resource requests will schedule.
 # values-gpu.yaml sets runtimeClassName: nvidia, so this RuntimeClass must exist
 # or every inference pod stays Pending with no obvious error.
+# Every node (server and agents) runs inference pods, so all get the toolkit.
 curl -sL https://nvidia.github.io/libnvidia-container/gpgkey \
   | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 curl -sL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
@@ -38,9 +73,20 @@ curl -sL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-containe
   > /etc/apt/sources.list.d/nvidia-container-toolkit.list
 apt-get update -qq
 apt-get install -y -qq nvidia-container-toolkit
-systemctl restart k3s
 
-cat <<'EOF' | kubectl apply -f -
+# containerd picks up the nvidia runtime on restart — the service name
+# differs between the two roles.
+if [ "$IS_SERVER" = "true" ]; then
+  systemctl restart k3s
+else
+  systemctl restart k3s-agent
+fi
+
+# --- cluster addons (server only) --------------------------------------------
+# RuntimeClass, device plugin and KEDA are cluster-scoped — applied once, on
+# the server. The device plugin is a DaemonSet, so agents still run it.
+if [ "$IS_SERVER" = "true" ]; then
+  cat <<'EOF' | kubectl apply -f -
 apiVersion: node.k8s.io/v1
 kind: RuntimeClass
 metadata:
@@ -48,20 +94,17 @@ metadata:
 handler: nvidia
 EOF
 
-kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.17.0/deployments/static/nvidia-device-plugin.yml
+  kubectl apply -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.17.0/deployments/static/nvidia-device-plugin.yml
 
-# --- KEDA --------------------------------------------------------------------
-# Autoscales inference workers on stream-queue depth. Under the gpu profile the
-# chart renders a ScaledObject; without KEDA installed that object is inert and
-# the pool silently never scales — which would look like a working demo right up
-# until load arrives.
-kubectl apply --server-side \
-  -f https://github.com/kedacore/keda/releases/download/v2.16.0/keda-2.16.0.yaml
+  # KEDA autoscales inference workers on stream-queue depth. Under the gpu
+  # profile the chart renders a ScaledObject; without KEDA installed that
+  # object is inert and the pool silently never scales.
+  kubectl apply --server-side \
+    -f https://github.com/kedacore/keda/releases/download/v2.16.0/keda-2.16.0.yaml
 
-# --- readiness marker --------------------------------------------------------
-# `terraform apply` returning is not the same as the cluster being ready.
-# Poll this before running `helm upgrade`.
-until kubectl -n kube-system get deploy nvidia-device-plugin-daemonset >/dev/null 2>&1 \
-   || kubectl get ds -A -o name | grep -q nvidia-device-plugin; do sleep 5; done
+  # `terraform apply` returning is not the same as the cluster being ready.
+  # Poll this marker before running `helm upgrade`.
+  until kubectl get ds -A -o name 2>/dev/null | grep -q nvidia-device-plugin; do sleep 5; done
+fi
 
 echo "prahari: node $NODE_INDEX in $DISTRICT ready" > /var/log/prahari-bootstrap.done

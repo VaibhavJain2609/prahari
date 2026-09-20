@@ -62,6 +62,40 @@ variable "vpc_cidr" {
   default     = "10.0.0.0/16"
 }
 
+variable "central_plane_cidr" {
+  description = <<-EOT
+    CIDR of the central metadata plane that edge nodes may egress to on
+    port 9001 (detections and alerts leave; pixels do not).
+
+    Provisioned by the central-plane module (not yet built) — until then this
+    is a reserved placeholder range, kept as a variable so the day the real
+    plane exists, wiring it in is a tfvars change, not a module change.
+  EOT
+  type        = string
+  default     = "10.255.0.0/16"
+}
+
+variable "ssh_cidr" {
+  description = <<-EOT
+    CIDR allowed to reach SSH (22) and the k3s API (6443) on edge nodes —
+    typically the operator's egress IP as a /32.
+
+    Required, with no default, on purpose: a GPU node with an open SSH/API
+    surface is a cryptomining target within minutes. Validation rejects
+    0.0.0.0/0 so "just open it" has to be a deliberate act, not a default.
+  EOT
+  type        = string
+
+  validation {
+    condition = (
+      can(regex("^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$", var.ssh_cidr)) &&
+      can(cidrhost(var.ssh_cidr, 0)) &&
+      var.ssh_cidr != "0.0.0.0/0"
+    )
+    error_message = "ssh_cidr must be a valid, narrow IPv4 CIDR (e.g. \"203.0.113.10/32\"). 0.0.0.0/0 is rejected — use your own egress IP."
+  }
+}
+
 variable "k3s_version" {
   description = "Pinned k3s version. Never floating — a demo that breaks because an upstream tag moved is an unrecoverable loss."
   type        = string
