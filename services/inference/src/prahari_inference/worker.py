@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import httpx
+from prahari_common import internal_auth
 from prahari_common.catalogue import CameraEntry
 
 from .capture import SampleGate, StreamCapture
@@ -124,6 +125,12 @@ class RegistryClient:
     def __init__(self, settings: IngestSettings, *, client: httpx.Client | None = None) -> None:
         self._s = settings
         self._http = client or httpx.Client(base_url=settings.registry_url, timeout=10.0)
+        if settings.internal_token:
+            # The registry's `require_internal_token` gate: every call this
+            # client makes goes to the registry, so the header lives on the
+            # client, not per request. Set on an injected client too — the
+            # credential is this client's contract, not a construction detail.
+            self._http.headers[internal_auth.HEADER_NAME] = settings.internal_token
 
     def assignments(self) -> list[CameraAssignment]:
         """Ask the registry what to pull.
@@ -220,7 +227,9 @@ class IngestWorker:
         self._pipeline = pipeline or DetectionPipeline(
             YoloVehicleDetector(self._ds), PaddlePlateReader(self._ds), self._ds
         )
-        self._match_client = match_client or MatchEngineClient(self._ds)
+        self._match_client = match_client or MatchEngineClient(
+            self._ds, internal_token=self._s.internal_token
+        )
         # Shared across every camera's pump thread, matching CLAUDE.md's
         # "batch across cameras, never within one": a single camera at
         # sample_fps=2 cannot fill a batch without adding real latency, while

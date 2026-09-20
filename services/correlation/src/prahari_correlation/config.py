@@ -72,10 +72,25 @@ class CorrelationSettings(BaseSettings):
     across a plate-unreadable detection. Tuned against
     `tests/test_bridging.py`'s accuracy cases, not picked from theory."""
 
+    # --- access --------------------------------------------------------------
+
+    internal_token: str = ""
+    """Required as `X-Internal-Token` on every `/api/*` request when set -- the
+    same gate the registry runs (`RegistrySettings.internal_token`). Without it
+    anything cluster-reachable can read route reconstructions, which are exactly
+    the movement history the BFF's authorisation exists to control. Empty
+    disables enforcement -- the local/dev default; the chart arms it per
+    profile."""
+
     # --- registry client -----------------------------------------------------
 
     registry_base_url: str = "http://registry:8000"
     registry_timeout_s: float = 5.0
+
+    registry_internal_token: str = ""
+    """Sent as `X-Internal-Token` on every registry call -- must match
+    `RegistrySettings.internal_token` on the other side exactly. Empty sends no
+    credential, matching the registry's empty-means-open gate."""
 
 
 @lru_cache(maxsize=1)

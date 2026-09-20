@@ -46,6 +46,59 @@ class _FakeRegistry:
         return [DarkZone(camera_id="CAM-DOWN", location=None)]
 
 
+class TestInternalToken:
+    """`require_internal_token`: once PRAHARI_CORRELATION_INTERNAL_TOKEN is
+    set, /api/* answers 401 without the header — the route data behind it is
+    movement history, exactly what the BFF's authorisation exists to control.
+    Unset means the gate is off entirely (local/dev default)."""
+
+    def _armed_client(self, monkeypatch) -> TestClient:
+        monkeypatch.setenv("PRAHARI_CORRELATION_INTERNAL_TOKEN", "tok-1")
+        return TestClient(app)
+
+    def test_unset_token_leaves_the_api_open(self, monkeypatch) -> None:
+        monkeypatch.delenv("PRAHARI_CORRELATION_INTERNAL_TOKEN", raising=False)
+        store = DetectionStore(max_per_plate=10, max_plates=10)
+        app.dependency_overrides[get_store] = lambda: store
+        app.dependency_overrides[get_registry] = lambda: _FakeRegistry({})
+        try:
+            with _client() as client:
+                assert client.get("/api/v1/routes/GJ01AB1234").status_code == 200
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_armed_gate_rejects_a_missing_token(self, monkeypatch) -> None:
+        with self._armed_client(monkeypatch) as client:
+            response = client.get("/api/v1/routes/GJ01AB1234")
+        assert response.status_code == 401
+
+    def test_armed_gate_rejects_a_wrong_token(self, monkeypatch) -> None:
+        with self._armed_client(monkeypatch) as client:
+            response = client.get(
+                "/api/v1/routes/GJ01AB1234", headers={"x-internal-token": "wrong"}
+            )
+        assert response.status_code == 401
+
+    def test_armed_gate_accepts_the_right_token(self, monkeypatch) -> None:
+        store = DetectionStore(max_per_plate=10, max_plates=10)
+        app.dependency_overrides[get_store] = lambda: store
+        app.dependency_overrides[get_registry] = lambda: _FakeRegistry({})
+        try:
+            with self._armed_client(monkeypatch) as client:
+                response = client.get(
+                    "/api/v1/routes/GJ01AB1234", headers={"x-internal-token": "tok-1"}
+                )
+        finally:
+            app.dependency_overrides.clear()
+        assert response.status_code == 200
+
+    def test_healthz_stays_open_when_armed(self, monkeypatch) -> None:
+        # A liveness probe carries no data and must not depend on a secret
+        # being wired correctly to answer.
+        with self._armed_client(monkeypatch) as client:
+            assert client.get("/healthz").status_code == 200
+
+
 class TestProbes:
     def test_healthz_never_touches_the_consumer(self) -> None:
         with _client() as client:

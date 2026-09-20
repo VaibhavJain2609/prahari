@@ -94,3 +94,37 @@ async def test_dark_zones_returns_empty_list_on_failure_not_raised() -> None:
 
     zones = await _client_for(handler).dark_zones()
     assert zones == []
+
+
+async def test_internal_token_is_sent_on_every_registry_call() -> None:
+    """`CorrelationSettings.registry_internal_token` must match the registry's
+    own `internal_token`; a caller that does not send it gets 401 on every
+    `/api/*` once that side is armed."""
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("x-internal-token"))
+        return httpx.Response(200, json={"id": "CAM-1", "location": None})
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(transport=transport, base_url="http://registry")
+    client = RegistryClient(
+        base_url="http://registry",
+        timeout_s=5.0,
+        cache_ttl_s=300.0,
+        internal_token="tok-1",
+        client=http,
+    )
+    assert (await client.camera_location("CAM-1")) is None
+    assert seen == ["tok-1"]
+
+
+async def test_no_credential_is_sent_when_internal_token_is_unset() -> None:
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("x-internal-token"))
+        return httpx.Response(200, json={"id": "CAM-1", "location": None})
+
+    assert (await _client_for(handler).camera_location("CAM-1")) is None
+    assert seen == [None]

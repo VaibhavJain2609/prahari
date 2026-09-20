@@ -27,6 +27,7 @@ from datetime import UTC
 
 import grpc
 from prahari.v1 import adapter_pb2, adapter_pb2_grpc
+from prahari_common.internal_auth import expected_token_ok, provided_token
 
 from .alerts import AlertBuilder, AlertPublisher
 from .config import MatchSettings
@@ -34,9 +35,48 @@ from .dedup import Deduper
 from .detections import DetectionPublisher, NullDetectionPublisher
 from .matcher import WatchlistStore, match
 
-__all__ = ["MetadataIngestServicer", "serve"]
+__all__ = ["InternalTokenInterceptor", "MetadataIngestServicer", "serve"]
 
 log = logging.getLogger(__name__)
+
+
+class InternalTokenInterceptor(grpc.ServerInterceptor):
+    """Rejects calls that do not carry the shared `x-internal-token` metadata.
+
+    The gRPC twin of `app.py`'s `require_internal_token` middleware: an open
+    `MetadataIngestService` lets anything that can reach the pod inject
+    detections — and therefore alerts — straight into the evidence trail, so
+    it is gated by the same credential as the HTTP surface.
+
+    `serve()` installs it only when `MatchSettings.internal_token` is set;
+    empty means the gate is off (`expected_token_ok`), so the interceptor is
+    simply never built rather than passing everything through a disabled
+    check on every call.
+    """
+
+    def __init__(self, expected_token: str) -> None:
+        self._expected = expected_token
+
+    def intercept_service(self, continuation, handler_call_details):  # noqa: ANN001, ANN202 - grpc's own signature
+        handler = continuation(handler_call_details)
+        provided = provided_token(dict(handler_call_details.invocation_metadata or ()))
+        if handler is None or expected_token_ok(provided, self._expected):
+            return handler
+
+        def reject(_request_or_iterator, context):  # noqa: ANN001, ANN202
+            context.abort(grpc.StatusCode.UNAUTHENTICATED, "internal token required")
+
+        # Return a rejecting handler of the same cardinality as the real one —
+        # the four method types differ in request/response streaming shape, and
+        # answering a client-streaming call with a unary handler would fail the
+        # RPC before `reject` ever ran, with the wrong status code.
+        if handler.stream_unary:
+            return grpc.stream_unary_rpc_method_handler(reject)
+        if handler.stream_stream:
+            return grpc.stream_stream_rpc_method_handler(reject)
+        if handler.unary_stream:
+            return grpc.unary_stream_rpc_method_handler(reject)
+        return grpc.unary_unary_rpc_method_handler(reject)
 
 
 class MetadataIngestServicer(adapter_pb2_grpc.MetadataIngestServiceServicer):
@@ -144,7 +184,13 @@ def serve(
     so a caller controls its own shutdown -- this function does not block,
     matching how `app.py`'s lifespan needs to run it alongside uvicorn rather
     than instead of it."""
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=settings.grpc_max_workers))
+    interceptors = (
+        (InternalTokenInterceptor(settings.internal_token),) if settings.internal_token else ()
+    )
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=settings.grpc_max_workers),
+        interceptors=interceptors,
+    )
     servicer = MetadataIngestServicer(
         store, deduper, publisher, settings, detection_publisher=detection_publisher
     )

@@ -28,6 +28,7 @@ class _RecordingServicer(adapter_pb2_grpc.MetadataIngestServiceServicer):
 
     def __init__(self) -> None:
         self.calls: list[list[events_pb2.VehicleDetection]] = []
+        self.metadata_seen: list[dict[str, str]] = []
 
     def StreamDetections(
         self,
@@ -36,6 +37,7 @@ class _RecordingServicer(adapter_pb2_grpc.MetadataIngestServiceServicer):
     ) -> adapter_pb2.StreamDetectionsResponse:
         received = [request.detection for request in request_iterator]
         self.calls.append(received)
+        self.metadata_seen.append(dict(context.invocation_metadata()))
         return adapter_pb2.StreamDetectionsResponse(
             ack=adapter_pb2.IngestAck(accepted=len(received), rejected=0, detail="")
         )
@@ -90,6 +92,27 @@ class TestSendDetections:
         assert len(servicer.calls) == 2
         assert [d.detection_id for d in servicer.calls[0]] == ["D1"]
         assert [d.detection_id for d in servicer.calls[1]] == ["D2", "D3"]
+
+    def test_internal_token_is_sent_as_call_metadata(self, running_server):
+        # The match engine's InternalTokenInterceptor reads `x-internal-token`
+        # off invocation metadata; a worker that does not send it gets every
+        # batch rejected once that gate is armed.
+        servicer, address = running_server
+        client = MatchEngineClient(
+            DetectorSettings(match_engine_grpc=address), internal_token="tok-1"
+        )
+
+        client.send_detections([_detection("D1")])
+
+        assert servicer.metadata_seen[0]["x-internal-token"] == "tok-1"
+
+    def test_no_token_sends_no_credential_metadata(self, running_server):
+        servicer, address = running_server
+        client = MatchEngineClient(DetectorSettings(match_engine_grpc=address))
+
+        client.send_detections([_detection("D1")])
+
+        assert "x-internal-token" not in servicer.metadata_seen[0]
 
     def test_a_batch_survives_no_server_listening(self):
         # An address nothing is bound to -- the RPC must fail fast (channel

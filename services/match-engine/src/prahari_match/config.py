@@ -45,6 +45,18 @@ class MatchSettings(BaseSettings):
     that needs to know its own port (e.g. building a self-referential URL)
     reads it from here, not by re-parsing argv."""
 
+    # --- access --------------------------------------------------------------
+
+    internal_token: str = ""
+    """Required as `X-Internal-Token` on every `/api/*` request and as
+    `x-internal-token` gRPC metadata on `MetadataIngestService`, when set --
+    the same gate the registry runs (`RegistrySettings.internal_token`), on
+    both surfaces this service exposes. The watchlist and its alerts are
+    exactly what access control exists for, and an unauthenticated
+    `MetadataIngestService` lets anything cluster-reachable inject detections
+    into the evidence trail. Empty disables both gates -- the local/dev
+    default; the chart arms it per profile."""
+
     # --- watchlist -------------------------------------------------------
 
     watchlist_dir: str = "data/watchlist"

@@ -22,6 +22,7 @@ from collections.abc import Iterable
 
 import grpc
 from prahari.v1 import adapter_pb2, adapter_pb2_grpc, events_pb2
+from prahari_common import internal_auth
 
 from .config import DetectorSettings, detector_settings
 
@@ -46,10 +47,18 @@ class MatchEngineClient:
         settings: DetectorSettings | None = None,
         *,
         channel: grpc.Channel | None = None,
+        internal_token: str = "",
     ) -> None:
         self._s = settings or detector_settings()
         self._channel = channel or grpc.insecure_channel(self._s.match_engine_grpc)
         self._stub = adapter_pb2_grpc.MetadataIngestServiceStub(self._channel)
+        # `x-internal-token` call metadata — the match engine's
+        # `InternalTokenInterceptor` checks it once `MatchSettings.internal_token`
+        # is armed. The token lives on `IngestSettings` (one credential per
+        # caller), not `DetectorSettings`, so it arrives as a parameter.
+        self._metadata: tuple[tuple[str, str], ...] | None = (
+            ((internal_auth.HEADER_NAME, internal_token),) if internal_token else None
+        )
 
     def send_detections(
         self, detections: Iterable[events_pb2.VehicleDetection]
@@ -76,7 +85,7 @@ class MatchEngineClient:
         if not requests:
             return None
         try:
-            response = self._stub.StreamDetections(iter(requests))
+            response = self._stub.StreamDetections(iter(requests), metadata=self._metadata)
         except grpc.RpcError as exc:
             log.warning("StreamDetections failed (%d detections dropped): %s", len(requests), exc)
             return None
