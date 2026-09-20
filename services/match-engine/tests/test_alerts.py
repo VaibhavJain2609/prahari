@@ -15,6 +15,7 @@ from prahari_match.alerts import (
     RedisStreamPublisher,
 )
 from prahari_match.matcher import MatchResult
+from prahari_match.metrics import ALERT_PUBLISH_FAILURES, METRICS
 
 
 def _detection(camera_id: str = "CAM-1") -> events_pb2.VehicleDetection:
@@ -108,11 +109,80 @@ class TestPublishers:
         # A Redis outage must never propagate past publish() -- it would fail
         # the gRPC ack a worker is blocked on for a reason that has nothing to
         # do with whether the detection matched.
-        publisher = RedisStreamPublisher("redis://127.0.0.1:1", "prahari:alerts")
+        publisher = RedisStreamPublisher("redis://127.0.0.1:1", "prahari:alerts", 50_000)
         alert = AlertBuilder().build(
             _detection(), _match_result(events_pb2.WATCHLIST_REASON_STOLEN), dedup_key="k"
         )
         publisher.publish(alert)  # must not raise even though nothing is listening
+
+    def test_redis_publisher_connects_with_socket_timeouts(self, fake_redis) -> None:
+        # A bare from_url has no socket_timeout: a hung Redis would wedge the
+        # calling gRPC handler thread, and there are only grpc_max_workers of
+        # them. The timeouts must reach the client constructor.
+        publisher = RedisStreamPublisher(
+            "redis://example:6379/0",
+            "prahari:alerts",
+            50_000,
+            socket_timeout_s=7.0,
+            socket_connect_timeout_s=3.0,
+        )
+        alert = AlertBuilder().build(
+            _detection(), _match_result(events_pb2.WATCHLIST_REASON_STOLEN), dedup_key="k"
+        )
+        publisher.publish(alert)
+
+        assert len(fake_redis.from_url_calls) == 1
+        call = fake_redis.from_url_calls[0]
+        assert call["url"] == "redis://example:6379/0"
+        assert call["socket_timeout"] == 7.0
+        assert call["socket_connect_timeout"] == 3.0
+
+    def test_redis_publisher_xadd_caps_stream_with_approximate_maxlen(self, fake_redis) -> None:
+        # The alerts stream used to be a bare XADD with no MAXLEN: a
+        # long-running demo would grow prahari:alerts without bound.
+        publisher = RedisStreamPublisher("redis://x", "prahari:alerts", 50_000)
+        alert = AlertBuilder().build(
+            _detection(), _match_result(events_pb2.WATCHLIST_REASON_STOLEN), dedup_key="k"
+        )
+        publisher.publish(alert)
+
+        assert len(fake_redis.xadd_calls) == 1
+        call = fake_redis.xadd_calls[0]
+        assert call["stream"] == "prahari:alerts"
+        assert call["maxlen"] == 50_000
+        assert call["approximate"] is True
+        assert "alert" in call["fields"]
+
+    def test_redis_publisher_retries_once_on_a_fresh_connection(self, fake_redis) -> None:
+        # One failure -> drop the suspect connection, reconnect, retry once.
+        fake_redis.failures_remaining = 1
+        publisher = RedisStreamPublisher("redis://x", "prahari:alerts", 50_000)
+        alert = AlertBuilder().build(
+            _detection(), _match_result(events_pb2.WATCHLIST_REASON_STOLEN), dedup_key="k"
+        )
+        before = METRICS.get(ALERT_PUBLISH_FAILURES)
+
+        publisher.publish(alert)  # must not raise, and must have retried
+
+        assert len(fake_redis.xadd_calls) == 2
+        assert len(fake_redis.from_url_calls) == 2  # reconnected for the retry
+        assert METRICS.get(ALERT_PUBLISH_FAILURES) == before  # not a failure -- it landed
+
+    def test_redis_publisher_drops_and_counts_after_the_retry(self, fake_redis) -> None:
+        # Two failures -> drop the alert and count it. An alert is worth one
+        # retry, never more: holding up the worker's ack for a dead Redis is
+        # worse than losing one fan-out.
+        fake_redis.failures_remaining = 5
+        publisher = RedisStreamPublisher("redis://x", "prahari:alerts", 50_000)
+        alert = AlertBuilder().build(
+            _detection(), _match_result(events_pb2.WATCHLIST_REASON_STOLEN), dedup_key="k"
+        )
+        before = METRICS.get(ALERT_PUBLISH_FAILURES)
+
+        publisher.publish(alert)  # must not raise
+
+        assert len(fake_redis.xadd_calls) == 2  # exactly one retry
+        assert METRICS.get(ALERT_PUBLISH_FAILURES) == before + 1
 
     def test_fan_out_publishes_to_every_publisher(self) -> None:
         recent_a = RecentAlertsPublisher(max_size=10)

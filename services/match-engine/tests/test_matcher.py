@@ -8,6 +8,8 @@ arithmetic is exactly the kind of thing that looks right and is not.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 from prahari.v1 import common_pb2, events_pb2
 
@@ -124,6 +126,48 @@ def test_empty_observed_text_does_not_match() -> None:
     store = _store_with("GJ01AB1234")
     result = match(_reading(""), store, SETTINGS)
     assert not result.matched
+
+
+# --- NaN guard ---------------------------------------------------------------
+# A non-finite wire confidence (NaN, ±inf) used to propagate through the
+# weighted DP into `final_score`, where `NaN > best_score` is False for every
+# candidate -- a genuine hit degenerated into a silent no_match with nothing
+# logged. Non-finite values are now sanitised to 0.0 ("trust this character
+# least", the same default `project_confidences` uses for a missing entry)
+# before scoring.
+
+
+def test_nan_confidence_does_not_silently_no_match() -> None:
+    store = _store_with("GJ01AB1230")
+    # 'O' at the last position is the known 0/O confusion; NaN confidence sits
+    # exactly on the substituted character so it must flow through the DP.
+    result = match(_reading("GJ01AB123O", confidences=[0.9] * 9 + [float("nan")]), store, SETTINGS)
+
+    assert result.matched
+    assert math.isfinite(result.explanation.final_score)
+    # 0.0 confidence = "trust least": a known confusion that was already cheap
+    # gets cheaper still, so this scores above the accuracy-table rows.
+    assert result.band == common_pb2.CONFIDENCE_BAND_CONFIRMED
+
+
+def test_nan_confidence_via_raw_text_projection() -> None:
+    # Same guard on the other branch: `raw_text` set, confidences projected
+    # through `project_confidences` and then sanitised.
+    store = _store_with("GJ01AB1230")
+    reading = events_pb2.PlateReading(
+        raw_text="GJ01AB123O", char_confidence=[0.9] * 9 + [float("nan")]
+    )
+    result = match(reading, store, SETTINGS)
+
+    assert result.matched
+    assert math.isfinite(result.explanation.final_score)
+
+
+def test_infinite_confidence_is_also_sanitised() -> None:
+    store = _store_with("GJ01AB1230")
+    result = match(_reading("GJ01AB123O", confidences=[0.9] * 9 + [float("inf")]), store, SETTINGS)
+    assert result.matched
+    assert math.isfinite(result.explanation.final_score)
 
 
 # --- M1: the bloom funnel must not false-negative on a length mismatch ------

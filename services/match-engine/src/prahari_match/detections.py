@@ -19,6 +19,8 @@ from typing import Protocol
 
 from prahari.v1 import events_pb2
 
+from .metrics import DETECTION_PUBLISH_FAILURES, METRICS
+
 __all__ = ["DetectionPublisher", "NullDetectionPublisher", "RedisDetectionPublisher"]
 
 log = logging.getLogger(__name__)
@@ -42,17 +44,35 @@ class RedisDetectionPublisher:
     long-running demo — this stream carries *every* detection, not just watchlist hits,
     so it is the higher-rate of the two streams this service writes."""
 
-    def __init__(self, redis_url: str, stream_key: str, maxlen: int) -> None:
+    def __init__(
+        self,
+        redis_url: str,
+        stream_key: str,
+        maxlen: int,
+        *,
+        socket_timeout_s: float = 5.0,
+        socket_connect_timeout_s: float = 2.0,
+    ) -> None:
         self._redis_url = redis_url
         self._stream_key = stream_key
         self._maxlen = maxlen
+        self._socket_timeout_s = socket_timeout_s
+        self._socket_connect_timeout_s = socket_connect_timeout_s
         self._client = None
 
     def _client_or_connect(self):
         if self._client is None:
             import redis
 
-            self._client = redis.Redis.from_url(self._redis_url)
+            # No defaults here: an unbounded socket read on a hung Redis would
+            # wedge a gRPC handler thread forever (there are only
+            # `grpc_max_workers` of them). A timeout surfaces as an exception,
+            # which publish() below logs and drops.
+            self._client = redis.Redis.from_url(
+                self._redis_url,
+                socket_timeout=self._socket_timeout_s,
+                socket_connect_timeout=self._socket_connect_timeout_s,
+            )
         return self._client
 
     def publish(self, detection: events_pb2.VehicleDetection) -> None:
@@ -65,6 +85,11 @@ class RedisDetectionPublisher:
                 approximate=True,
             )
         except Exception:
+            # Unlike alerts, a detection that fails to publish is simply
+            # dropped, not retried -- this stream is the high-rate one, and a
+            # retry storm against a degraded Redis costs more than one lost
+            # sighting is worth. The counter is what keeps the drop honest.
+            METRICS.inc(DETECTION_PUBLISH_FAILURES)
             log.exception(
                 "failed to publish detection %s to redis stream %s",
                 detection.detection_id,
