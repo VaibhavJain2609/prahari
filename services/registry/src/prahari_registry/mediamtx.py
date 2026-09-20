@@ -104,9 +104,7 @@ class MediaMTXClient:
             # until send, and a test must be able to see the credential. With
             # no token configured the header carries an empty password and
             # enforcement is off on both sides anyway.
-            basic = base64.b64encode(
-                f"{MTX_API_USER}:{self._s.internal_token}".encode()
-            ).decode()
+            basic = base64.b64encode(f"{MTX_API_USER}:{self._s.internal_token}".encode()).decode()
             self._client = httpx.AsyncClient(
                 base_url=self._s.mediamtx_api_url,
                 timeout=10.0,
