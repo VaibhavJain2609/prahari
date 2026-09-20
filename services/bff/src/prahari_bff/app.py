@@ -15,9 +15,11 @@ from __future__ import annotations
 import asyncio
 import csv
 import dataclasses
+import hmac
 import io
 import json
 import logging
+import secrets
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 from urllib.parse import quote, urlparse
@@ -25,7 +27,7 @@ from urllib.parse import quote, urlparse
 import httpx
 import redis as redis_lib
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from google.protobuf.json_format import MessageToDict
 from prahari.v1 import events_pb2
 from prahari_common.bus import RedisStreamConsumer
@@ -45,6 +47,16 @@ from .models import (
     Principal,
     User,
     UserCreate,
+)
+from .oidc import (
+    OIDC_MARKER_COOKIE_NAME,
+    STATE_COOKIE_NAME,
+    STATE_TTL_S,
+    OidcClient,
+    map_realm_role,
+    new_pkce_pair,
+    safe_next,
+    validate_org_path_claim,
 )
 from .registry_client import RegistryClient
 from .repository import (
@@ -1377,3 +1389,170 @@ async def verify_audit(principal: AdminDep, audit: AuditDep) -> dict:
         "head_hash": head_hash,
         "row_count": row_count,
     }
+
+
+# --- oidc (Keycloak SSO) -----------------------------------------------------
+#
+# `auth.kind=keycloak` in the chart (docs/KEYCLOAK.md). All three routes 404
+# unless `oidc_enabled` — `builtin` leaves the estate exactly as before and the
+# bootstrap admin stays the break-glass path.
+#
+# The flow: /oidc/login redirects the browser to Keycloak with a PKCE
+# challenge; Keycloak returns a code to /oidc/callback, which exchanges it
+# server-side (confidential client `prahari-bff`), validates the id_token
+# against the realm JWKS, resolves or JIT-provisions the local user, and mints
+# the same opaque `prahari_session` cookie builtin login does — so proxy.ts,
+# SSE, RBAC and audit downstream are unchanged.
+
+
+def _get_oidc(request: Request) -> OidcClient:
+    """Built lazily on first use and stashed on `app.state` so the JWKS cache
+    outlives one request. Tests inject their own (MockTransport-backed)
+    client by setting `app.state.oidc` directly."""
+    oidc = getattr(request.app.state, "oidc", None)
+    if oidc is None:
+        oidc = OidcClient(request.app.state.settings)
+        request.app.state.oidc = oidc
+    return oidc
+
+
+def _require_oidc(request: Request) -> OidcClient:
+    """404 — not 503 — when OIDC is off: the route does not exist in a builtin
+    deployment, which is exactly what a caller probing the surface should
+    learn."""
+    if not request.app.state.settings.oidc_enabled:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "not found")
+    return _get_oidc(request)
+
+
+@app.get("/api/v1/auth/oidc/login", tags=["auth"])
+async def oidc_login(request: Request, next: str = "/") -> RedirectResponse:
+    settings: BFFSettings = request.app.state.settings
+    oidc = _require_oidc(request)
+    verifier, challenge = new_pkce_pair()
+    nonce = secrets.token_urlsafe(24)
+    response = RedirectResponse(
+        oidc.authorize_url(state=nonce, challenge=challenge, nonce=nonce),
+        status_code=status.HTTP_302_FOUND,
+    )
+    # The verifier, the CSRF nonce and where to land afterward ride in one
+    # signed httponly cookie — nothing server-side to persist, any replica can
+    # complete the flow.
+    response.set_cookie(
+        STATE_COOKIE_NAME,
+        oidc.seal_state(nonce=nonce, verifier=verifier, next_path=safe_next(next)),
+        httponly=True,
+        secure=settings.session_cookie_secure,
+        samesite="lax",
+        max_age=STATE_TTL_S,
+    )
+    return response
+
+
+@app.get("/api/v1/auth/oidc/callback", tags=["auth"])
+async def oidc_callback(request: Request, code: str = "", state: str = "") -> RedirectResponse:
+    settings: BFFSettings = request.app.state.settings
+    session_repo: SessionRepository = request.app.state.session_repo
+    user_repo: UserRepository = request.app.state.user_repo
+    pool = request.app.state.pool
+    oidc = _require_oidc(request)
+
+    if not code or not state:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing code or state")
+    sealed = oidc.open_state(request.cookies.get(STATE_COOKIE_NAME) or "")
+    if not hmac.compare_digest(str(sealed.get("n", "")), state):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "oidc state mismatch")
+
+    token = await oidc.exchange_code(code=code, verifier=str(sealed.get("v", "")))
+    claims = await oidc.validate_id_token(token["id_token"], expected_nonce=state)
+
+    username = claims.get("preferred_username") or claims.get("sub")
+    if not username:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "id_token carries no usable subject")
+    org_path_claim = validate_org_path_claim(claims)
+
+    # Resolve or JIT-provision. For an existing user Postgres stays
+    # authoritative — role and org come from the users row, and a present
+    # org_path claim is only a consistency check that must agree with it.
+    # For a new user the claim is the only org signal, so it is mandatory,
+    # alphabet-validated, and must name an org that actually exists.
+    resolved = await user_repo.get_by_username_with_hash(username)
+    if resolved is not None:
+        user, _password_hash = resolved
+        if user.disabled_at is not None:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "account is disabled")
+        if org_path_claim is not None:
+            db_org_path = await org_path_for_id(pool, user.org_id)
+            if org_path_claim != db_org_path:
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    "org_path claim does not match this account's org",
+                )
+    else:
+        if org_path_claim is None:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "no org_path claim and no existing account — cannot provision",
+            )
+        org_id = await pool.fetchval("SELECT id FROM orgs WHERE path = $1::ltree", org_path_claim)
+        if org_id is None:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "org_path claim names no known org")
+        # Random unusable password: an SSO-provisioned row can never satisfy
+        # builtin password login, which remains the bootstrap admin's alone.
+        user = await user_repo.create(
+            UserCreate(
+                username=username,
+                password=secrets.token_urlsafe(32),
+                org_id=str(org_id),
+                role=map_realm_role(claims),
+            )
+        )
+
+    session_id, expires_at = await session_repo.create(
+        user.id, ttl_hours=settings.session_ttl_hours
+    )
+    response = RedirectResponse(safe_next(sealed.get("next")), status_code=status.HTTP_302_FOUND)
+    response.set_cookie(
+        settings.session_cookie_name,
+        session_id,
+        httponly=True,
+        secure=settings.session_cookie_secure,
+        samesite="lax",
+        expires=expires_at,
+    )
+    # Lets logout tell an OIDC-born session from a builtin one — the sessions
+    # table has no auth-via column (006_identity.sql is registry-owned).
+    response.set_cookie(
+        OIDC_MARKER_COOKIE_NAME,
+        "1",
+        httponly=True,
+        secure=settings.session_cookie_secure,
+        samesite="lax",
+        expires=expires_at,
+    )
+    response.delete_cookie(STATE_COOKIE_NAME)
+    return response
+
+
+@app.post("/api/v1/auth/oidc/logout", tags=["auth"])
+async def oidc_logout(request: Request, response: Response) -> dict:
+    """Revoke the local session AND hand back the RP-initiated logout URL.
+    Returning the URL rather than 302-ing: the console's fetch follows a
+    redirect into Keycloak's HTML page, so it navigates `window.location`
+    itself. A non-OIDC session gets plain local logout semantics and no URL."""
+    oidc = _require_oidc(request)
+    settings: BFFSettings = request.app.state.settings
+    session_repo: SessionRepository = request.app.state.session_repo
+
+    session_id = request.cookies.get(settings.session_cookie_name)
+    if session_id:
+        await session_repo.revoke(session_id)
+    response.delete_cookie(settings.session_cookie_name)
+    response.delete_cookie(OIDC_MARKER_COOKIE_NAME)
+
+    result: dict = {"status": "ok"}
+    if request.cookies.get(OIDC_MARKER_COOKIE_NAME) == "1":
+        result["end_session_url"] = oidc.end_session_url(
+            post_logout_redirect_uri=settings.oidc_redirect_base
+        )
+    return result

@@ -1,0 +1,121 @@
+{{/*
+The in-chart Keycloak — a dev-mode IdP for the local profile, rendered only
+when auth.kind=keycloak, auth.keycloak.enabled is on, and no external
+auth.keycloak.url was given (a set `url` means "the IdP lives elsewhere" and
+this deployment would be dead weight).
+
+Deliberately `start-dev` and not a production topology: H2 in-container
+database, no TLS, bootstrap admin/admin. That is acceptable for the laptop
+profile the same way the generated Postgres password is — the laptop is the
+trust boundary — and it is NOT acceptable for gpu, which is why values-gpu
+points at an external instance instead. Reaching for the Keycloak Operator
+here was weighed and rejected in docs/NEXT-PHASE-PLAN.md §3: a CRD lifecycle
+for one realm is disproportionate.
+
+The realm itself arrives via the prahari-keycloak-realm ConfigMap
+(keycloak-realm-configmap.yaml) mounted at /opt/keycloak/data/import and
+imported once at boot by --import-realm. Re-imports on restart are idempotent
+for a dev realm (H2 is recreated with the pod anyway).
+*/}}
+{{- if and .Values.auth.keycloak.enabled (eq .Values.auth.kind "keycloak") (not .Values.auth.keycloak.url) }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prahari-keycloak
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+    app.kubernetes.io/name: keycloak
+spec:
+  # start-dev keeps its realm in an embedded H2 file — two replicas would be
+  # two divergent IdPs. Recreate, not rolling, for the same reason.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "prahari.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/name: keycloak
+  template:
+    metadata:
+      labels:
+        {{- include "prahari.labels" . | nindent 8 }}
+        app.kubernetes.io/name: keycloak
+    spec:
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: keycloak
+          image: {{ .Values.auth.keycloak.image }}
+          args: ["start-dev", "--import-realm"]
+          env:
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            # iss is pinned to the BROWSER-facing base — the BFF validates it
+            # against PRAHARI_OIDC_ISSUER_URL while reaching the realm itself
+            # over the Service name (PRAHARI_OIDC_INTERNAL_URL). Strict off so
+            # the admin console still answers on whatever host a port-forward
+            # hands it.
+            - name: KC_HOSTNAME
+              value: {{ .Values.auth.keycloak.publicUrl | quote }}
+            - name: KC_HOSTNAME_STRICT
+              value: "false"
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+            # start-dev bootstrap admin for the throwaway local realm — a
+            # dev-only credential on a laptop-only IdP, the same class of
+            # secret as a generated postgres password. Real deployments are
+            # external (auth.keycloak.url) and manage their own admin.
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              value: "admin"
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              value: "admin"
+          ports:
+            - name: http
+              containerPort: 8080
+            # Management port: /health/ready and /health/live live here, not
+            # on the HTTP listener — KC splits them so a wedged realm doesn't
+            # take down the probe surface.
+            - name: management
+              containerPort: 9000
+          resources:
+            {{- toYaml .Values.auth.keycloak.resources | nindent 12 }}
+          volumeMounts:
+            - name: realm
+              mountPath: /opt/keycloak/data/import
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 9000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            # JVM start + realm import is the slowest boot in the chart;
+            # give it real headroom before declaring unready.
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 9000
+            initialDelaySeconds: 60
+            periodSeconds: 20
+      volumes:
+        - name: realm
+          configMap:
+            name: prahari-keycloak-realm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prahari-keycloak
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+    app.kubernetes.io/name: keycloak
+spec:
+  selector:
+    {{- include "prahari.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/name: keycloak
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+{{- end }}

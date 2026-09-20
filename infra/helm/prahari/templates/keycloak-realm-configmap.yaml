@@ -1,0 +1,120 @@
+{{/*
+Realm import for the in-chart dev IdP — mounted into the Keycloak container
+and imported at boot with `--import-realm` (templates/keycloak.yaml).
+
+Same gate as the deployment: only rendered when auth.kind=keycloak, the
+in-chart IdP is enabled, and no external `auth.keycloak.url` was given.
+
+Deliberately contains NO users: this is a public repo and a realm file full
+of test users is a credential leak waiting to be committed. Bootstrapping a
+user (admin console -> user -> org_path attribute + realm role) is documented
+in docs/KEYCLOAK.md.
+
+What the realm DOES carry:
+
+- realm roles viewer/operator/admin — the exact set BFF claim mapping
+  intersects `realm_access.roles` with (prahari_bff.oidc.map_realm_role).
+- ONE confidential client, `prahari-bff`. The BFF does the code exchange
+  server-side so the secret never lives in a browser; PKCE is still enforced
+  (S256) as defence in depth. The `secret` below is a dev-only placeholder —
+  it protects a throwaway laptop IdP and must match the `client-secret` key
+  of the `prahari-oidc` Secret for the flow to complete.
+- Claim mappers pinned ON the client (not via client scopes, which a minimal
+  realm import does not get for free):
+    preferred_username  <- user property `username`
+    realm_access.roles  <- the user's realm roles
+    org_path            <- user attribute `org_path` (set per user at
+                           bootstrap; the BFF validates the ltree alphabet
+                           and requires the org to exist)
+*/}}
+{{- if and .Values.auth.keycloak.enabled (eq .Values.auth.kind "keycloak") (not .Values.auth.keycloak.url) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prahari-keycloak-realm
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+    app.kubernetes.io/name: keycloak
+data:
+  prahari-realm.json: |
+    {
+      "realm": {{ .Values.auth.keycloak.realm | quote }},
+      "enabled": true,
+      "sslRequired": "none",
+      "roles": {
+        "realm": [
+          {"name": "viewer", "description": "Read-only console access"},
+          {"name": "operator", "description": "Camera registration and operations"},
+          {"name": "admin", "description": "User/key/org administration"}
+        ]
+      },
+      "clients": [
+        {
+          "clientId": {{ .Values.auth.keycloak.clientId | quote }},
+          "name": "PRAHARI BFF",
+          "enabled": true,
+          "protocol": "openid-connect",
+          "publicClient": false,
+          "secret": "dev-only-not-a-real-secret",
+          "standardFlowEnabled": true,
+          "implicitFlowEnabled": false,
+          "directAccessGrantsEnabled": false,
+          "serviceAccountsEnabled": false,
+          "redirectUris": [
+            {{ printf "%s/api/bff/auth/oidc/callback" (required "auth.redirectBase must be set when auth.kind=keycloak" .Values.auth.redirectBase | trimSuffix "/") | quote }},
+            {{ .Values.auth.redirectBase | trimSuffix "/" | quote }}
+          ],
+          "webOrigins": [
+            {{ .Values.auth.redirectBase | trimSuffix "/" | quote }}
+          ],
+          "attributes": {
+            "pkce.code.challenge.method": "S256",
+            "post.logout.redirect.uris": "+"
+          },
+          "protocolMappers": [
+            {
+              "name": "preferred_username",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-property-mapper",
+              "consentRequired": false,
+              "config": {
+                "user.attribute": "username",
+                "claim.name": "preferred_username",
+                "jsonType.label": "String",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true"
+              }
+            },
+            {
+              "name": "realm roles",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-realm-role-mapper",
+              "consentRequired": false,
+              "config": {
+                "claim.name": "realm_access.roles",
+                "jsonType.label": "String",
+                "multivalued": "true",
+                "id.token.claim": "true",
+                "access.token.claim": "true"
+              }
+            },
+            {
+              "name": "org_path",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-attribute-mapper",
+              "consentRequired": false,
+              "config": {
+                "user.attribute": "org_path",
+                "claim.name": "org_path",
+                "jsonType.label": "String",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true"
+              }
+            }
+          ]
+        }
+      ]
+    }
+{{- end }}

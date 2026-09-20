@@ -131,6 +131,46 @@ class BFFSettings(BaseSettings):
     unbounded fan-out is a self-inflicted DoS. Beyond the cap the endpoint
     answers 429; the browser retries."""
 
+    # --- oidc (Keycloak SSO) --------------------------------------------------
+    #
+    # Everything below is inert unless oidc_enabled — `auth.kind=builtin` in the
+    # chart leaves every /api/v1/auth/oidc/* route answering 404 and the builtin
+    # login page untouched, so the bootstrap admin stays the break-glass path.
+    # See docs/KEYCLOAK.md.
+
+    oidc_enabled: bool = False
+    """Master switch, wired to `auth.kind=keycloak` in the chart. When False
+    the oidc routes do not exist (404) and nothing here is read."""
+
+    oidc_issuer_url: str | None = None
+    """The PUBLIC issuer — the browser-reachable Keycloak realm base
+    (`https://sso.example.gov.in/realms/prahari`). Used as the expected `iss`
+    claim AND as the base for browser-facing endpoints (authorize, RP-initiated
+    logout), so it must be the URL the browser actually navigates to, not the
+    in-cluster Service name."""
+
+    oidc_internal_url: str | None = None
+    """Cluster-internal base for server-to-server calls (token exchange, JWKS
+    fetch) — e.g. `http://prahari-keycloak:8080/realms/prahari`. The browser
+    and the pod reach the same realm through different URLs, and Keycloak pins
+    `iss` to the public hostname; when unset this falls back to
+    `oidc_issuer_url`, which is correct whenever one URL serves both."""
+
+    oidc_client_id: str = "prahari-bff"
+    oidc_client_secret: str = ""
+    """Confidential-client credential for the code exchange, delivered via the
+    out-of-band `prahari-oidc` Secret — never in values.yaml. Empty only in a
+    profile where no Secret exists; token exchange then relies on PKCE alone,
+    which is accepted for local dev and wrong anywhere else."""
+
+    oidc_redirect_base: str | None = None
+    """Public origin of the CONSOLE (web) app — the callback URL is
+    `{oidc_redirect_base}/api/bff/auth/oidc/callback`, routed back to this
+    service through the console's own BFF proxy so the session cookie lands on
+    the console's origin."""
+
+    oidc_scopes: str = "openid profile email"
+
     # --- bootstrap -----------------------------------------------------------
 
     bootstrap_admin_username: str | None = None
