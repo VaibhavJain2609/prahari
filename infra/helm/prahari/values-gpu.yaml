@@ -54,9 +54,17 @@ services:
 #   browserWhepBase: https://streams.example.gov.in
 
 inference:
+  # The CUDA variant — built as prahari-inference:<tag>-cuda by CI
+  # (services/inference/Dockerfile.gpu). Without this override the gpu
+  # profile would schedule a CPU image onto the GPU node.
+  # image: <registry>/prahari-inference:dev-cuda
   replicas: 2
   model: yolov8s.pt
-  decodeBackend: nvdec        # hardware decode — the single biggest lever
+  # nvdec is NOT real today: capture.py never consumes decode_backend, and
+  # opencv-python-headless's bundled ffmpeg has no NVDEC — this currently
+  # decodes in software. Scale numbers produced under this profile are
+  # CPU-decode numbers; label them as such (docs/SCALE-80K.md).
+  decodeBackend: nvdec
   device: cuda                # model device for the GPU profile
   samplingFps: 4
   maxStreamsPerWorker: 50     # WORKING ESTIMATE — replace with the measured value
