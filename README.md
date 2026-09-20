@@ -54,7 +54,7 @@ middleware), with Model 2 direct-connect as one adapter class.
    ┌────────┼────────┬──────────────┐
    ▼        ▼        ▼              ▼
 registry  correlation  BFF ──── Next.js console
-+ PostGIS  route recon  REST+SSE   MapLibre (WHEP preview planned)
++ PostGIS  route recon  REST+SSE   MapLibre · audited WHEP preview tickets
 ```
 
 ## What is deliberately different
@@ -73,7 +73,9 @@ registry  correlation  BFF ──── Next.js console
 5. **Live camera health** — heartbeat, FPS drift, black-frame and tamper
    detection — feeding Model 1's coverage-gap analysis.
 6. **A measured scaling curve**, on rented GPU hardware, rather than an asserted
-   one.
+   one — the harness (`infra/loadtest/`) and the `profile=gpu` switch exist;
+   the run itself is pending, and every dependent number is labelled estimate
+   until it lands.
 
 ## Repository layout
 
@@ -86,10 +88,10 @@ infra/
   helm/         umbrella chart; profile: local | gpu is the ONLY cutover knob
   k3d/          local cluster — same Kubernetes API as the cloud
   terraform/    modules/district — statewide rollout as a runnable artifact
-docs/           PLAN · HLD · SECURITY · DAY2-DESIGN · DAY3-DESIGN ·
-                ORG-TIERS-DESIGN · NEXT-PHASE-PLAN (on branch
-                docs/next-phase-plan — post-submission hardening plan)
-                Planned, not yet written: SCALE-80K · COST-MODEL · DEMO-SCRIPT
+docs/           PLAN · HLD · SECURITY · SCALE-80K · COST-MODEL ·
+                DEMO-SCRIPT · OPERATIONS · OBSERVABILITY · KEYCLOAK ·
+                ORG-TIERS-DESIGN · DAY2-DESIGN · DAY3-DESIGN ·
+                NEXT-PHASE-PLAN (post-submission hardening)
 ```
 
 ## Local first
@@ -177,28 +179,36 @@ cannot drift apart. Nothing district-specific is hardcoded in the module body.
 
 ## Status
 
-Through Day 3's gate, local-first on k3d: the full vertical slice runs on a
-laptop. `services/registry` (FastAPI + PostGIS, org-scoped RBAC, catalogue
-sync, live camera health) and `services/inference` (decode → motion gate →
-YOLO → OCR, lazily-loaded backends) landed Day 1/2, alongside the confusion-aware
-`match-engine` and its watchlist gate test. Day 3 added `services/correlation`
-(cross-camera stitching with spatio-temporal feasibility gating), `services/bff`
-(auth, sessions, API keys, org-scoped proxying, SSRF-hardened RTSP probing, bulk
-CSV import, hash-chained audit log, SSE), and the `web/` Next.js console
-(auth-gated board, MapLibre camera health map, plate trace, alert console,
-onboarding and admin panels) — gated by an executable test: plate in, a
-timestamped route out, with an injected impossible hop rejected and a
-non-watchlist plate correctly producing no alert.
+Local-first on k3d: the full vertical slice runs on a laptop. Since the
+Day-3 gate the following also landed:
 
-Not yet done: the Day 4 cloud cutover (`profile=gpu` Helm switch is written and
-`terraform apply` for a district is `validate`-clean, but neither has been run
-against rented GPU hardware), the measured streams-per-GPU figure that
-`docs/SCALE-80K.md` and the Terraform module's node-count math both depend on,
-and the Day 5/6 load test, `docs/COST-MODEL.md`, and demo submission
-artifacts. (`docs/HLD.md` and `docs/SECURITY.md` have since been written.)
-See `TODO.md` for the day-by-day checklist and `CLAUDE.md` for the hard
-invariants — several of them (RTSP over TCP, never trust `CAP_PROP_FPS`, feeds
-loop) come straight from the portal's Integrator's Guide and will otherwise
-cost real debugging hours. The submission window has now passed; what comes
-next — including the security and deployment gaps this README does not hide —
-is `docs/NEXT-PHASE-PLAN.md` (on branch `docs/next-phase-plan`).
+- **Worker sharding** — inference pods register with the registry
+  (`workers` table, lease-reaped) and pull `(row_number-1) % shard_count`
+  slices of the estate instead of every pod racing the same cameras.
+- **Alert persistence** — the match engine writes every alert to Postgres
+  *before* publishing to the Redis relay; `GET /api/v1/alerts` +
+  `POST /api/v1/alerts/{id}/ack` expose it through the BFF, org-scoped.
+  (The console's `/alerts` history page is still a stub — live alerts are
+  the rail.)
+- **Audited live preview** — `POST /api/v1/media/preview-ticket` writes
+  `video_preview` to the hash chain *before* minting a scoped, ~60-second
+  Ed25519 JWT for MediaMTX WHEP; the console's camera drawer drives it.
+- **Keycloak SSO** — `auth.kind: builtin | keycloak` (OIDC code+PKCE minting
+  the same `prahari_session`; `docs/KEYCLOAK.md`). Off in both profiles —
+  builtin login stays the default and the bootstrap admin is break-glass.
+- **Observability wiring** — hand-rolled `/metrics` on match-engine,
+  correlation, inference and MediaMTX; scrape annotations + optional
+  ServiceMonitors behind `observability.enabled`. No Prometheus alerting
+  exists — `docs/OBSERVABILITY.md` says so plainly.
+- **`make backup`** — pg_dump + the audit.db off the cluster
+  (`docs/OPERATIONS.md`).
+
+Still not done: the cloud cutover (`profile=gpu` renders and
+`terraform apply` for a district is `validate`-clean, but neither has run
+against rented hardware), the measured streams-per-GPU figure that
+`docs/SCALE-80K.md` and the Terraform module's node-count math both depend
+on, the load test itself, and evidence clip pull (preview tickets exist;
+nothing stores edge segments yet). See `TODO.md` for the checklist,
+`CLAUDE.md` for the hard invariants, and `docs/NEXT-PHASE-PLAN.md` for
+post-submission hardening — including the security and deployment gaps this
+README does not hide.
