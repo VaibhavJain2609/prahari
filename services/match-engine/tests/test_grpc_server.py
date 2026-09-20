@@ -10,17 +10,24 @@ needed.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from concurrent import futures
 from datetime import UTC, datetime
 
 import grpc
+import pytest
 from google.protobuf.timestamp_pb2 import Timestamp
-from prahari.v1 import adapter_pb2, common_pb2, events_pb2
+from prahari.v1 import adapter_pb2, adapter_pb2_grpc, common_pb2, events_pb2
 
 from prahari_match.alerts import AlertBuilder, NullPublisher, RecentAlertsPublisher
 from prahari_match.bloom import BloomFilter
 from prahari_match.config import MatchSettings
 from prahari_match.dedup import Deduper
-from prahari_match.grpc_server import MetadataIngestServicer, serve
+from prahari_match.grpc_server import (
+    InternalTokenInterceptor,
+    MetadataIngestServicer,
+    serve,
+)
 from prahari_match.matcher import WatchlistStore
 from prahari_match.watchlist import Watchlist
 
@@ -307,6 +314,59 @@ class TestServe:
             assert options["grpc.max_concurrent_streams"] == 100
         finally:
             server.stop(0)
+
+
+class TestInternalTokenInterceptor:
+    """`InternalTokenInterceptor` on a real loopback server -- the wire check
+    (metadata in, UNAUTHENTICATED out) is what a misconfigured worker
+    actually hits, and it cannot be exercised by calling the servicer
+    directly like the tests above do.
+
+    `serve()` only installs the interceptor when `MatchSettings.internal_token`
+    is set, so the empty-token case needs no wire test at all: no interceptor,
+    no check.
+    """
+
+    @pytest.fixture
+    def gated_server(self):
+        store = _store_with("GJ01AB1234")
+        servicer, _recent, _detections = _servicer(store)
+        server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=2),
+            interceptors=[InternalTokenInterceptor("tok-1")],
+        )
+        adapter_pb2_grpc.add_MetadataIngestServiceServicer_to_server(servicer, server)
+        port = server.add_insecure_port("127.0.0.1:0")
+        server.start()
+        channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+        try:
+            yield adapter_pb2_grpc.MetadataIngestServiceStub(channel)
+        finally:
+            channel.close()
+            server.stop(grace=None)
+
+    def _request(self) -> Iterator[adapter_pb2.StreamDetectionsRequest]:
+        return iter(
+            [adapter_pb2.StreamDetectionsRequest(detection=_detection("CAM-1", "GJ01AB1234"))]
+        )
+
+    def test_call_with_the_right_token_reaches_the_servicer(self, gated_server) -> None:
+        response = gated_server.StreamDetections(
+            self._request(), metadata=(("x-internal-token", "tok-1"),)
+        )
+        assert response.ack.accepted == 1
+
+    def test_call_without_a_token_is_unauthenticated(self, gated_server) -> None:
+        with pytest.raises(grpc.RpcError) as exc:
+            gated_server.StreamDetections(self._request())
+        assert exc.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+    def test_call_with_a_wrong_token_is_unauthenticated(self, gated_server) -> None:
+        with pytest.raises(grpc.RpcError) as exc:
+            gated_server.StreamDetections(
+                self._request(), metadata=(("x-internal-token", "wrong"),)
+            )
+        assert exc.value.code() == grpc.StatusCode.UNAUTHENTICATED
 
 
 class TestStreamHealth:

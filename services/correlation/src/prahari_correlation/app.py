@@ -12,6 +12,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, Request, Response, status
 from fastapi.responses import PlainTextResponse
+from prahari_common.internal_auth import expected_token_ok, provided_token
 
 from .config import CorrelationSettings, correlation_settings
 from .consumer import DetectionConsumer
@@ -40,11 +41,19 @@ async def lifespan(app: FastAPI):
     consumer = DetectionConsumer(settings.redis_url, settings.redis_detection_stream_key, store)
     consumer.start()
 
+    if not settings.internal_token:
+        log.warning(
+            "internal auth disabled: PRAHARI_CORRELATION_INTERNAL_TOKEN is unset, "
+            "so /api/* is reachable by anything that can reach this pod"
+        )
+
     registry = RegistryClient(
         settings.registry_base_url,
         settings.registry_timeout_s,
         settings.camera_location_cache_ttl_s,
         metrics=metrics,
+        internal_token=settings.registry_internal_token,
+
     )
 
     metrics.gauge("store_plates", store.tracked_plate_count)
@@ -70,6 +79,25 @@ app = FastAPI(
     summary="Cross-camera route reconstruction",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def require_internal_token(request: Request, call_next):
+    """Same gate as the registry's `require_internal_token` — a route
+    reconstruction is movement history, precisely what the BFF's authorisation
+    exists to control, so this service must not be reachable directly once the
+    token is armed.
+
+    `/healthz` and `/readyz` are exempt — a probe carries no data and must not
+    depend on a secret being wired correctly to answer. Empty
+    `internal_token` disables the gate entirely (`expected_token_ok`)."""
+    settings: CorrelationSettings = request.app.state.settings
+    if settings.internal_token and request.url.path not in ("/healthz", "/readyz"):
+        if not expected_token_ok(provided_token(request.headers), settings.internal_token):
+            return Response(
+                status_code=status.HTTP_401_UNAUTHORIZED, content="internal token required"
+            )
+    return await call_next(request)
 
 
 # --- dependencies ------------------------------------------------------------

@@ -18,6 +18,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import PlainTextResponse
 from google.protobuf.json_format import MessageToDict
+from prahari_common.internal_auth import expected_token_ok, provided_token
 
 from .alerts import FanOutPublisher, RecentAlertsPublisher, RedisStreamPublisher
 from .bloom import BloomFilter
@@ -105,6 +106,11 @@ async def lifespan(app: FastAPI):
         )
     else:
         log.warning("PRAHARI_MATCH_REDIS_URL not set; alerts fan out only to /api/v1/alerts")
+    if not settings.internal_token:
+        log.warning(
+            "internal auth disabled: PRAHARI_MATCH_INTERNAL_TOKEN is unset, so /api/* "
+            "and MetadataIngestService are reachable by anything that can reach this pod"
+        )
     fan_out = FanOutPublisher(publishers) if len(publishers) > 1 else recent
 
     detection_publisher: DetectionPublisher
@@ -140,6 +146,25 @@ app = FastAPI(
     summary="Confusion-aware watchlist matching and alert fan-out",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def require_internal_token(request: Request, call_next):
+    """Same gate as the registry's `require_internal_token`, on this service's
+    HTTP surface — watchlist admin and the alerts debug view are exactly what
+    the token exists to keep cluster-internal. The gRPC surface is gated
+    separately, by `InternalTokenInterceptor` in `grpc_server.py`.
+
+    `/healthz` and `/readyz` are exempt — a probe carries no data and must not
+    depend on a secret being wired correctly to answer. Empty
+    `internal_token` disables the gate entirely (`expected_token_ok`)."""
+    settings: MatchSettings = request.app.state.settings
+    if settings.internal_token and request.url.path not in ("/healthz", "/readyz"):
+        if not expected_token_ok(provided_token(request.headers), settings.internal_token):
+            return Response(
+                status_code=status.HTTP_401_UNAUTHORIZED, content="internal token required"
+            )
+    return await call_next(request)
 
 
 # --- dependencies ------------------------------------------------------------

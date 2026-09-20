@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 
 import httpx
+from prahari_common import internal_auth
 
 from .metrics import Metrics
 
@@ -38,12 +39,20 @@ class RegistryClient:
         base_url: str,
         timeout_s: float,
         cache_ttl_s: float,
+        *,
+        internal_token: str = "",
         client: httpx.AsyncClient | None = None,
         metrics: Metrics | None = None,
     ) -> None:
         self._cache_ttl_s = cache_ttl_s
         self._client = client or httpx.AsyncClient(base_url=base_url, timeout=timeout_s)
         self._metrics = metrics if metrics is not None else Metrics()
+        if internal_token:
+            # The registry's `require_internal_token` gate. Every call this
+            # client makes goes to the registry, so the header lives on the
+            # client rather than per request — set on an injected client too,
+            # since the credential is this client's contract either way.
+            self._client.headers[internal_auth.HEADER_NAME] = internal_token
         # camera_id -> (cached_at_monotonic, location). A miss (camera has no
         # location, or the lookup failed) is cached too -- otherwise a
         # location-less camera costs one HTTP round trip on every hop for the

@@ -232,6 +232,47 @@ def test_assignments_are_not_filtered_by_health_state():
     assert "state" not in seen[0].params
 
 
+# --- the internal token --------------------------------------------------------
+
+
+def test_registry_client_sends_x_internal_token_when_set():
+    """Once the registry arms `require_internal_token`, a worker that does not
+    send the credential gets 401 on assignments AND heartbeats -- the whole
+    health contract silently dies. The header goes on the client, so both
+    calls carry it."""
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("x-internal-token"))
+        if request.method == "POST":
+            return httpx.Response(200, json={"camera_id": "x", "state": "healthy", "reason": "ok"})
+        return httpx.Response(200, json=[])
+
+    settings = IngestSettings(internal_token="tok-1")
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
+    client = RegistryClient(settings, client=http)
+
+    client.assignments()
+    client.heartbeat("cam-1", {"connected": True})
+
+    assert seen == ["tok-1", "tok-1"]
+
+
+def test_registry_client_sends_no_credential_when_token_is_unset():
+    """Empty means the gate is off on the registry's side too -- sending an
+    empty header would be a credential-shaped lie, not a no-op."""
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("x-internal-token"))
+        return httpx.Response(200, json=[])
+
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
+    RegistryClient(SETTINGS, client=http).assignments()
+
+    assert seen == [None]
+
+
 # --- what gets reported ------------------------------------------------------
 
 

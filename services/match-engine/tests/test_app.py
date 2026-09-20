@@ -34,9 +34,13 @@ def watchlist_dir(tmp_path: Path) -> Path:
     return directory
 
 
-def _client(monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path) -> TestClient:
+def _client(
+    monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path, internal_token: str | None = None
+) -> TestClient:
     monkeypatch.setenv("PRAHARI_MATCH_WATCHLIST_DIR", str(watchlist_dir))
     monkeypatch.setenv("PRAHARI_MATCH_GRPC_PORT", "0")  # ephemeral -- no fixed-port collisions
+    if internal_token is not None:
+        monkeypatch.setenv("PRAHARI_MATCH_INTERNAL_TOKEN", internal_token)
     return TestClient(app)
 
 
@@ -124,6 +128,49 @@ class TestWatchlistAdmin:
             assert reload_response.status_code == 200
             assert reload_response.json()["entries"] == 3
             assert client.get("/api/v1/watchlist/summary").json()["entries"] == 3
+
+
+class TestInternalToken:
+    """`require_internal_token`: once PRAHARI_MATCH_INTERNAL_TOKEN is set, the
+    HTTP admin surface (watchlist, /alerts) answers 401 without the credential.
+    Unset means the gate is off entirely -- the local/dev default. The gRPC
+    surface's gate is `InternalTokenInterceptor`, covered in
+    test_grpc_server.py."""
+
+    def test_unset_token_leaves_the_api_open(
+        self, monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path
+    ) -> None:
+        with _client(monkeypatch, watchlist_dir) as client:
+            assert client.get("/api/v1/alerts").status_code == 200
+
+    def test_armed_gate_rejects_a_missing_token(
+        self, monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path
+    ) -> None:
+        with _client(monkeypatch, watchlist_dir, internal_token="tok-1") as client:
+            assert client.get("/api/v1/alerts").status_code == 401
+            assert client.post("/api/v1/watchlist/reload").status_code == 401
+
+    def test_armed_gate_rejects_a_wrong_token(
+        self, monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path
+    ) -> None:
+        with _client(monkeypatch, watchlist_dir, internal_token="tok-1") as client:
+            response = client.get("/api/v1/alerts", headers={"x-internal-token": "wrong"})
+        assert response.status_code == 401
+
+    def test_armed_gate_accepts_the_right_token(
+        self, monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path
+    ) -> None:
+        with _client(monkeypatch, watchlist_dir, internal_token="tok-1") as client:
+            response = client.get("/api/v1/alerts", headers={"x-internal-token": "tok-1"})
+        assert response.status_code == 200
+
+    def test_healthz_stays_open_when_armed(
+        self, monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path
+    ) -> None:
+        # A liveness probe carries no data and must not depend on a secret
+        # being wired correctly to answer.
+        with _client(monkeypatch, watchlist_dir, internal_token="tok-1") as client:
+            assert client.get("/healthz").status_code == 200
 
 
 class TestAlerts:
