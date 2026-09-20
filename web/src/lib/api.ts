@@ -56,21 +56,53 @@ export type ImportResult = {
   rows: ImportRowResult[];
 };
 
+// Mirrors services/correlation/src/prahari_correlation/app.py::_route_to_dict.
+// `location` is a GeoPoint object on the wire, not a string — rendering it
+// inline crashes React 19, so it is typed honestly here and consumed by the
+// map, not by a text node.
+export type GeoPoint = { latitude: number; longitude: number };
+
 export type RouteHop = {
   camera_id: string;
-  location?: string;
+  location?: GeoPoint | null;
   wall_clock_s?: number;
   pts_ms?: number;
-  link_kind?: string;
+  link_kind?: "plate" | "bridged" | null;
   confidence?: number;
   evidence_ref?: string;
+};
+
+// A sighting that failed feasibility gating — excluded from `hops` and
+// recorded here instead of being silently folded into the route.
+export type RejectedHop = {
+  from_camera_id: string;
+  to_camera_id: string;
+  reason: string;
+  implied_speed_kmh: number | null;
+};
+
+// The registry's dark-zone list handed back alongside the route — the full
+// current list, not filtered to this corridor (stated simplification in
+// correlation's routes.py).
+export type DarkZone = {
+  camera_id: string;
+  location: GeoPoint | null;
 };
 
 export type RouteResult = {
   plate: string;
   hops: RouteHop[];
-  rejected: unknown[];
-  dark_zones: unknown[];
+  rejected: RejectedHop[];
+  dark_zones: DarkZone[];
+};
+
+export type CameraGeoJSON = {
+  type: "FeatureCollection";
+  features: {
+    type: "Feature";
+    geometry: { type: "Point"; coordinates: [number, number] };
+    properties: Record<string, unknown>;
+  }[];
 };
 
 export class ApiError extends Error {
@@ -82,10 +114,27 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(
-  path: string,
-  init: RequestInit & { purposeCode?: string } = {},
-): Promise<T> {
+type ApiInit = RequestInit & {
+  purposeCode?: string;
+  // login/logout must not trip the global 401 bounce — a failed login IS a
+  // 401, and redirecting to /login from /login would loop.
+  skipAuthRedirect?: boolean;
+};
+
+// A 401 anywhere in the console means the session is gone; send the operator
+// to /login with a `next` back to where they were. Browser-only: on the
+// server there is no window to navigate and no session cookie to lose.
+function redirectToLogin() {
+  if (typeof window === "undefined") return;
+  const here = window.location.pathname + window.location.search;
+  // Not a component — useRouter isn't reachable from a fetch wrapper, and a
+  // hard navigation is what we want anyway: the dead session's client state
+  // should not survive the trip to /login.
+  // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+  window.location.assign(`/login?next=${encodeURIComponent(here)}`);
+}
+
+async function request<T>(path: string, init: ApiInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
@@ -95,7 +144,12 @@ async function request<T>(
   const res = await fetch(`/api/bff/${path}`, { ...init, headers, cache: "no-store" });
   if (!res.ok) {
     const body = await res.json().catch(() => null);
-    throw new ApiError(res.status, body?.detail ?? body?.error ?? `request failed (${res.status})`);
+    const error = new ApiError(
+      res.status,
+      body?.detail ?? body?.error ?? `request failed (${res.status})`,
+    );
+    if (res.status === 401 && !init.skipAuthRedirect) redirectToLogin();
+    throw error;
   }
   if (res.status === 204) return undefined as T;
   return res.json() as Promise<T>;
@@ -105,13 +159,22 @@ function json(body: unknown): RequestInit {
   return { method: "POST", body: JSON.stringify(body) };
 }
 
+// Audited actions carry a purpose code of the form "<action>:<case ref>" —
+// the case reference is operator-supplied (a FIR/eGujCop number, an incident
+// id, …) so the hash-chained audit log records why the access happened, not
+// just that it did. A blank ref degrades gracefully to the bare action code.
+function purpose(action: string, caseRef?: string): string {
+  const ref = caseRef?.trim();
+  return ref ? `${action}:${ref}` : action;
+}
+
 export const api = {
   me: () => request<Principal>("auth/me"),
 
   login: (username: string, password: string) =>
-    request("auth/login", json({ username, password })),
+    request("auth/login", { ...json({ username, password }), skipAuthRedirect: true }),
 
-  logout: () => request("auth/logout", { method: "POST" }),
+  logout: () => request("auth/logout", { method: "POST", skipAuthRedirect: true }),
 
   listOrgs: () => request<Org[]>("orgs"),
 
@@ -128,10 +191,35 @@ export const api = {
     label: string;
   }) => request<{ plaintext: string }>("auth/api-keys", json(body)),
 
+  // The scoped camera feed. `bbox` is "min_lon,min_lat,max_lon,max_lat" in
+  // the registry's terms; `limit` caps at the registry's 100k ceiling, and a
+  // FeatureCollection that hits it is silently truncated — the caller shows
+  // the count with a ≥ caveat rather than pretending it is complete.
+  getCamerasGeoJSON: (opts: { bbox?: string; limit?: number } = {}) => {
+    const params = new URLSearchParams();
+    if (opts.bbox) params.set("bbox", opts.bbox);
+    if (opts.limit != null) params.set("limit", String(opts.limit));
+    const qs = params.toString();
+    return request<CameraGeoJSON>(`cameras/geojson${qs ? `?${qs}` : ""}`);
+  },
+
+  // Camera detail is an audited read of a specific, identifiable asset —
+  // the BFF requires a purpose code and writes it to the audit log.
+  getCamera: (cameraId: string, caseRef?: string) =>
+    request<Record<string, unknown>>(`cameras/${encodeURIComponent(cameraId)}`, {
+      purposeCode: purpose("camera-detail", caseRef),
+    }),
+
   createCamera: (body: Record<string, unknown>) => request("cameras", json(body)),
 
-  probeCamera: (body: { rtsp_url: string; username?: string; password?: string }) =>
-    request<ProbeResult>("cameras/probe", { ...json(body), purposeCode: "camera-onboarding" }),
+  probeCamera: (
+    body: { rtsp_url: string; username?: string; password?: string },
+    caseRef?: string,
+  ) =>
+    request<ProbeResult>("cameras/probe", {
+      ...json(body),
+      purposeCode: purpose("camera-onboarding", caseRef),
+    }),
 
   importCameras: (csvText: string) =>
     request<ImportResult>("cameras/import", {
@@ -140,21 +228,25 @@ export const api = {
       headers: { "content-type": "text/csv" },
     }),
 
-  getRoute: (plate: string) =>
+  getRoute: (plate: string, caseRef?: string) =>
     request<RouteResult>(`routes/${encodeURIComponent(plate)}`, {
-      purposeCode: "plate-trace",
+      purposeCode: purpose("plate-trace", caseRef),
     }),
 
   // A plain <a href> can't carry the required X-Purpose-Code header, so the
   // export is a fetch that returns bytes for the caller to hand to the
   // browser's own download machinery (an object URL click, typically).
-  exportRoute: async (plate: string, format: "csv" | "pdf") => {
+  exportRoute: async (plate: string, format: "csv" | "pdf", caseRef?: string) => {
     const res = await fetch(
       `/api/bff/routes/${encodeURIComponent(plate)}/export?format=${format}`,
-      { headers: { "x-purpose-code": "plate-trace-export" }, cache: "no-store" },
+      {
+        headers: { "x-purpose-code": purpose("plate-trace-export", caseRef) },
+        cache: "no-store",
+      },
     );
     if (!res.ok) {
       const body = await res.json().catch(() => null);
+      if (res.status === 401) redirectToLogin();
       throw new ApiError(res.status, body?.detail ?? `export failed (${res.status})`);
     }
     return res.blob();

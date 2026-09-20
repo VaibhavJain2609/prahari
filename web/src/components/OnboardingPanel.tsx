@@ -23,6 +23,7 @@ function ManualAdd() {
   const [rtspUrl, setRtspUrl] = useState("");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [caseRef, setCaseRef] = useState("");
   const [probe, setProbe] = useState<ProbeResult | null>(null);
   const [probing, setProbing] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -35,11 +36,14 @@ function ManualAdd() {
     setProbe(null);
     try {
       setProbe(
-        await api.probeCamera({
-          rtsp_url: rtspUrl.trim(),
-          username: username || undefined,
-          password: password || undefined,
-        }),
+        await api.probeCamera(
+          {
+            rtsp_url: rtspUrl.trim(),
+            username: username || undefined,
+            password: password || undefined,
+          },
+          caseRef.trim() || undefined,
+        ),
       );
     } catch (err) {
       setMessage({ ok: false, text: err instanceof ApiError ? err.message : "probe failed" });
@@ -83,49 +87,61 @@ function ManualAdd() {
         value={externalId}
         onChange={(e) => setExternalId(e.target.value)}
         placeholder="external id"
-        className="w-full rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-800"
+        aria-label="External ID"
+        className="w-full rounded border border-slate-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500"
       />
       <input
         value={siteName}
         onChange={(e) => setSiteName(e.target.value)}
         placeholder="site name"
-        className="w-full rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-800"
+        aria-label="Site name"
+        className="w-full rounded border border-slate-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500"
       />
       <input
         value={rtspUrl}
         onChange={(e) => setRtspUrl(e.target.value)}
         placeholder="rtsp://..."
-        className="w-full rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-800"
+        aria-label="RTSP URL"
+        className="w-full rounded border border-slate-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500"
       />
       <div className="flex gap-2">
         <input
           value={username}
           onChange={(e) => setUsername(e.target.value)}
           placeholder="username (optional)"
-          className="min-w-0 flex-1 rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-800"
+          aria-label="Stream username (optional)"
+          className="min-w-0 flex-1 rounded border border-slate-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500"
         />
         <input
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
           placeholder="password (optional)"
-          className="min-w-0 flex-1 rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-800"
+          aria-label="Stream password (optional)"
+          className="min-w-0 flex-1 rounded border border-slate-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500"
         />
       </div>
+      <input
+        value={caseRef}
+        onChange={(e) => setCaseRef(e.target.value)}
+        placeholder="case reference (optional — appended to probe's audit purpose)"
+        aria-label="Case reference for probe audit (optional)"
+        className="w-full rounded border border-slate-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500"
+      />
 
       <div className="flex gap-2">
         <button
           type="button"
           onClick={onProbe}
           disabled={probing || !rtspUrl.trim()}
-          className="rounded border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+          className="rounded border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 focus:outline-none focus:ring-2 focus:ring-slate-400 dark:hover:bg-slate-800 dark:focus:ring-slate-500"
         >
           {probing ? "Probing…" : "Probe"}
         </button>
         <button
           type="submit"
           disabled={saving || !externalId.trim() || !siteName.trim()}
-          className="rounded bg-slate-900 px-3 py-1 text-xs font-medium text-white disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900"
+          className="rounded bg-slate-900 px-3 py-1 text-xs font-medium text-white disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-slate-400 dark:bg-slate-100 dark:text-slate-900"
         >
           {saving ? "Saving…" : "Save"}
         </button>
@@ -175,9 +191,16 @@ function CsvImport() {
   return (
     <div>
       <p className="mb-1 text-xs font-medium text-slate-700 dark:text-slate-300">Bulk import (CSV)</p>
-      <label className="block cursor-pointer rounded border border-dashed border-slate-300 px-2 py-2 text-center text-xs text-slate-500 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-400 dark:hover:bg-slate-800">
+      <label className="block cursor-pointer rounded border border-dashed border-slate-300 px-2 py-2 text-center text-xs text-slate-500 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-400 dark:hover:bg-slate-800 dark:focus:ring-slate-500">
         {busy ? "Importing…" : fileName ?? "Choose a CSV file (needs an external_id column)"}
-        <input type="file" accept=".csv,text/csv" className="hidden" onChange={onFile} disabled={busy} />
+        <input
+          type="file"
+          accept=".csv,text/csv"
+          className="hidden"
+          onChange={onFile}
+          disabled={busy}
+          aria-label="Choose a CSV file to import"
+        />
       </label>
       {error && <p className="mt-1 text-xs text-red-600 dark:text-red-400">{error}</p>}
       {result && (

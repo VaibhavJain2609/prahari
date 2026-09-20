@@ -3,6 +3,7 @@ import PlateTracePanel from "@/components/PlateTracePanel";
 import AlertPanel from "@/components/AlertPanel";
 import OnboardingPanel from "@/components/OnboardingPanel";
 import AdminPanel from "@/components/AdminPanel";
+import PanelErrorBoundary from "@/components/PanelErrorBoundary";
 
 // Plate trace and the alert console are the mandatory-path panels — every
 // board shows both, identically, regardless of role or org kind (the BFF
@@ -17,19 +18,27 @@ export default function Sidebar({ principal, org }: { principal: Principal | nul
   return (
     <aside className="flex w-80 shrink-0 flex-col gap-4 overflow-y-auto border-l border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-950">
       <Panel title="Plate trace">
-        <PlateTracePanel />
+        <PanelErrorBoundary title="Plate trace">
+          <PlateTracePanel />
+        </PanelErrorBoundary>
       </Panel>
       <Panel title="Alert console">
-        <AlertPanel />
+        <PanelErrorBoundary title="Alert console">
+          <AlertPanel />
+        </PanelErrorBoundary>
       </Panel>
       {canOnboard && (
         <Panel title="Camera onboarding" caption={org ? `into ${org.name}` : undefined}>
-          <OnboardingPanel />
+          <PanelErrorBoundary title="Camera onboarding">
+            <OnboardingPanel />
+          </PanelErrorBoundary>
         </Panel>
       )}
       {canAdminister && principal && (
         <Panel title="Administration" caption={org ? `subtree of ${org.name}` : undefined}>
-          <AdminPanel principal={principal} />
+          <PanelErrorBoundary title="Administration">
+            <AdminPanel principal={principal} />
+          </PanelErrorBoundary>
         </Panel>
       )}
     </aside>
