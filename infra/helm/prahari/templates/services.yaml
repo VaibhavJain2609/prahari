@@ -22,10 +22,23 @@ spec:
         {{- include "prahari.labels" $ | nindent 8 }}
         app.kubernetes.io/name: {{ $name }}
     spec:
+      # First-party images create uid 10001 `prahari` and drop to it
+      # (services/*/Dockerfile). Services without a Dockerfile yet
+      # (correlation, bff, web) must follow the same convention.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: {{ $name }}
           image: {{ include "prahari.image" (dict "registry" $.Values.global.imageRegistry "name" $name "tag" $.Values.global.imageTag) }}
           imagePullPolicy: {{ $.Values.global.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           ports:
             - name: http
               containerPort: {{ $cfg.port }}
@@ -41,8 +54,21 @@ spec:
             {{- if eq $name "match-engine" }}
             {{- include "prahari.matchEngineEnv" $ | nindent 12 }}
             {{- end }}
+            {{- if eq $name "correlation" }}
+            {{- include "prahari.correlationEnv" $ | nindent 12 }}
+            {{- end }}
+            {{- if eq $name "bff" }}
+            {{- include "prahari.bffEnv" $ | nindent 12 }}
+            {{- end }}
+            {{- if eq $name "web" }}
+            {{- include "prahari.webEnv" $ | nindent 12 }}
+            {{- end }}
           resources:
             {{- toYaml $cfg.resources | nindent 12 }}
+          {{- if $cfg.volumeMounts }}
+          volumeMounts:
+            {{- toYaml $cfg.volumeMounts | nindent 12 }}
+          {{- end }}
           # Readiness and liveness are DIFFERENT endpoints on purpose.
           #
           # /readyz checks the database; /healthz does not. A liveness probe that
@@ -73,6 +99,10 @@ spec:
               port: {{ $cfg.port }}
             periodSeconds: 5
             failureThreshold: 24
+      {{- if $cfg.volumes }}
+      volumes:
+        {{- toYaml $cfg.volumes | nindent 8 }}
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service

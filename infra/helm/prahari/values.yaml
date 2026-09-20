@@ -15,14 +15,22 @@ global:
 
 # --- the metadata plane ------------------------------------------------------
 
-bus:
-  # Redis Streams locally; Redpanda under the gpu profile for the scale test.
-  # Same protobuf messages either way — one schema, two transports.
-  kind: redis
-  retentionHours: 24
+# The bus is Redis Streams in every profile. There is no `bus.kind` switch:
+# no Redpanda chart exists and no settings field read PRAHARI_BUS_KIND, so the
+# value was a knob that switched nothing. Redpanda for the scale test is
+# deferred — reintroduce it as a real deployment plus a real settings field
+# together, or the "switch" is silent.
 
 postgres:
   enabled: true
+  # Name of a pre-existing Secret holding `key: password` — the out-of-band
+  # pattern the gateway Secret already uses (`kubectl create secret generic
+  # prahari-postgres-auth --from-literal=password=...`, then set this to
+  # "prahari-postgres-auth"). When empty the chart generates a Secret, annotated
+  # helm.sh/resource-policy: keep so an upgrade never re-rolls the password
+  # under an existing PVC — Postgres auth lives in PGDATA, so a rotated
+  # password breaks every client permanently.
+  existingSecret: ""
   # PostGIS is mandatory: the registry's coverage and dark-zone queries are
   # ST_Distance / KNN on geography(Point, 4326), and there is no fallback.
   #
@@ -37,10 +45,18 @@ postgres:
   database: prahari
   user: prahari
   storage: 10Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: "1",  memory: 1Gi }
 
 redis:
   enabled: true
-  image: redis:7-alpine
+  # Pinned to the Alpine base — a floating `-alpine` tag that moves under us is
+  # the same class of surprise as `latest`.
+  image: redis:7.4-alpine3.21
+  resources:
+    requests: { cpu: 50m,  memory: 128Mi }
+    limits:   { cpu: 500m, memory: 512Mi }
 
 # --- ingest ------------------------------------------------------------------
 
@@ -57,6 +73,18 @@ mediamtx:
   # deliberately absent from infra/k3d/cluster.yaml's host port mappings, because
   # nothing outside the cluster has any business reconfiguring the restreamer.
   apiPort: 9997
+  # Prometheus-compatible metrics endpoint (mediamtx `metrics: yes`).
+  metricsPort: 9998
+  # Host the registry puts into the fan-out URLs it hands consumers. One field
+  # feeds BOTH browser previews and in-cluster inference workers
+  # (worker.py prefers fanout_rtsp_url), and no single value satisfies both:
+  # `localhost` is right for browser playback through k3d's port maps;
+  # `prahari-mediamtx` is right for pod-to-pod pulls. Local favours the browser
+  # demo path — see the comment on PRAHARI_MEDIAMTX_PUBLIC_HOST in _helpers.tpl.
+  publicHost: localhost
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { cpu: "1",  memory: 512Mi }
 
 # --- registry: the control plane ---------------------------------------------
 
@@ -127,6 +155,16 @@ services:
     resources:
       requests: { cpu: 100m, memory: 256Mi }
       limits:   { cpu: "1",  memory: 1Gi }
+    # The hash-chained audit log is append-only and must outlive the pod —
+    # the one piece of first-party state outside Postgres, on its own PVC.
+    auditStorage: 1Gi
+    volumeMounts:
+      - name: audit
+        mountPath: /var/lib/prahari/audit
+    volumes:
+      - name: audit
+        persistentVolumeClaim:
+          claimName: prahari-audit
 
   web:
     enabled: false
@@ -139,9 +177,12 @@ services:
 # --- match engine: watchlist decisions ---------------------------------------
 
 matchEngine:
-  # Mounted read-only from a ConfigMap or PVC. The real watchlist is police
-  # data; what ships in data/watchlist/ is synthetic.
-  watchlistPath: /var/lib/prahari/watchlist
+  # The image bakes the synthetic dataset into /app/data/watchlist
+  # (services/match-engine/Dockerfile: COPY data/watchlist /app/data/watchlist).
+  # Pointing anywhere unmounted leaves the store empty and /readyz at 503 —
+  # which is what hung `helm install --wait`. A PVC/ConfigMap mount carrying the
+  # real (police) watchlist is a follow-up; what ships here is synthetic.
+  watchlistPath: /app/data/watchlist
 
   # Accuracy thresholds, deliberately values rather than constants: they are
   # tuned against measured precision/recall, and a tuning change must not be a
@@ -191,8 +232,15 @@ inference:
 
 # --- security ----------------------------------------------------------------
 
-audit:
-  # Hash-chained audit log. There is no bypass path, in any profile —
-  # "every video access is logged" is not a production-only property.
+# The audit log is not optional and not profile-switched: it is the BFF's
+# append-only SQLite file on the prahari-audit PVC, always on in every profile.
+# The old `audit.enabled`/`requirePurposeCode` values fed PRAHARI_AUDIT_* env
+# vars that no settings field read — deleted rather than kept as decoration.
+
+networkPolicies:
+  # Default-deny ingress plus explicit per-service allows
+  # (templates/networkpolicy.yaml). k3s' default flannel CNI does not enforce
+  # NetworkPolicy, so locally these are documentation that happens to be
+  # enforceable the day the cluster runs a CNI that is — check the probe
+  # caveat in that file before enabling on such a CNI.
   enabled: true
-  requirePurposeCode: true

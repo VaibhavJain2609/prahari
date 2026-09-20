@@ -1,0 +1,213 @@
+{{- if .Values.networkPolicies.enabled }}
+{{/*
+Default-deny ingress for every prahari pod, then explicit allows per
+destination. Egress is left unrestricted: the registry must reach the
+government gateway and MediaMTX must reach upstream cameras, and an egress
+policy that forgets one is a silent outage.
+
+CAVEATS before relying on this on a CNI that enforces NetworkPolicy
+(k3s' default flannel does NOT — locally these are documentation):
+
+  * kubelet HTTP probes originate from the NODE, not a pod, so a podSelector
+    allow does not cover them. On an enforcing CNI, either add an ingress
+    `from: [{ipBlock: <node/pod CIDRs>}]` rule to each HTTP-serving workload
+    or move probes to exec/grpc. Exec probes (postgres, redis, inference)
+    are unaffected.
+  * k3d host port mappings (cluster.yaml) arrive from the node/loadbalancer,
+    not a pod — the open-port rules below exist so the browser and host-side
+    debugging still work.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prahari-default-deny-ingress
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+---
+# The control plane. Callers: the BFF (proxied camera reads), correlation
+# (camera locations), inference workers (heartbeat + assignments).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prahari-registry-ingress
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: registry
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: bff
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: correlation
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: inference
+      ports:
+        - port: {{ .Values.services.registry.port }}
+---
+# Worker → match-engine gRPC (MetadataIngestService, the detection feed).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prahari-match-engine-ingress
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: match-engine
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: inference
+      ports:
+        - port: {{ .Values.services.matchEngine.grpcPort }}
+---
+# The media ports must stay open: browsers reach WHEP/HLS through the k3d
+# port maps and workers pull RTSP — traffic from the host arrives off-node.
+# Only the control API is restricted, to the registry that reconciles paths.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prahari-mediamtx-ingress
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mediamtx
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - port: {{ .Values.mediamtx.rtspPort }}
+        - port: {{ .Values.mediamtx.hlsPort }}
+        - port: {{ .Values.mediamtx.whepPort }}
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: registry
+      ports:
+        - port: {{ .Values.mediamtx.apiPort }}
+    - ports:
+        - port: {{ .Values.mediamtx.metricsPort }}
+---
+# The bus. Consumers: match-engine (publishes detections + alerts), correlation
+# (consumes detections), bff (consumes alerts for SSE). The keda namespace rule
+# lets the ScaledObject trigger read the stream backlog.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prahari-redis-ingress
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: match-engine
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: correlation
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: bff
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: keda
+      ports:
+        - port: 6379
+---
+# Postgres. Only the two services with a database_url touch it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prahari-postgres-ingress
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: registry
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: bff
+      ports:
+        - port: 5432
+---
+# Route reconstruction is called by the BFF only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prahari-correlation-ingress
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: correlation
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: bff
+      ports:
+        - port: {{ .Values.services.correlation.port }}
+---
+# web → bff is the browser's data path. The port also stays open to the host:
+# cluster.yaml maps 8080 for direct API/SSE debugging, and a web-only rule
+# would break `curl localhost:8080` on the laptop. Tighten to the web
+# podSelector alone on a profile fronted by a real ingress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prahari-bff-ingress
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: bff
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - port: {{ .Values.services.bff.port }}
+---
+# The console itself — browsers reach it through the k3d port map.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prahari-web-ingress
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: web
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - port: {{ .Values.services.web.port }}
+{{- end }}

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["profile"],
+  "properties": {
+    "profile": {
+      "type": "string",
+      "enum": ["local", "gpu"],
+      "description": "The ONLY thing that differs between the laptop and the cloud."
+    },
+    "services": {
+      "type": "object",
+      "patternProperties": {
+        "^[a-zA-Z]+$": {
+          "type": "object",
+          "properties": {
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "grpcPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "enabled": { "type": "boolean" },
+            "replicas": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    }
+  }
+}
