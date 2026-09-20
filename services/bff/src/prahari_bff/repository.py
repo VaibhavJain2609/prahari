@@ -78,11 +78,56 @@ class UserRepository:
         return _user_from_row(row)
 
     async def get(self, user_id: str) -> User | None:
-        row = await self._pool.fetchrow(
-            "SELECT id, username, org_id, role, created_at, disabled_at "
-            "FROM users WHERE id = $1::uuid",
-            user_id,
+        try:
+            row = await self._pool.fetchrow(
+                "SELECT id, username, org_id, role, created_at, disabled_at "
+                "FROM users WHERE id = $1::uuid",
+                user_id,
+            )
+        except (ValueError, asyncpg.DataError):
+            # A non-uuid `user_id` is "no such user", not a 500.
+            return None
+        return _user_from_row(row) if row else None
+
+    async def list_users(self, scope: str) -> list[User]:
+        """Every user whose org sits inside `scope`'s ltree subtree — the
+        SQL-side version of the `in_scope` check `create_user` applies to a
+        single target org, used by the admin user list. `scope` is the
+        *caller's* org path; this method never sees a caller-supplied one."""
+        rows = await self._pool.fetch(
+            """
+            SELECT u.id, u.username, u.org_id, u.role, u.created_at, u.disabled_at
+            FROM users u
+            JOIN orgs o ON o.id = u.org_id
+            WHERE o.path <@ $1::ltree
+            ORDER BY u.created_at, u.username
+            """,
+            scope,
         )
+        return [_user_from_row(row) for row in rows]
+
+    async def set_disabled(self, user_id: str, *, disabled: bool) -> User | None:
+        """Idempotent disable/enable. Disabling keeps the *first*
+        `disabled_at` (`COALESCE`), not the latest call's — the timestamp is
+        forensic ("when did this account stop working"), and rewriting it on
+        every repeated disable would erase exactly that. Returns the updated
+        row, or None when no such user exists."""
+        if disabled:
+            query = (
+                "UPDATE users SET disabled_at = COALESCE(disabled_at, now()) "
+                "WHERE id = $1::uuid "
+                "RETURNING id, username, org_id, role, created_at, disabled_at"
+            )
+        else:
+            query = (
+                "UPDATE users SET disabled_at = NULL "
+                "WHERE id = $1::uuid "
+                "RETURNING id, username, org_id, role, created_at, disabled_at"
+            )
+        try:
+            row = await self._pool.fetchrow(query, user_id)
+        except (ValueError, asyncpg.DataError):
+            return None
         return _user_from_row(row) if row else None
 
     async def get_by_username_with_hash(self, username: str) -> tuple[User, str] | None:
@@ -217,10 +262,50 @@ class ApiKeyRepository:
         )
         return _api_key_from_row(row), row["org_path"]
 
-    async def revoke(self, key_id: str) -> None:
+    async def get(self, key_id: str) -> ApiKey | None:
+        """Metadata for one key — `key_hash` is never selected, same
+        discipline as `_api_key_from_row` never having a field for it."""
         try:
-            await self._pool.execute(
-                "UPDATE api_keys SET revoked_at = now() WHERE id = $1::uuid", key_id
+            row = await self._pool.fetchrow(
+                "SELECT id, org_id, role, purpose, label, created_at, last_used_at, revoked_at "
+                "FROM api_keys WHERE id = $1::uuid",
+                key_id,
             )
         except (ValueError, asyncpg.DataError):
-            return
+            return None
+        return _api_key_from_row(row) if row else None
+
+    async def list_keys(self, scope: str) -> list[ApiKey]:
+        """Every key whose org sits inside `scope`'s ltree subtree — the
+        admin API-key list. Same scoping rule as `UserRepository.
+        list_users`: the subtree predicate is applied in SQL against the
+        caller's own org path, never a caller-supplied one."""
+        rows = await self._pool.fetch(
+            """
+            SELECT k.id, k.org_id, k.role, k.purpose, k.label,
+                   k.created_at, k.last_used_at, k.revoked_at
+            FROM api_keys k
+            JOIN orgs o ON o.id = k.org_id
+            WHERE o.path <@ $1::ltree
+            ORDER BY k.created_at, k.label
+            """,
+            scope,
+        )
+        return [_api_key_from_row(row) for row in rows]
+
+    async def revoke(self, key_id: str) -> ApiKey | None:
+        """Idempotent revoke: an already-revoked key keeps its *first*
+        `revoked_at` (same forensic argument as `UserRepository.
+        set_disabled`). Returns the updated row so the endpoint can answer
+        with the post-revoke state, or None when no such key exists."""
+        try:
+            row = await self._pool.fetchrow(
+                "UPDATE api_keys SET revoked_at = COALESCE(revoked_at, now()) "
+                "WHERE id = $1::uuid "
+                "RETURNING id, org_id, role, purpose, label, created_at, "
+                "last_used_at, revoked_at",
+                key_id,
+            )
+        except (ValueError, asyncpg.DataError):
+            return None
+        return _api_key_from_row(row) if row else None

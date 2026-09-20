@@ -57,6 +57,30 @@ class BFFSettings(BaseSettings):
 
     registry_timeout_s: float = 5.0
 
+    # --- match engine --------------------------------------------------------
+
+    match_engine_base_url: str = "http://localhost:8001"
+
+    match_engine_timeout_s: float = 5.0
+
+    internal_token: str = ""
+    """Sent as `X-Internal-Token` on every call to the match engine, whose
+    `/api/*` surface is gated by its own `MatchSettings.internal_token`
+    (env `PRAHARI_MATCH_INTERNAL_TOKEN`). The two fields carry the *same
+    shared secret* — one value, minted once per deployment, distributed to
+    every internal service — but they are distinct settings fields because
+    each service's env prefix differs: the gate reads `PRAHARI_MATCH_*`,
+    this sender reads `PRAHARI_*`.
+
+    Deliberately separate from `registry_internal_token`, which exists for
+    the same reason on the registry side. If the deployment ever wants one
+    name for all of them, that is a chart refactor, not a settings-field
+    merge — the registry gate was shipped first and its name is load-bearing
+    in existing values files.
+
+    Empty disables enforcement on the gated side (the local/dev default);
+    every real profile's chart sets a real shared value."""
+
     state_root_org_path: str = "gj"
     """Used only for this service's own internal "which org owns camera X"
     lookups (the camera-detail 403 boundary and the SSE alert filter) — never

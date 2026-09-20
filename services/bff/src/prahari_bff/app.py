@@ -36,7 +36,16 @@ from .config import BFFSettings, bff_settings
 from .correlation_client import CorrelationClient
 from .db import create_pool
 from .export import route_to_csv, route_to_pdf
-from .models import ApiKeyCreate, ApiKeyCreated, LoginRequest, Principal, User, UserCreate
+from .match_engine_client import MatchEngineClient
+from .models import (
+    ApiKey,
+    ApiKeyCreate,
+    ApiKeyCreated,
+    LoginRequest,
+    Principal,
+    User,
+    UserCreate,
+)
 from .registry_client import RegistryClient
 from .repository import (
     ApiKeyRepository,
@@ -100,6 +109,7 @@ async def lifespan(app: FastAPI):
 
     registry = RegistryClient(settings)
     correlation = CorrelationClient(settings)
+    match_engine = MatchEngineClient(settings)
     scope_resolver = CameraScopeResolver(
         registry,
         pool,
@@ -115,6 +125,7 @@ async def lifespan(app: FastAPI):
     app.state.api_key_repo = api_key_repo
     app.state.registry = registry
     app.state.correlation = correlation
+    app.state.match_engine = match_engine
     app.state.scope_resolver = scope_resolver
     app.state.audit = audit
     app.state.login_limiter = SlidingWindowRateLimiter(
@@ -126,6 +137,7 @@ async def lifespan(app: FastAPI):
     finally:
         await registry.aclose()
         await correlation.aclose()
+        await match_engine.aclose()
         audit.close()
         await pool.close()
 
@@ -157,6 +169,10 @@ def get_correlation_client(request: Request) -> CorrelationClient:
     return request.app.state.correlation
 
 
+def get_match_engine_client(request: Request) -> MatchEngineClient:
+    return request.app.state.match_engine
+
+
 def get_scope_resolver(request: Request) -> CameraScopeResolver:
     return request.app.state.scope_resolver
 
@@ -167,6 +183,7 @@ def get_audit_log(request: Request) -> AuditLog:
 
 RegistryDep = Annotated[RegistryClient, Depends(get_registry_client)]
 CorrelationDep = Annotated[CorrelationClient, Depends(get_correlation_client)]
+MatchEngineDep = Annotated[MatchEngineClient, Depends(get_match_engine_client)]
 ScopeResolverDep = Annotated[CameraScopeResolver, Depends(get_scope_resolver)]
 AuditDep = Annotated[AuditLog, Depends(get_audit_log)]
 
@@ -467,6 +484,129 @@ async def create_api_key(
     return ApiKeyCreated(**key.model_dump(), plaintext=plaintext)
 
 
+@app.get("/api/v1/auth/users", response_model=list[User], tags=["auth"])
+async def list_users(principal: AdminDep, request: Request) -> list[User]:
+    """Every user in the caller's own org subtree. The subtree predicate is
+    applied in SQL (`UserRepository.list_users`) against the *caller's*
+    `org_path` — the same rule `create_user` applies to a single target org,
+    read instead of write."""
+    return await request.app.state.user_repo.list_users(principal.org_path)
+
+
+async def _set_user_disabled(
+    user_id: str,
+    *,
+    disabled: bool,
+    action: str,
+    principal: Principal,
+    audit: AuditLog,
+    request: Request,
+) -> User:
+    """Shared body of the disable/enable pair: resolve the target, scope-
+    check its org exactly like `create_user` checks a target org, write,
+    audit. Denials and failures are audit entries, not silent responses."""
+    user_repo: UserRepository = request.app.state.user_repo
+    target = await user_repo.get(user_id)
+    if target is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no user {user_id}")
+    target_path = await org_path_for_id(request.app.state.pool, target.org_id)
+    if target_path is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no org {target.org_id}")
+    if not in_scope(target_path, principal.org_path):
+        await _audit_access(
+            audit,
+            principal,
+            purpose_code=_ADMIN_PURPOSE,
+            resource=f"user:{target.username}",
+            action=f"{action}_denied",
+        )
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "user is outside your own org subtree")
+    updated = await user_repo.set_disabled(user_id, disabled=disabled)
+    if updated is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no user {user_id}")
+    await _audit_access(
+        audit,
+        principal,
+        purpose_code=_ADMIN_PURPOSE,
+        resource=f"user:{target.username}",
+        action=action,
+    )
+    return updated
+
+
+@app.post("/api/v1/auth/users/{user_id}/disable", response_model=User, tags=["auth"])
+async def disable_user(
+    user_id: str, principal: AdminDep, audit: AuditDep, request: Request
+) -> User:
+    """Sets `disabled_at` — sticky, per migrations/006: existing sessions
+    stop resolving, not just future logins. Idempotent: re-disabling keeps
+    the first `disabled_at`."""
+    return await _set_user_disabled(
+        user_id,
+        disabled=True,
+        action="user_disable",
+        principal=principal,
+        audit=audit,
+        request=request,
+    )
+
+
+@app.post("/api/v1/auth/users/{user_id}/enable", response_model=User, tags=["auth"])
+async def enable_user(user_id: str, principal: AdminDep, audit: AuditDep, request: Request) -> User:
+    return await _set_user_disabled(
+        user_id,
+        disabled=False,
+        action="user_enable",
+        principal=principal,
+        audit=audit,
+        request=request,
+    )
+
+
+@app.get("/api/v1/auth/api-keys", response_model=list[ApiKey], tags=["auth"])
+async def list_api_keys(principal: AdminDep, request: Request) -> list[ApiKey]:
+    """Metadata for every key in the caller's subtree — `key_hash` is never
+    selected, so there is nothing here a response could leak. The plaintext
+    is shown once at creation and is unrecoverable by design."""
+    return await request.app.state.api_key_repo.list_keys(principal.org_path)
+
+
+@app.post("/api/v1/auth/api-keys/{key_id}/revoke", response_model=ApiKey, tags=["auth"])
+async def revoke_api_key(
+    key_id: str, principal: AdminDep, audit: AuditDep, request: Request
+) -> ApiKey:
+    """Idempotent revoke, scope-checked against the *key's* org the same way
+    `create_api_key` scope-checks a target org — a zone admin cannot revoke
+    a sibling zone's keys any more than it could mint them."""
+    api_key_repo: ApiKeyRepository = request.app.state.api_key_repo
+    key = await api_key_repo.get(key_id)
+    if key is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no api key {key_id}")
+    target_path = await org_path_for_id(request.app.state.pool, key.org_id)
+    if target_path is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no org {key.org_id}")
+    if not in_scope(target_path, principal.org_path):
+        await _audit_access(
+            audit,
+            principal,
+            purpose_code=_ADMIN_PURPOSE,
+            resource=f"api_key:{key.label}",
+            action="api_key_revoke_denied",
+        )
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "api key is outside your own org subtree")
+    revoked = await api_key_repo.revoke(key_id)
+    if revoked is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no api key {key_id}")
+    await _audit_access(
+        audit,
+        principal,
+        purpose_code=_ADMIN_PURPOSE,
+        resource=f"api_key:{key.label}",
+        action="api_key_revoke",
+    )
+    return revoked
+
+
 # --- orgs --------------------------------------------------------------------
 #
 # The console's board switch needs to know its own org's `kind`
@@ -623,6 +763,28 @@ async def get_camera(
         action="read" if response.status_code < 400 else "read_failed",
     )
     return _forward_json(response)
+
+
+@app.get("/api/v1/cameras/{camera_id}/health-history", tags=["cameras"])
+async def camera_health_history(
+    camera_id: str,
+    principal: PrincipalDep,
+    registry: RegistryDep,
+    request: Request,
+) -> list:
+    """Operational timeseries (heartbeat-derived health samples), not an
+    evidence read — so `PrincipalDep` only, no `X-Purpose-Code` and no audit
+    entry, unlike the camera-detail route above which resolves a specific
+    identifiable asset. Scope is enforced upstream the same way the list
+    endpoints do it: the caller's own `org_path` goes down as `org_scope`
+    and an out-of-scope camera reads as the upstream 404, not a filtered
+    row."""
+    return _forward_json(
+        await registry.get(
+            f"/api/v1/cameras/{camera_id}/health-history",
+            _scoped_params(request, principal),
+        )
+    )
 
 
 # --- cameras: registration, edit, decommission -------------------------------
@@ -916,6 +1078,36 @@ async def import_cameras(
     return summary
 
 
+# --- catalogue sync -----------------------------------------------------------
+#
+# Admin-only proxies onto the registry's own sync surface (`POST /api/v1/
+# sync`, `GET /api/v1/sync/runs`). Upstream semantics pass straight through
+# `_forward_json`: a second trigger while one is running is the registry's
+# 409, an unconfigured gateway its 503 — neither is rewritten here.
+
+
+@app.post("/api/v1/sync", tags=["sync"])
+async def trigger_sync(principal: AdminDep, registry: RegistryDep, audit: AuditDep) -> dict:
+    response = await registry.post("/api/v1/sync")
+    await _audit_access(
+        audit,
+        principal,
+        purpose_code=_ADMIN_PURPOSE,
+        resource="sync:catalogue",
+        action="sync_trigger" if response.status_code < 400 else "sync_trigger_failed",
+    )
+    return _forward_json(response)
+
+
+@app.get("/api/v1/sync/runs", tags=["sync"])
+async def list_sync_runs(
+    principal: AdminDep,
+    registry: RegistryDep,
+    limit: int = Query(10, ge=1, le=100),
+) -> list:
+    return _forward_json(await registry.get("/api/v1/sync/runs", {"limit": limit}))
+
+
 # --- routes: the mandatory path ----------------------------------------------
 #
 # Deliberately NOT filtered by org scope, unlike everything above. A route is
@@ -1023,7 +1215,69 @@ async def export_route(
     )
 
 
-# --- alerts: SSE relay --------------------------------------------------------
+# --- watchlist admin -----------------------------------------------------------
+#
+# Admin-only proxies onto the match engine's own surface. The match engine
+# has no principal concept, same as the registry's camera writes — the gate
+# and the audit entry live here, in the one service a browser can reach.
+
+
+@app.get("/api/v1/watchlist/summary", tags=["watchlist"])
+async def watchlist_summary(principal: AdminDep, match_engine: MatchEngineDep) -> dict:
+    return _forward_json(await match_engine.get("/api/v1/watchlist/summary"))
+
+
+@app.post("/api/v1/watchlist/reload", tags=["watchlist"])
+async def watchlist_reload(
+    principal: AdminDep, match_engine: MatchEngineDep, audit: AuditDep
+) -> dict:
+    response = await match_engine.post("/api/v1/watchlist/reload")
+    await _audit_access(
+        audit,
+        principal,
+        purpose_code=_ADMIN_PURPOSE,
+        resource="watchlist",
+        action="watchlist_reload" if response.status_code < 400 else "watchlist_reload_failed",
+    )
+    return _forward_json(response)
+
+
+# --- alerts --------------------------------------------------------------------
+#
+# Two surfaces over the same alert flow: the recent-buffer list (the match
+# engine's in-memory ring — a debug/operational view, not the system of
+# record) and the live SSE relay off the Redis stream. Both are scoped the
+# same way: `Alert.detection.camera_id` is the only per-alert scoping
+# signal, resolved through the same `CameraScopeResolver` the relay uses.
+# `PrincipalDep`, not `AdminDep` — alerts are operational data every console
+# role needs, and the org filter is the actual access boundary.
+
+
+@app.get("/api/v1/alerts", tags=["alerts"])
+async def list_alerts(
+    principal: PrincipalDep,
+    match_engine: MatchEngineDep,
+    scope_resolver: ScopeResolverDep,
+    limit: int = Query(50, ge=1, le=500),
+) -> list:
+    response = await match_engine.get("/api/v1/alerts", {"limit": limit})
+    if response.status_code >= 400:
+        return _forward_json(response)
+    # Same filter as the SSE relay below: resolve the camera's real org
+    # (root-scoped — the resolver is trusted to see the whole estate in
+    # order to decide whether the *caller* may), drop anything outside the
+    # caller's subtree or with no resolvable camera. An alert we cannot
+    # attribute to an org is hidden, never leaked.
+    visible = []
+    for item in response.json():
+        camera_id = (item.get("detection") or {}).get("camera_id")
+        if camera_id is None:
+            continue
+        org_path = await scope_resolver.org_path_for_camera(camera_id)
+        if org_path is None or not in_scope(org_path, principal.org_path):
+            continue
+        visible.append(item)
+    return visible
 
 
 @app.get("/api/v1/alerts/stream", tags=["alerts"])
