@@ -20,6 +20,7 @@ import io
 import json
 import logging
 import secrets
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 from urllib.parse import quote, urlparse
@@ -276,7 +277,9 @@ async def origin_and_security_headers(request: Request, call_next):
 # The privacy invariant: every evidence access is written to the hash-chained
 # audit log — no exceptions, no "internal" bypass. In code that means the
 # append happens *before* the response is served, and a failed append fails
-# the request closed (500) rather than serving an unaudited access.
+# the request closed (500) rather than serving an unaudited access. Mutations
+# get the same guarantee from `_audit_mutation`: the intent row lands before
+# the mutation commits, so a committed change can never exist unrecorded.
 
 _ADMIN_PURPOSE = "admin"
 """Audit `purpose_code` for admin/config actions (user/API-key/org/camera
@@ -358,6 +361,78 @@ async def _require_session_admin(
             status.HTTP_403_FORBIDDEN,
             "API keys cannot create users or API keys — a session principal is required",
         )
+
+
+async def _audit_mutation[T](
+    audit: AuditLog,
+    principal: Principal,
+    *,
+    purpose_code: str,
+    resource: str,
+    action: str,
+    mutation: Callable[[], Awaitable[T]],
+) -> T:
+    """Run one state-changing operation between two audit rows.
+
+    The ordering is the whole point. The pre-fix shape appended only *after*
+    the upstream call returned, so a failed append left a committed mutation
+    with no record at all — exactly backwards for an accountability log.
+    Here `<action>_requested` lands before the mutation runs and fails
+    closed: if the intent row cannot be written the mutation never happens
+    (HTTPException 500, nothing to record because nothing occurred).
+
+    Once the callable settles, the outcome row is `<action>` on success or
+    `<action>_failed` on any exception it raises — an upstream 4xx included,
+    since callers put `_forward_json` inside the callable. A refused scope
+    check is *not* this helper's job: denials stay where they are, audited
+    as `<action>_denied` before the mutation is ever attempted.
+
+    Failure semantics, decided and documented:
+
+    - Intent append fails → abort, 500. Fail-closed, same as reads.
+    - Mutation fails → best-effort `<action>_failed` row, then the original
+      exception propagates (it is the honest response to the caller). If
+      that append also fails the loss is logged loudly, not masked.
+    - Mutation succeeds but the outcome append fails → 500. The 500 cannot
+      un-commit the mutation, but it does not need to: the intent row
+      already records who changed what, and a degraded audit log must
+      surface rather than let the request return 200 with its outcome row
+      silently missing.
+    """
+    await _audit_access(
+        audit,
+        principal,
+        purpose_code=purpose_code,
+        resource=resource,
+        action=f"{action}_requested",
+    )
+    try:
+        result = await mutation()
+    except Exception:
+        try:
+            await audit.append(
+                actor=principal.subject,
+                org_path=principal.org_path,
+                purpose_code=purpose_code,
+                resource=resource,
+                action=f"{action}_failed",
+            )
+        except Exception as audit_exc:  # noqa: BLE001 - log, never mask the real error
+            log.error(
+                "audit append failed for %s_failed on %s (mutation error is propagating): %s",
+                action,
+                resource,
+                audit_exc,
+            )
+        raise
+    await _audit_access(
+        audit,
+        principal,
+        purpose_code=purpose_code,
+        resource=resource,
+        action=action,
+    )
+    return result
 
 
 # --- probes --------------------------------------------------------------
@@ -464,10 +539,11 @@ async def logout(request: Request, response: Response) -> dict:
 
     session_id = request.cookies.get(settings.session_cookie_name)
     if session_id:
-        # Resolve BEFORE revoking — the revoked session no longer resolves, and
-        # a sign-out is itself an auditable authentication event.
+        # Resolve BEFORE revoking — the revoked session no longer resolves.
+        # Audit before the revoke commits, the same ordering `_audit_mutation`
+        # enforces everywhere else: a destroyed session must never exist
+        # without a record of who signed out.
         resolved = await session_repo.resolve(session_id)
-        await session_repo.revoke(session_id)
         if resolved is not None:
             user, org_path = resolved
             await _audit_event(
@@ -477,6 +553,7 @@ async def logout(request: Request, response: Response) -> dict:
                 resource=f"user:{user.username}",
                 action="auth_logout",
             )
+        await session_repo.revoke(session_id)
     response.delete_cookie(settings.session_cookie_name)
     return {"status": "ok"}
 
@@ -517,25 +594,14 @@ async def create_user(
             action="user_create_denied",
         )
         raise HTTPException(status.HTTP_403_FORBIDDEN, "org is outside your own org subtree")
-    try:
-        user = await request.app.state.user_repo.create(payload)
-    except Exception:
-        await _audit_access(
-            audit,
-            principal,
-            purpose_code=_ADMIN_PURPOSE,
-            resource=f"user:{payload.username}",
-            action="user_create_failed",
-        )
-        raise
-    await _audit_access(
+    return await _audit_mutation(
         audit,
         principal,
         purpose_code=_ADMIN_PURPOSE,
-        resource=f"user:{user.username}",
+        resource=f"user:{payload.username}",
         action="user_create",
+        mutation=lambda: request.app.state.user_repo.create(payload),
     )
-    return user
 
 
 @app.post(
@@ -562,23 +628,13 @@ async def create_api_key(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "org is outside your own org subtree")
 
     api_key_repo: ApiKeyRepository = request.app.state.api_key_repo
-    try:
-        key, plaintext = await api_key_repo.create(payload, created_by=principal.id)
-    except Exception:
-        await _audit_access(
-            audit,
-            principal,
-            purpose_code=_ADMIN_PURPOSE,
-            resource=f"api_key:{payload.label}",
-            action="api_key_create_failed",
-        )
-        raise
-    await _audit_access(
+    key, plaintext = await _audit_mutation(
         audit,
         principal,
         purpose_code=_ADMIN_PURPOSE,
-        resource=f"api_key:{key.label}",
+        resource=f"api_key:{payload.label}",
         action="api_key_create",
+        mutation=lambda: api_key_repo.create(payload, created_by=principal.id),
     )
     return ApiKeyCreated(**key.model_dump(), plaintext=plaintext)
 
@@ -620,17 +676,21 @@ async def _set_user_disabled(
             action=f"{action}_denied",
         )
         raise HTTPException(status.HTTP_403_FORBIDDEN, "user is outside your own org subtree")
-    updated = await user_repo.set_disabled(user_id, disabled=disabled)
-    if updated is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no user {user_id}")
-    await _audit_access(
+
+    async def _write() -> User:
+        updated = await user_repo.set_disabled(user_id, disabled=disabled)
+        if updated is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"no user {user_id}")
+        return updated
+
+    return await _audit_mutation(
         audit,
         principal,
         purpose_code=_ADMIN_PURPOSE,
         resource=f"user:{target.username}",
         action=action,
+        mutation=_write,
     )
-    return updated
 
 
 @app.post("/api/v1/auth/users/{user_id}/disable", response_model=User, tags=["auth"])
@@ -693,17 +753,21 @@ async def revoke_api_key(
             action="api_key_revoke_denied",
         )
         raise HTTPException(status.HTTP_403_FORBIDDEN, "api key is outside your own org subtree")
-    revoked = await api_key_repo.revoke(key_id)
-    if revoked is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f"no api key {key_id}")
-    await _audit_access(
+
+    async def _revoke() -> ApiKey:
+        revoked = await api_key_repo.revoke(key_id)
+        if revoked is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"no api key {key_id}")
+        return revoked
+
+    return await _audit_mutation(
         audit,
         principal,
         purpose_code=_ADMIN_PURPOSE,
         resource=f"api_key:{key.label}",
         action="api_key_revoke",
+        mutation=_revoke,
     )
-    return revoked
 
 
 # --- orgs --------------------------------------------------------------------
@@ -735,15 +799,18 @@ async def create_org(
         denied_action="org_create_denied",
         resource=f"org:{body.get('label', 'new')}",
     )
-    response = await registry.post("/api/v1/orgs", json=body)
-    await _audit_access(
+
+    async def _create() -> dict:
+        return _forward_json(await registry.post("/api/v1/orgs", json=body))
+
+    return await _audit_mutation(
         audit,
         principal,
         purpose_code=_ADMIN_PURPOSE,
         resource=f"org:{body.get('label', 'new')}",
-        action="org_create" if response.status_code < 400 else "org_create_failed",
+        action="org_create",
+        mutation=_create,
     )
-    return _forward_json(response)
 
 
 def _forward_json(response: httpx.Response):
@@ -967,15 +1034,18 @@ async def create_camera(
         denied_action="camera_create_denied",
         resource=resource,
     )
-    response = await registry.post("/api/v1/cameras", json=body)
-    await _audit_access(
+
+    async def _create() -> dict:
+        return _public_camera(_forward_json(await registry.post("/api/v1/cameras", json=body)))
+
+    return await _audit_mutation(
         audit,
         principal,
         purpose_code=_ADMIN_PURPOSE,
         resource=resource,
-        action="camera_create" if response.status_code < 400 else "camera_create_failed",
+        action="camera_create",
+        mutation=_create,
     )
-    return _public_camera(_forward_json(response))
 
 
 @app.patch("/api/v1/cameras/{camera_id}", tags=["cameras"])
@@ -1009,15 +1079,20 @@ async def update_camera(
             denied_action="camera_update_denied",
             resource=f"camera:{camera_id}",
         )
-    response = await registry.patch(f"/api/v1/cameras/{camera_id}", json=body)
-    await _audit_access(
+
+    async def _update() -> dict:
+        return _public_camera(
+            _forward_json(await registry.patch(f"/api/v1/cameras/{camera_id}", json=body))
+        )
+
+    return await _audit_mutation(
         audit,
         principal,
         purpose_code=_ADMIN_PURPOSE,
         resource=f"camera:{camera_id}",
-        action="camera_update" if response.status_code < 400 else "camera_update_failed",
+        action="camera_update",
+        mutation=_update,
     )
-    return _public_camera(_forward_json(response))
 
 
 @app.delete("/api/v1/cameras/{camera_id}", tags=["cameras"])
@@ -1040,15 +1115,18 @@ async def decommission_camera(
             action="camera_delete_denied",
         )
         raise HTTPException(status.HTTP_403_FORBIDDEN, "camera is outside your org subtree")
-    response = await registry.delete(f"/api/v1/cameras/{camera_id}")
-    await _audit_access(
+
+    async def _delete() -> dict:
+        return _public_camera(_forward_json(await registry.delete(f"/api/v1/cameras/{camera_id}")))
+
+    return await _audit_mutation(
         audit,
         principal,
         purpose_code=_ADMIN_PURPOSE,
         resource=f"camera:{camera_id}",
-        action="camera_delete" if response.status_code < 400 else "camera_delete_failed",
+        action="camera_delete",
+        mutation=_delete,
     )
-    return _public_camera(_forward_json(response))
 
 
 @app.post("/api/v1/cameras/probe", tags=["cameras"])
@@ -1066,15 +1144,18 @@ async def probe_camera(
     org — the registry endpoint itself has no principal concept to enforce
     that with."""
     body = await request.json()
-    response = await registry.post("/api/v1/cameras/probe", json=body)
-    await _audit_access(
+
+    async def _probe() -> dict:
+        return _forward_json(await registry.post("/api/v1/cameras/probe", json=body))
+
+    return await _audit_mutation(
         audit,
         principal,
         purpose_code=purpose_code,
         resource=f"camera-probe:{body.get('rtsp_url', '')}",
-        action="probe" if response.status_code < 400 else "probe_failed",
+        action="probe",
+        mutation=_probe,
     )
-    return _forward_json(response)
 
 
 # --- media: the audited video path -------------------------------------------
@@ -1209,55 +1290,88 @@ async def import_cameras(
     if not reader.fieldnames or "external_id" not in reader.fieldnames:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "CSV must have an external_id column")
 
-    results: list[dict] = []
-    for line_no, row in enumerate(reader, start=2):  # header occupies line 1
-        external_id = (row.get("external_id") or "").strip()
-        if not external_id:
-            results.append({"row": line_no, "ok": False, "error": "external_id is required"})
-            continue
-        try:
-            payload = _row_to_camera_payload(row)
-            # A scope denial here is a row swallowed into a per-row error, not
-            # a request failure — without audit kwargs it would leave no trace
-            # that an operator probed an out-of-scope org via the import path.
-            payload["org_id"] = await _check_target_org(
-                request,
-                principal,
-                payload.get("org_id"),
-                audit=audit,
-                denied_action="camera_import_denied",
-                resource=f"camera:{external_id}",
-            )
-            response = await registry.post("/api/v1/cameras", json=payload)
-        except HTTPException as exc:
-            results.append(
-                {"row": line_no, "external_id": external_id, "ok": False, "error": exc.detail}
-            )
-            continue
-        except (ValueError, KeyError) as exc:
-            results.append(
-                {"row": line_no, "external_id": external_id, "ok": False, "error": str(exc)}
-            )
-            continue
+    rows = list(reader)
+    # Same audit-before-commit rule as `_audit_mutation`, at batch granularity:
+    # the intent row lands before *any* row is created upstream, so committed
+    # creates can never exist without a record of who asked for them. One row,
+    # not one per CSV line — per-row entries would flood the chain for a
+    # 200-camera CSV while adding nothing the per-row results don't carry.
+    await _audit_access(
+        audit,
+        principal,
+        purpose_code=_ADMIN_PURPOSE,
+        resource=f"cameras-import:{len(rows)}",
+        action="camera_import_requested",
+    )
 
-        if response.status_code >= 400:
-            results.append(
-                {
-                    "row": line_no,
-                    "external_id": external_id,
-                    "ok": False,
-                    "error": _upstream_detail(response),
-                }
+    results: list[dict] = []
+    try:
+        for line_no, row in enumerate(rows, start=2):  # header occupies line 1
+            external_id = (row.get("external_id") or "").strip()
+            if not external_id:
+                results.append({"row": line_no, "ok": False, "error": "external_id is required"})
+                continue
+            try:
+                payload = _row_to_camera_payload(row)
+                # A scope denial here is a row swallowed into a per-row error, not
+                # a request failure — without audit kwargs it would leave no trace
+                # that an operator probed an out-of-scope org via the import path.
+                payload["org_id"] = await _check_target_org(
+                    request,
+                    principal,
+                    payload.get("org_id"),
+                    audit=audit,
+                    denied_action="camera_import_denied",
+                    resource=f"camera:{external_id}",
+                )
+                response = await registry.post("/api/v1/cameras", json=payload)
+            except HTTPException as exc:
+                results.append(
+                    {"row": line_no, "external_id": external_id, "ok": False, "error": exc.detail}
+                )
+                continue
+            except (ValueError, KeyError) as exc:
+                results.append(
+                    {"row": line_no, "external_id": external_id, "ok": False, "error": str(exc)}
+                )
+                continue
+
+            if response.status_code >= 400:
+                results.append(
+                    {
+                        "row": line_no,
+                        "external_id": external_id,
+                        "ok": False,
+                        "error": _upstream_detail(response),
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "row": line_no,
+                        "external_id": external_id,
+                        "ok": True,
+                        "id": response.json().get("id"),
+                    }
+                )
+    except Exception:
+        # Reaching here means the batch itself died mid-import (e.g. the
+        # registry connection dropped) — per-row failures are captured in
+        # `results` and never reach this handler. Rows that already committed
+        # keep their record in the intent row above; this entry says the batch
+        # never completed. Best-effort: a failed append must not mask the
+        # original error.
+        try:
+            await audit.append(
+                actor=principal.subject,
+                org_path=principal.org_path,
+                purpose_code=_ADMIN_PURPOSE,
+                resource=f"cameras-import:{len(rows)}",
+                action="camera_import_failed",
             )
-        else:
-            results.append(
-                {
-                    "row": line_no,
-                    "external_id": external_id,
-                    "ok": True,
-                    "id": response.json().get("id"),
-                }
-            )
+        except Exception as audit_exc:  # noqa: BLE001 - log, never mask the real error
+            log.error("audit append failed for camera_import_failed: %s", audit_exc)
+        raise
 
     summary = {
         "total": len(results),
@@ -1265,9 +1379,8 @@ async def import_cameras(
         "failed": sum(1 for r in results if not r["ok"]),
         "rows": results,
     }
-    # One entry per import, carrying the row counts — per-row entries would
-    # flood the chain for a 200-camera CSV while adding nothing a reviewer
-    # can't get from the per-row results.
+    # The outcome row, carrying the row counts. Fail-closed like the intent
+    # row — the creates already committed either way and are recorded there.
     await _audit_access(
         audit,
         principal,
@@ -1288,15 +1401,17 @@ async def import_cameras(
 
 @app.post("/api/v1/sync", tags=["sync"])
 async def trigger_sync(principal: AdminDep, registry: RegistryDep, audit: AuditDep) -> dict:
-    response = await registry.post("/api/v1/sync")
-    await _audit_access(
+    async def _trigger() -> dict:
+        return _forward_json(await registry.post("/api/v1/sync"))
+
+    return await _audit_mutation(
         audit,
         principal,
         purpose_code=_ADMIN_PURPOSE,
         resource="sync:catalogue",
-        action="sync_trigger" if response.status_code < 400 else "sync_trigger_failed",
+        action="sync_trigger",
+        mutation=_trigger,
     )
-    return _forward_json(response)
 
 
 @app.get("/api/v1/sync/runs", tags=["sync"])
@@ -1431,15 +1546,17 @@ async def watchlist_summary(principal: AdminDep, match_engine: MatchEngineDep) -
 async def watchlist_reload(
     principal: AdminDep, match_engine: MatchEngineDep, audit: AuditDep
 ) -> dict:
-    response = await match_engine.post("/api/v1/watchlist/reload")
-    await _audit_access(
+    async def _reload() -> dict:
+        return _forward_json(await match_engine.post("/api/v1/watchlist/reload"))
+
+    return await _audit_mutation(
         audit,
         principal,
         purpose_code=_ADMIN_PURPOSE,
         resource="watchlist",
-        action="watchlist_reload" if response.status_code < 400 else "watchlist_reload_failed",
+        action="watchlist_reload",
+        mutation=_reload,
     )
-    return _forward_json(response)
 
 
 # --- alerts --------------------------------------------------------------------
@@ -1687,6 +1804,13 @@ async def oidc_callback(request: Request, code: str = "", state: str = "") -> Re
             raise HTTPException(status.HTTP_403_FORBIDDEN, "org_path claim names no known org")
         # Random unusable password: an SSO-provisioned row can never satisfy
         # builtin password login, which remains the bootstrap admin's alone.
+        await _audit_event(
+            request,
+            actor=username,
+            org_path=org_path_claim,
+            resource=f"user:{username}",
+            action="auth_user_provisioned",
+        )
         user = await user_repo.create(
             UserCreate(
                 username=username,
@@ -1696,6 +1820,17 @@ async def oidc_callback(request: Request, code: str = "", state: str = "") -> Re
             )
         )
 
+    # Same event builtin login writes, in the same order — before the session
+    # row exists. Until now an SSO sign-in committed a session with no audit
+    # row at all.
+    org_path = org_path_claim or await org_path_for_id(pool, user.org_id) or "-"
+    await _audit_event(
+        request,
+        actor=user.username,
+        org_path=org_path,
+        resource=f"user:{user.username}",
+        action="auth_login",
+    )
     session_id, expires_at = await session_repo.create(
         user.id, ttl_hours=settings.session_ttl_hours
     )
@@ -1734,6 +1869,19 @@ async def oidc_logout(request: Request, response: Response) -> dict:
 
     session_id = request.cookies.get(settings.session_cookie_name)
     if session_id:
+        # Same event and same ordering as builtin `logout`: resolve (the
+        # revoked session no longer resolves), audit, then revoke. This path
+        # previously wrote no audit row at all.
+        resolved = await session_repo.resolve(session_id)
+        if resolved is not None:
+            user, org_path = resolved
+            await _audit_event(
+                request,
+                actor=user.username,
+                org_path=org_path,
+                resource=f"user:{user.username}",
+                action="auth_logout",
+            )
         await session_repo.revoke(session_id)
     response.delete_cookie(settings.session_cookie_name)
     response.delete_cookie(OIDC_MARKER_COOKIE_NAME)

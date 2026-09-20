@@ -358,7 +358,10 @@ async def test_create_camera_writes_an_admin_audit_entry():
     assert audit.entries[-1]["purpose_code"] == "admin"
 
 
-async def test_csv_import_writes_one_audit_entry_with_row_counts():
+async def test_csv_import_writes_an_intent_then_outcome_audit_entry():
+    """Two entries per import, not one per row: `camera_import_requested`
+    before any row is created upstream, `camera_import` with the row counts
+    once the batch settles."""
     audit = FakeAudit()
     registry = FakeRegistry(status_code=201, body={"id": "cam-1"})
 
@@ -369,9 +372,9 @@ async def test_csv_import_writes_one_audit_entry_with_row_counts():
     request.body = _body
     result = await import_cameras(OPERATOR, registry, audit, request)
     assert result["succeeded"] == 2
-    assert len(audit.entries) == 1
-    assert audit.entries[0]["action"] == "camera_import"
-    assert audit.entries[0]["resource"] == "cameras-import:2/2"
+    assert [e["action"] for e in audit.entries] == ["camera_import_requested", "camera_import"]
+    assert audit.entries[0]["resource"] == "cameras-import:2"
+    assert audit.entries[-1]["resource"] == "cameras-import:2/2"
 
 
 async def test_verify_response_carries_head_and_row_count():
