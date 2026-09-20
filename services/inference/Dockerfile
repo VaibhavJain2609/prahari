@@ -26,14 +26,19 @@ COPY pyproject.toml uv.lock ./
 COPY packages/prahari-common/pyproject.toml packages/prahari-common/
 COPY packages/prahari-proto/pyproject.toml packages/prahari-proto/
 COPY services/inference/pyproject.toml services/inference/
+# --extra models installs the detection stack (ultralytics/paddleocr/torch —
+# declared optional so the workspace test suite doesn't need them, but the
+# worker image without them decodes frames and produces nothing, forever:
+# every batch ImportErrors inside _load() and is dropped, while heartbeats
+# keep reporting a healthy pod.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-install-workspace --package prahari-inference
+    uv sync --frozen --no-dev --no-install-workspace --package prahari-inference --extra models
 
 COPY packages/prahari-common/ packages/prahari-common/
 COPY packages/prahari-proto/ packages/prahari-proto/
 COPY services/inference/ services/inference/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --package prahari-inference
+    uv sync --frozen --no-dev --package prahari-inference --extra models
 
 
 FROM python:3.12-slim AS runtime

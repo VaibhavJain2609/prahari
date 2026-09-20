@@ -119,6 +119,34 @@ resource "aws_security_group" "edge" {
     cidr_blocks = [var.central_plane_cidr]
   }
 
+  # The data plane: MediaMTX pulls upstream camera feeds INBOUND to the edge —
+  # RTSP (554 is the registry probe allowlist port; 8554 is the gateway's
+  # documented media port) and the WHEP/HLS fallbacks. Without these the feeds
+  # never reach the edge and the whole pipeline is alive but empty. Wide CIDR
+  # because the gateway address is operator-supplied; scope it down with
+  # var.gateway_cidr when the address is known and stable.
+  dynamic "egress" {
+    for_each = var.gateway_cidr != "" ? [var.gateway_cidr] : ["0.0.0.0/0"]
+    content {
+      description = "Upstream camera media pull (RTSP TCP)"
+      from_port   = 554
+      to_port     = 554
+      protocol    = "tcp"
+      cidr_blocks = [egress.value]
+    }
+  }
+
+  dynamic "egress" {
+    for_each = var.gateway_cidr != "" ? [var.gateway_cidr] : ["0.0.0.0/0"]
+    content {
+      description = "Upstream camera media pull (gateway RTSP/WHEP)"
+      from_port   = 8554
+      to_port     = 8889
+      protocol    = "tcp"
+      cidr_blocks = [egress.value]
+    }
+  }
+
   # Bootstrap egress — the remaining rules exist because a node that cannot
   # reach the internet at first boot silently produces a half-built node.
   egress {

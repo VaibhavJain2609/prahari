@@ -75,6 +75,17 @@ variable "central_plane_cidr" {
   default     = "10.255.0.0/16"
 }
 
+variable "gateway_cidr" {
+  description = <<-EOT
+    CIDR of the government camera gateway the edge pulls media from (RTSP
+    554/8554, WHEP 8889). Empty allows media-port egress to 0.0.0.0/0 — the
+    gateway address is operator-supplied and differs per district; set it to
+    a /32 when the address is known and stable.
+  EOT
+  type        = string
+  default     = ""
+}
+
 variable "ssh_cidr" {
   description = <<-EOT
     CIDR allowed to reach SSH (22) and the k3s API (6443) on edge nodes —

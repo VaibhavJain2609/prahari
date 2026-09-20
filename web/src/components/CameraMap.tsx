@@ -31,6 +31,7 @@ const ROUTE_SOURCE_ID = "trace-route";
 const ROUTE_CASING_LAYER_ID = "trace-link-casing";
 const ROUTE_PLATE_LAYER_ID = "trace-links-plate";
 const ROUTE_BRIDGED_LAYER_ID = "trace-links-bridged";
+const ROUTE_UNVERIFIED_LAYER_ID = "trace-links-unverified";
 const HOP_SOURCE_ID = "trace-hops";
 const HOP_LAYER_ID = "trace-hop-points";
 const HOP_LABEL_LAYER_ID = "trace-hop-labels";
@@ -44,6 +45,7 @@ const DARK_ZONE_LAYER_ID = "dark-zone-points";
 // honest way to dash just the bridged segments.
 const PLATE_LINK_COLOR = "#38bdf8"; // sky-400
 const BRIDGED_LINK_COLOR = "#f59e0b"; // amber-500
+const UNVERIFIED_LINK_COLOR = "#f43f5e"; // rose-500
 const REJECTED_COLOR = "#f59e0b"; // amber-500
 const DARK_ZONE_COLOR = "#f43f5e"; // rose-500
 
@@ -252,9 +254,29 @@ export default function CameraMap({
           id: ROUTE_PLATE_LAYER_ID,
           type: "line",
           source: ROUTE_SOURCE_ID,
-          filter: ["!=", ["get", "link_kind"], "bridged"],
+          filter: [
+            "all",
+            ["!=", ["get", "link_kind"], "bridged"],
+            ["!=", ["get", "link_kind"], "unverified"],
+          ],
           layout: { "line-cap": "round", "line-join": "round" },
           paint: { "line-width": 2.5, "line-color": PLATE_LINK_COLOR },
+        });
+      }
+      // "unverified" hops are asserted, not gated — a third visual state, not
+      // silently rendered as plate. Rose + dotted reads as "weakest claim".
+      if (!map.getLayer(ROUTE_UNVERIFIED_LAYER_ID)) {
+        map.addLayer({
+          id: ROUTE_UNVERIFIED_LAYER_ID,
+          type: "line",
+          source: ROUTE_SOURCE_ID,
+          filter: ["==", ["get", "link_kind"], "unverified"],
+          layout: { "line-cap": "round", "line-join": "round" },
+          paint: {
+            "line-width": 2.5,
+            "line-color": UNVERIFIED_LINK_COLOR,
+            "line-dasharray": [0.5, 2],
+          },
         });
       }
       if (!map.getLayer(ROUTE_BRIDGED_LAYER_ID)) {

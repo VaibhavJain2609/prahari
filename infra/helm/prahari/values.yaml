@@ -75,13 +75,12 @@ mediamtx:
   apiPort: 9997
   # Prometheus-compatible metrics endpoint (mediamtx `metrics: yes`).
   metricsPort: 9998
-  # Host the registry puts into the fan-out URLs it hands consumers. One field
-  # feeds BOTH browser previews and in-cluster inference workers
-  # (worker.py prefers fanout_rtsp_url), and no single value satisfies both:
-  # `localhost` is right for browser playback through k3d's port maps;
-  # `prahari-mediamtx` is right for pod-to-pod pulls. Local favours the browser
-  # demo path — see the comment on PRAHARI_MEDIAMTX_PUBLIC_HOST in _helpers.tpl.
-  publicHost: localhost
+  # Host the registry puts into the fan-out URLs it hands consumers. In-cluster
+  # workers resolve `prahari-mediamtx`; `localhost` inside a pod resolves to the
+  # pod itself — the previous default made every worker's capture fail while the
+  # pod heartbeated happily. Browser preview no longer uses this host: it goes
+  # through the BFF's audited ticket endpoint (see feat/audited-video-access).
+  publicHost: prahari-mediamtx
   resources:
     requests: { cpu: 100m, memory: 128Mi }
     limits:   { cpu: "1",  memory: 512Mi }

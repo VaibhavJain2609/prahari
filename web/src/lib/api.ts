@@ -67,7 +67,10 @@ export type RouteHop = {
   location?: GeoPoint | null;
   wall_clock_s?: number;
   pts_ms?: number;
-  link_kind?: "plate" | "bridged" | null;
+  // "unverified" is the honest third state: the hop is included because the
+  // registry lookup failed open — the link was never feasibility-gated and the
+  // UI must render it differently, not silently as `plate`.
+  link_kind?: "plate" | "bridged" | "unverified" | null;
   confidence?: number;
   evidence_ref?: string;
 };
@@ -94,6 +97,9 @@ export type RouteResult = {
   hops: RouteHop[];
   rejected: RejectedHop[];
   dark_zones: DarkZone[];
+  // Count of hops whose link was never feasibility-gated — the number that
+  // tells an operator how much of this route is asserted vs observed.
+  ungated_hops?: number;
 };
 
 export type CameraGeoJSON = {

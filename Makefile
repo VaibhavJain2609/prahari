@@ -75,6 +75,24 @@ gateway-secret: ## Load .env into the cluster as the gateway credential Secret
 	  --namespace $(NAMESPACE) --from-env-file=.env \
 	  --dry-run=client -o yaml | kubectl apply -f -
 
+.PHONY: bff-bootstrap
+bff-bootstrap: ## Create the prahari-bff-bootstrap Secret (first-login admin) from .env
+	# Without this Secret there is no first login on a fresh cluster — the BFF
+	# seeds one admin only when the users table is empty. Reads
+	# PRAHARI_BOOTSTRAP_ADMIN_USERNAME/_PASSWORD from .env; refuses to generate
+	# a random password silently, because an admin password nobody knows is
+	# worse than a loud failure here.
+	@if kubectl get secret prahari-bff-bootstrap --namespace $(NAMESPACE) >/dev/null 2>&1; then \
+	  echo "prahari-bff-bootstrap already exists — leaving it alone"; \
+	else \
+	  test ! -f .env || { set -a; . ./.env; set +a; }; \
+	  test -n "$${PRAHARI_BOOTSTRAP_ADMIN_USERNAME}" && test -n "$${PRAHARI_BOOTSTRAP_ADMIN_PASSWORD}" || { \
+	    echo "set PRAHARI_BOOTSTRAP_ADMIN_USERNAME and PRAHARI_BOOTSTRAP_ADMIN_PASSWORD in .env first"; exit 1; }; \
+	  kubectl create secret generic prahari-bff-bootstrap --namespace $(NAMESPACE) \
+	    --from-literal=admin-username="$$PRAHARI_BOOTSTRAP_ADMIN_USERNAME" \
+	    --from-literal=admin-password="$$PRAHARI_BOOTSTRAP_ADMIN_PASSWORD"; \
+	fi
+
 .PHONY: internal-secret
 internal-secret: ## Create the prahari-internal Secret (service token + credential key)
 	# Two keys every real deployment needs:

@@ -33,8 +33,23 @@ def test_redact_handles_escaped_password_and_missing_port():
 
 
 def test_redact_leaves_credential_free_urls_untouched():
-    url = "rtsp://10.0.0.5:554/ch1?x=1"
+    url = "rtsp://10.0.0.5:554/ch1"
     assert redact_url_credentials(url) == url
+
+
+def test_redact_drops_query_strings_because_dvrs_accept_query_auth():
+    # Some DVR/NVR lines authenticate via ?username=&password= — the diagnostic
+    # surface emits scheme+host+path only.
+    url = "rtsp://10.0.0.5:554/ch1?username=admin&password=s3cret"
+    assert redact_url_credentials(url) == "rtsp://10.0.0.5:554/ch1"
+
+
+def test_redact_does_not_500_on_a_malformed_port():
+    assert redact_url_credentials("rtsp://u:p@dvr.local:abc/ch1") == "rtsp://dvr.local/ch1"
+
+
+def test_redact_rebrackets_ipv6_hosts():
+    assert redact_url_credentials("rtsp://u:p@[fd00::1]:8554/ch") == "rtsp://[fd00::1]:8554/ch"
 
 
 def test_clamp_observed_at_defaults_to_now():

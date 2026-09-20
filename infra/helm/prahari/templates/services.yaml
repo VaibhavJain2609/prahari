@@ -112,6 +112,10 @@ metadata:
     {{- include "prahari.labels" $ | nindent 4 }}
     app.kubernetes.io/name: {{ $name }}
 spec:
+  # ClusterIP everywhere except where a profile asks for LoadBalancer — the
+  # k3d cluster maps host ports to the loadbalancer (infra/k3d/cluster.yaml),
+  # and a ClusterIP service never binds a node port for it to reach.
+  type: {{ $cfg.serviceType | default "ClusterIP" }}
   selector:
     {{- include "prahari.selectorLabels" $ | nindent 4 }}
     app.kubernetes.io/name: {{ $name }}

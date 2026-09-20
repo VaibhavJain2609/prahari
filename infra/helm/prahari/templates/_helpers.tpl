@@ -177,6 +177,33 @@ because a missing credential must not take down camera health as well as sync.
       name: {{ .Values.registry.gatewaySecret }}
       key: PRAHARI_GATEWAY_SCHEME
       optional: true
+# The remaining GatewaySettings fields — a gateway whose media hostname or
+# ports differ from the catalogue host (DIRECT_HOST) or nonstandard RTSP/WHEP
+# ports silently produced URLs pointing at the wrong place without these.
+- name: PRAHARI_GATEWAY_DIRECT_HOST
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.registry.gatewaySecret }}
+      key: PRAHARI_GATEWAY_DIRECT_HOST
+      optional: true
+- name: PRAHARI_GATEWAY_RTSP_PORT
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.registry.gatewaySecret }}
+      key: PRAHARI_GATEWAY_RTSP_PORT
+      optional: true
+- name: PRAHARI_GATEWAY_WHEP_PORT
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.registry.gatewaySecret }}
+      key: PRAHARI_GATEWAY_WHEP_PORT
+      optional: true
+- name: PRAHARI_GATEWAY_VERIFY_TLS
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.registry.gatewaySecret }}
+      key: PRAHARI_GATEWAY_VERIFY_TLS
+      optional: true
 {{- end -}}
 
 {{/*

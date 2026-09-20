@@ -152,6 +152,7 @@ def _request(*, pool=None, user_repo=None, session_repo=None, login_limiter=None
                     sse_max_connections=2,
                     redis_url=None,
                     alert_stream_key="prahari:alerts",
+                    login_ip_rate_limit_attempts=120,
                 ),
             )
         ),

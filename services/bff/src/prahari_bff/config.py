@@ -38,11 +38,18 @@ class BFFSettings(BaseSettings):
 
     login_rate_limit_attempts: int = 10
     login_rate_limit_window_s: float = 60.0
+    login_ip_rate_limit_attempts: int = 120
     """Sliding-window throttle on `/auth/login`, applied per-username and
     per-client-IP: beyond `login_rate_limit_attempts` attempts inside
     `login_rate_limit_window_s` seconds the endpoint answers 429. In-memory
     and per-process — enough to blunt a script against one pod without
-    making login depend on Redis."""
+    making login depend on Redis.
+
+    `login_ip_rate_limit_attempts` is deliberately looser: every browser
+    login arrives via the Next.js proxy pod, so the IP bucket is effectively
+    a deployment-global cap — sized to still catch a spray script (one source
+    hammering many usernames) without locking out an org's worth of operators
+    sharing that proxy."""
 
     # --- registry ----------------------------------------------------------
 

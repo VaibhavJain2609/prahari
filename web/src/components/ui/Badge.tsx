@@ -44,11 +44,14 @@ export function PriorityBadge({ priority }: { priority: string }) {
 const LINK_KIND_STYLES: Record<string, string> = {
   plate: "bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300",
   bridged: "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300",
+  unverified: "bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300",
 };
 
 // Route-hop link provenance: "plate" = same plate seen at both ends,
 // "bridged" = correlation stitched a gap on appearance — a weaker claim,
-// and the badge is how the operator sees which is which.
+// "unverified" = the feasibility gate could not run (registry lookup failed
+// open), so the hop is asserted, not verified — a weaker claim still, and the
+// badge is how the operator sees which is which.
 export function LinkKindBadge({ kind }: { kind: string | null | undefined }) {
   if (!kind) return null;
   return (

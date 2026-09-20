@@ -244,6 +244,9 @@ metadata:
   labels:
     {{- include "prahari.labels" . | nindent 4 }}
 spec:
+  # LoadBalancer in the local profile so k3d's host port maps (8554/8888/8889)
+  # actually reach it — a ClusterIP binds no node port for the loadbalancer.
+  type: {{ .Values.mediamtx.serviceType | default "ClusterIP" }}
   selector:
     {{- include "prahari.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/name: mediamtx

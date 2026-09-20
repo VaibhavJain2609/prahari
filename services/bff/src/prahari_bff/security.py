@@ -100,16 +100,21 @@ class SlidingWindowRateLimiter:
         self._lock = threading.Lock()
         self._last_prune = 0.0
 
-    def allow(self, key: str) -> bool:
+    def allow(self, key: str, max_attempts: int | None = None) -> bool:
         """Record one attempt; True while `key` has seen fewer than
-        `max_attempts` inside the trailing `window_s`."""
+        `max_attempts` (default: the limiter's own) inside the trailing
+        `window_s`. The override exists because not every key class shares a
+        fair cap: behind the Next.js proxy every browser login arrives from
+        the proxy pod's IP, so the per-IP bucket is effectively global and
+        needs a looser ceiling than the per-username one."""
         now = self._clock()
+        limit = self._max_attempts if max_attempts is None else max_attempts
         with self._lock:
             self._prune(now)
             events = self._events.setdefault(key, deque())
             while events and now - events[0] >= self._window_s:
                 events.popleft()
-            if len(events) >= self._max_attempts:
+            if len(events) >= limit:
                 return False
             events.append(now)
             return True

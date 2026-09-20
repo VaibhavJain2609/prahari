@@ -42,6 +42,23 @@ inference:
   keda:
     enabled: false
 
+# The console plane is real in every profile now — the images exist and the
+# console IA landed. LoadBalancer type so the k3d host port maps
+# (infra/k3d/cluster.yaml: 3000, 8080) reach them; a ClusterIP service binds
+# no node port for the loadbalancer to hit.
+services:
+  correlation:
+    enabled: true
+  bff:
+    enabled: true
+    serviceType: LoadBalancer
+  web:
+    enabled: true
+    serviceType: LoadBalancer
+
+mediamtx:
+  serviceType: LoadBalancer  # k3d maps 8554/8888/8889 to the loadbalancer
+
 # The laptop estate is trimmed by inference.maxStreamsPerWorker above — that is
 # the value the chart wires to PRAHARI_INGEST_MAX_ACTIVE_CAMERAS. The old
 # top-level `ingest.maxActiveCameras` was read by nothing; the registry still

@@ -30,12 +30,22 @@ profile: gpu
 postgres:
   storage: 50Gi
 
-# mediamtx.publicHost MUST be set for this profile — the base default
-# `localhost` only works through k3d's port maps. It is the host embedded in
-# the fan-out URLs handed to consumers, reachable from browsers AND in-cluster
-# workers (one field serves both; see PRAHARI_MEDIAMTX_PUBLIC_HOST in
-# _helpers.tpl). Left commented: an uncommented-but-empty `mediamtx:` map would
-# null out every base mediamtx value.
+# The console plane runs here too — correlation is REQUIRED for the KEDA
+# trigger: it creates the `prahari-correlation` consumer group on
+# `prahari:detections`, and the ScaledObject reads that group's pending count.
+services:
+  correlation:
+    enabled: true
+  bff:
+    enabled: true
+  web:
+    enabled: true
+
+# mediamtx.publicHost feeds the fan-out URLs handed to in-cluster workers;
+# the base default `prahari-mediamtx` is already correct pod-to-pod. Browser
+# preview goes through the BFF's audited ticket flow, not this host — only
+# override it if an ingress fronts MediaMTX media ports for a reason the
+# ticket flow doesn't cover.
 # mediamtx:
 #   publicHost: streams.example.gov.in
 

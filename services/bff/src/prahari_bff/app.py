@@ -168,7 +168,10 @@ async def _data_error_handler(request: Request, exc: asyncpg.DataError) -> JSONR
     # Malformed uuid/literal inputs (e.g. an org_id that isn't a uuid) reach
     # asyncpg as DataError — a caller error, not a server failure. The registry
     # already maps this to 422; the BFF must not 500 on it.
-    return JSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content={"detail": "invalid identifier"})
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": "invalid identifier"},
+    )
 
 
 # --- dependency accessors ---------------------------------------------------
@@ -302,6 +305,35 @@ async def _audit_access(
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "audit log unavailable") from exc
 
 
+async def _audit_event(
+    request: Request,
+    *,
+    actor: str,
+    org_path: str,
+    resource: str,
+    action: str,
+) -> None:
+    """`_audit_access` for events with no Principal — authentication itself.
+    A police platform's audit log that records every camera read but no
+    login is missing its most security-relevant entries. Non-fatal on
+    failure or a missing audit log: these wrap an already-failing or
+    session-establishing path (and a test app without lifespan has no
+    audit state at all)."""
+    audit: AuditLog | None = getattr(request.app.state, "audit", None)
+    if audit is None:
+        return
+    try:
+        await audit.append(
+            actor=actor,
+            org_path=org_path,
+            purpose_code="auth",
+            resource=resource,
+            action=action,
+        )
+    except Exception as exc:
+        log.error("audit append failed for %s on %s: %s", action, resource, exc)
+
+
 async def _require_session_admin(
     principal: Principal, *, audit: AuditLog, audit_action: str
 ) -> None:
@@ -367,10 +399,16 @@ async def login(payload: LoginRequest, request: Request, response: Response) -> 
 
     # Throttle before doing any credential work: per-username so a targeted
     # account can't be hammered, per-IP so one source can't spray usernames.
-    keys = [f"u:{payload.username}"]
-    if request.client is not None:
-        keys.append(f"ip:{request.client.host}")
-    if not all(limiter.allow(key) for key in keys):
+    # The IP bucket gets the looser cap — behind the console proxy every
+    # browser arrives from the same pod IP, so it is the deployment-global
+    # bucket, not a per-user one (see BFFSettings.login_ip_rate_limit_attempts).
+    if not limiter.allow(f"u:{payload.username}"):
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS, "too many login attempts — try again shortly"
+        )
+    if request.client is not None and not limiter.allow(
+        f"ip:{request.client.host}", max_attempts=settings.login_ip_rate_limit_attempts
+    ):
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS, "too many login attempts — try again shortly"
         )
@@ -382,7 +420,23 @@ async def login(payload: LoginRequest, request: Request, response: Response) -> 
     # distinguishing them would tell an attacker which usernames are real.
     password_ok = verify_password(payload.password, password_hash)
     if user is None or user.disabled_at is not None or not password_ok:
+        await _audit_event(
+            request,
+            actor=f"unauthenticated:{payload.username}",
+            org_path="-",
+            resource=f"user:{payload.username}",
+            action="auth_login_denied",
+        )
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
+
+    org_path = await org_path_for_id(request.app.state.pool, user.org_id) or "-"
+    await _audit_event(
+        request,
+        actor=user.username,
+        org_path=org_path,
+        resource=f"user:{user.username}",
+        action="auth_login",
+    )
 
     session_id, expires_at = await session_repo.create(
         user.id, ttl_hours=settings.session_ttl_hours
@@ -405,7 +459,19 @@ async def logout(request: Request, response: Response) -> dict:
 
     session_id = request.cookies.get(settings.session_cookie_name)
     if session_id:
+        # Resolve BEFORE revoking — the revoked session no longer resolves, and
+        # a sign-out is itself an auditable authentication event.
+        resolved = await session_repo.resolve(session_id)
         await session_repo.revoke(session_id)
+        if resolved is not None:
+            user, org_path = resolved
+            await _audit_event(
+                request,
+                actor=user.username,
+                org_path=org_path,
+                resource=f"user:{user.username}",
+                action="auth_logout",
+            )
     response.delete_cookie(settings.session_cookie_name)
     return {"status": "ok"}
 
@@ -1055,7 +1121,17 @@ async def import_cameras(
             continue
         try:
             payload = _row_to_camera_payload(row)
-            payload["org_id"] = await _check_target_org(request, principal, payload.get("org_id"))
+            # A scope denial here is a row swallowed into a per-row error, not
+            # a request failure — without audit kwargs it would leave no trace
+            # that an operator probed an out-of-scope org via the import path.
+            payload["org_id"] = await _check_target_org(
+                request,
+                principal,
+                payload.get("org_id"),
+                audit=audit,
+                denied_action="camera_import_denied",
+                resource=f"camera:{external_id}",
+            )
             response = await registry.post("/api/v1/cameras", json=payload)
         except HTTPException as exc:
             results.append(
