@@ -105,6 +105,114 @@ export type CameraGeoJSON = {
   }[];
 };
 
+export type Lifecycle = "active" | "absent" | "decommissioned";
+
+// Mirrors services/registry/src/prahari_registry/models.py::Camera — the
+// REST/JSON face of the registry row. Typed in full (rather than
+// Record<string, unknown>) because the drawer and the table both render it,
+// and an honestly-typed field is the difference between a typo at build
+// time and a blank panel at demo time. `stream_secret` is deliberately
+// absent: credentials are write-only and never come back over the wire.
+export type Camera = {
+  id: string;
+  source: string;
+  external_id: string;
+  location: GeoPoint | null;
+  site_name: string | null;
+  district: string | null;
+  department: string | null;
+  owner: string | null;
+  org_id: string | null;
+  adapter: string;
+  camera_type: string;
+  vendor: string | null;
+  vms_platform: string | null;
+  codec: string | null;
+  native_width: number | null;
+  native_height: number | null;
+  endpoints: {
+    rtsp_url: string | null;
+    hls_url: string | null;
+    whep_url: string | null;
+    fanout_rtsp_url: string | null;
+    fanout_hls_url: string | null;
+    fanout_whep_url: string | null;
+  };
+  storage_location: string | null;
+  retention_days: number | null;
+  commissioned_at: string | null;
+  amc_expires_at: string | null;
+  lifecycle: Lifecycle;
+  catalogue_live: boolean;
+  present_in_catalogue: boolean;
+  last_seen_in_catalogue: string | null;
+  health: {
+    state: string;
+    reason: string | null;
+    last_heartbeat_at: string | null;
+    last_frame_at: string | null;
+    observed_fps: number | null;
+    declared_fps: number | null;
+    fps_drift: number | null;
+    black_frame_ratio: number | null;
+    tamper_suspected: boolean;
+    consecutive_failures: number;
+    loop_epoch: number;
+    last_error: string | null;
+  };
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+// services/registry .../app.py::list_cameras — the filters the registry
+// understands. `lifecycle` is single-valued server-side; "all" is the
+// caller's problem (three fetches, merged — see CamerasTable).
+export type CameraListParams = {
+  district?: string;
+  department?: string;
+  state?: string;
+  lifecycle?: Lifecycle;
+  search?: string;
+  limit?: number;
+  offset?: number;
+};
+
+// cameras/summary — headline counts plus a per-health-state breakdown of
+// the active estate (see repository.py::health_summary).
+export type CamerasSummary = {
+  active: number;
+  absent: number;
+  decommissioned: number;
+  health: Record<string, number>;
+};
+
+// gaps/districts — DistrictCoverage. `district` is null for the row that
+// aggregates cameras with no district recorded.
+export type DistrictCoverage = {
+  district: string | null;
+  registered: number;
+  healthy: number;
+  degraded: number;
+  unreachable: number;
+  tampered: number;
+  unknown: number;
+  absent: number;
+  coverage_pct: number;
+};
+
+// gaps/dark-zones — a camera that is down with no healthy camera near
+// enough to cover for it. `nearest_healthy_m` null means no healthy camera
+// with a known location exists anywhere in scope.
+export type DarkZoneInfo = {
+  camera_id: string;
+  site_name: string | null;
+  district: string | null;
+  location: GeoPoint | null;
+  state: string;
+  reason: string | null;
+  nearest_healthy_m: number | null;
+};
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -169,6 +277,10 @@ function purpose(action: string, caseRef?: string): string {
 }
 
 export const api = {
+  // Escape hatch for endpoints that don't need a named method yet —
+  // useBFF(path) calls this. Same-origin proxy, same 401 handling.
+  get: <T>(path: string, init: ApiInit = {}) => request<T>(path, init),
+
   me: () => request<Principal>("auth/me"),
 
   login: (username: string, password: string) =>
@@ -203,12 +315,42 @@ export const api = {
     return request<CameraGeoJSON>(`cameras/geojson${qs ? `?${qs}` : ""}`);
   },
 
+  listCameras: (params: CameraListParams = {}, init: ApiInit = {}) => {
+    const qs = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+      if (value != null && value !== "") qs.set(key, String(value));
+    }
+    const query = qs.toString();
+    return request<Camera[]>(`cameras${query ? `?${query}` : ""}`, init);
+  },
+
+  camerasSummary: () => request<CamerasSummary>("cameras/summary"),
+
+  gapsDistricts: () => request<DistrictCoverage[]>("gaps/districts"),
+
+  gapsDarkZones: (radiusM?: number) =>
+    request<DarkZoneInfo[]>(
+      `gaps/dark-zones${radiusM != null ? `?radius_m=${radiusM}` : ""}`,
+    ),
+
   // Camera detail is an audited read of a specific, identifiable asset —
-  // the BFF requires a purpose code and writes it to the audit log.
-  getCamera: (cameraId: string, caseRef?: string) =>
-    request<Record<string, unknown>>(`cameras/${encodeURIComponent(cameraId)}`, {
-      purposeCode: purpose("camera-detail", caseRef),
+  // the BFF requires a purpose code and writes it to the audit log. The
+  // caller passes the operator's composed purpose (lib/purpose.tsx), not a
+  // bare case ref: the code records *why* the read happened, while the
+  // audit entry's own action/resource fields record *what* was read.
+  getCamera: (cameraId: string, purposeCode: string) =>
+    request<Camera>(`cameras/${encodeURIComponent(cameraId)}`, {
+      purposeCode,
     }),
+
+  updateCamera: (cameraId: string, body: Record<string, unknown>) =>
+    request<Camera>(`cameras/${encodeURIComponent(cameraId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+
+  decommissionCamera: (cameraId: string) =>
+    request<Camera>(`cameras/${encodeURIComponent(cameraId)}`, { method: "DELETE" }),
 
   createCamera: (body: Record<string, unknown>) => request("cameras", json(body)),
 
@@ -228,19 +370,24 @@ export const api = {
       headers: { "content-type": "text/csv" },
     }),
 
-  getRoute: (plate: string, caseRef?: string) =>
+  // `purposeCode` is the operator-composed code (lib/purpose.tsx —
+  // "<action>:<case ref>"), sent verbatim: the operator chooses why the
+  // trace runs, and a client that silently rewrote it would be decorating
+  // the audit log rather than filling it.
+  getRoute: (plate: string, purposeCode: string) =>
     request<RouteResult>(`routes/${encodeURIComponent(plate)}`, {
-      purposeCode: purpose("plate-trace", caseRef),
+      purposeCode,
     }),
 
   // A plain <a href> can't carry the required X-Purpose-Code header, so the
   // export is a fetch that returns bytes for the caller to hand to the
-  // browser's own download machinery (an object URL click, typically).
-  exportRoute: async (plate: string, format: "csv" | "pdf", caseRef?: string) => {
+  // browser's own download machinery (an object URL click, typically). The
+  // same purpose code that produced the trace threads through to the export.
+  exportRoute: async (plate: string, format: "csv" | "pdf", purposeCode: string) => {
     const res = await fetch(
       `/api/bff/routes/${encodeURIComponent(plate)}/export?format=${format}`,
       {
-        headers: { "x-purpose-code": purpose("plate-trace-export", caseRef) },
+        headers: { "x-purpose-code": purposeCode },
         cache: "no-store",
       },
     );
@@ -252,5 +399,8 @@ export const api = {
     return res.blob();
   },
 
-  verifyAudit: () => request<{ ok: boolean; first_broken_id: string | null }>("audit/verify"),
+  // Response keys mirror the BFF's verify_audit handler: `ok` plus the id
+  // of the first entry whose hash doesn't chain, if any.
+  verifyAudit: () =>
+    request<{ ok: boolean; first_broken_entry: string | null }>("audit/verify"),
 };
