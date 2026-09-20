@@ -116,6 +116,99 @@ class TestLoading:
         watchlist = Watchlist.load_dir(tmp_path)
         assert len(watchlist) == 1
 
+    def test_missing_reason_stores_unspecified(self, tmp_path: Path) -> None:
+        from prahari.v1 import events_pb2
+
+        (tmp_path / "wl.json").write_text(
+            json.dumps([{"entry_id": "E1", "plate": "GJ01AB1234"}]), encoding="utf-8"
+        )
+        watchlist = Watchlist.load_dir(tmp_path)
+        record = next(iter(watchlist._by_entry_id.values()))  # noqa: SLF001
+        assert record.entry.reason == events_pb2.WATCHLIST_REASON_UNSPECIFIED
+
+    def test_row_without_any_id_is_skipped_not_fatal(self, tmp_path: Path) -> None:
+        # `_entry_from_row` raises ValueError for a missing entry_id; the
+        # loader must skip the row and keep the rest — same malformed-row
+        # contract as a missing plate.
+        (tmp_path / "wl.json").write_text(
+            json.dumps(
+                [
+                    {"plate": "GJ01AB1234", "reason": "stolen"},  # no entry_id or id
+                    {"entry_id": "E2", "plate": "GJ05CD5678", "reason": "wanted"},
+                ]
+            ),
+            encoding="utf-8",
+        )
+        watchlist = Watchlist.load_dir(tmp_path)
+        assert len(watchlist) == 1
+
+    def test_id_column_is_accepted_as_entry_id(self, tmp_path: Path) -> None:
+        # Some upstream snapshots key the row "id" rather than "entry_id" —
+        # the loader accepts either, and the alias must map to entry_id.
+        (tmp_path / "wl.csv").write_text(
+            "id,plate,reason\nW-7,GJ05CD5678,wanted\n", encoding="utf-8"
+        )
+        watchlist = Watchlist.load_dir(tmp_path)
+        assert len(watchlist) == 1
+        record = next(iter(watchlist._by_entry_id.values()))  # noqa: SLF001
+        assert record.entry.entry_id == "W-7"
+
+    def test_reason_aliases_resolve_to_their_proto_values(self, tmp_path: Path) -> None:
+        # "missing" is the documented alias for missing_person — a snapshot
+        # that spells it the short way must not land as UNSPECIFIED.
+        from prahari.v1 import events_pb2
+
+        (tmp_path / "wl.json").write_text(
+            json.dumps(
+                [
+                    {"entry_id": "E1", "plate": "GJ01AB1234", "reason": "missing"},
+                    {"entry_id": "E2", "plate": "GJ05CD5678", "reason": "suspect"},
+                ]
+            ),
+            encoding="utf-8",
+        )
+        watchlist = Watchlist.load_dir(tmp_path)
+        by_id = watchlist._by_entry_id  # noqa: SLF001
+        assert by_id["E1"].entry.reason == events_pb2.WATCHLIST_REASON_MISSING_PERSON
+        assert by_id["E2"].entry.reason == events_pb2.WATCHLIST_REASON_SUSPECT
+
+    def test_added_at_and_expires_at_parse_to_proto_timestamps(self, tmp_path: Path) -> None:
+        # expires_at is what matcher._expired reads — a parse that silently
+        # dropped it would keep expired entries matching forever.
+        from datetime import UTC, datetime
+
+        (tmp_path / "wl.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "entry_id": "E1",
+                        "plate": "GJ01AB1234",
+                        "reason": "stolen",
+                        "added_at": "2026-01-01T00:00:00+00:00",
+                        # Naive timestamp: treated as UTC, per _parse_timestamp.
+                        "expires_at": "2027-01-01T00:00:00",
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        watchlist = Watchlist.load_dir(tmp_path)
+        entry = next(iter(watchlist._by_entry_id.values())).entry  # noqa: SLF001
+        assert entry.HasField("added_at")
+        assert entry.HasField("expires_at")
+        assert entry.added_at.ToDatetime(tzinfo=UTC) == datetime(2026, 1, 1, tzinfo=UTC)
+        assert entry.expires_at.ToDatetime(tzinfo=UTC) == datetime(2027, 1, 1, tzinfo=UTC)
+
+    def test_blank_timestamps_leave_the_proto_fields_unset(self, tmp_path: Path) -> None:
+        (tmp_path / "wl.csv").write_text(
+            "entry_id,plate,reason,added_at,expires_at\nE1,GJ01AB1234,stolen, , \n",
+            encoding="utf-8",
+        )
+        watchlist = Watchlist.load_dir(tmp_path)
+        entry = next(iter(watchlist._by_entry_id.values())).entry  # noqa: SLF001
+        assert not entry.HasField("added_at")
+        assert not entry.HasField("expires_at")
+
 
 class TestLookup:
     def _watchlist_with(self, *plates: str) -> Watchlist:
@@ -152,3 +245,15 @@ class TestLookup:
         watchlist = self._watchlist_with("GJ01AB1234", "GJ01AB1Z34")
         assert watchlist.bucket_count() == 1
         assert len(watchlist) == 2
+
+    def test_bloom_keys_are_a_superset_of_both_lookup_indexes(self) -> None:
+        # Stage 1's acceptance set must be a superset of stage 2's candidate
+        # set: the full skeletons AND every single-deletion variant, or a
+        # plate read one character short dies in the Bloom filter before the
+        # matcher ever sees it.
+        watchlist = self._watchlist_with("GJ01AB1234")
+        keys = set(watchlist.bloom_keys())
+        skel = next(iter(watchlist.skeletons()))
+        assert skel in keys
+        for variant in single_char_deletions(skel):
+            assert variant in keys
