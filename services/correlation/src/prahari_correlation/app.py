@@ -141,11 +141,12 @@ async def require_internal_token(request: Request, call_next):
 # --- dependencies ------------------------------------------------------------
 
 
-def get_sightings(request: Request) -> SightingSource:
-    """The sightings backend route queries read — `PostgresSightings` when
+def get_store(request: Request) -> SightingSource:
+    """The sightings store route queries read — `PostgresSightings` when
     `database_url` is configured, the in-memory `DetectionStore` otherwise.
-    Named for what it is: overriding this in tests injects the query source,
-    whatever its durability."""
+    The name is the pre-durability contract (`tests/test_day3_gate.py`
+    overrides it to inject the query source); what it returns is whichever
+    backend the lifespan wired into `app.state.sightings`."""
     return request.app.state.sightings
 
 
@@ -169,7 +170,7 @@ def get_metrics(request: Request) -> Metrics:
     return request.app.state.metrics
 
 
-SightingsDep = Annotated[SightingSource, Depends(get_sightings)]
+StoreDep = Annotated[SightingSource, Depends(get_store)]
 DbDep = Annotated[PostgresSightings | None, Depends(get_db)]
 SettingsDep = Annotated[CorrelationSettings, Depends(get_settings)]
 ConsumerDep = Annotated[DetectionConsumer, Depends(get_consumer)]
@@ -281,7 +282,7 @@ def _route_to_dict(result: RouteResult) -> dict:
 @app.get("/api/v1/routes/{plate}", tags=["routes"])
 async def get_route(
     plate: str,
-    sightings: SightingsDep,
+    sightings: StoreDep,
     registry: RegistryDep,
     settings: SettingsDep,
     metrics: MetricsDep,

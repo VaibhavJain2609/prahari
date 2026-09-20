@@ -1,7 +1,7 @@
 """app.py: the FastAPI surface. `/healthz` must survive a disconnected
 detection consumer without touching it; `/readyz` must actually report
 whether one is connected. `/api/v1/routes/{plate}` is exercised through
-`dependency_overrides` on `get_sightings`/`get_registry` rather than a real
+`dependency_overrides` on `get_store`/`get_registry` rather than a real
 Redis-backed store or a real registry HTTP call -- this is an endpoint-wiring
 test, not a `build_route` behaviour test (that is `test_routes.py`'s job).
 """
@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 from google.protobuf.timestamp_pb2 import Timestamp
 from prahari.v1 import common_pb2, events_pb2
 
-from prahari_correlation.app import app, get_consumer, get_db, get_registry, get_sightings
+from prahari_correlation.app import app, get_consumer, get_db, get_registry, get_store
 from prahari_correlation.registry_client import DarkZone, GeoPoint
 from prahari_correlation.store import DetectionStore
 
@@ -63,7 +63,7 @@ class TestInternalToken:
     def test_unset_token_leaves_the_api_open(self, monkeypatch) -> None:
         monkeypatch.delenv("PRAHARI_CORRELATION_INTERNAL_TOKEN", raising=False)
         store = DetectionStore(max_per_plate=10, max_plates=10)
-        app.dependency_overrides[get_sightings] = lambda: store
+        app.dependency_overrides[get_store] = lambda: store
         app.dependency_overrides[get_registry] = lambda: _FakeRegistry({})
         try:
             with _client() as client:
@@ -85,7 +85,7 @@ class TestInternalToken:
 
     def test_armed_gate_accepts_the_right_token(self, monkeypatch) -> None:
         store = DetectionStore(max_per_plate=10, max_plates=10)
-        app.dependency_overrides[get_sightings] = lambda: store
+        app.dependency_overrides[get_store] = lambda: store
         app.dependency_overrides[get_registry] = lambda: _FakeRegistry({})
         try:
             with self._armed_client(monkeypatch) as client:
@@ -183,7 +183,7 @@ class TestRoutes:
         store.add(_detection("CAM-A", "GJ01AB1234"))
         registry = _FakeRegistry({"CAM-A": GeoPoint(latitude=23.0, longitude=72.5)})
 
-        app.dependency_overrides[get_sightings] = lambda: store
+        app.dependency_overrides[get_store] = lambda: store
         app.dependency_overrides[get_registry] = lambda: registry
         try:
             with _client() as client:
@@ -207,7 +207,7 @@ class TestRoutes:
         store = DetectionStore(max_per_plate=10, max_plates=10)
         registry = _FakeRegistry({})
 
-        app.dependency_overrides[get_sightings] = lambda: store
+        app.dependency_overrides[get_store] = lambda: store
         app.dependency_overrides[get_registry] = lambda: registry
         try:
             with _client() as client:
