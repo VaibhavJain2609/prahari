@@ -79,6 +79,16 @@ spec:
               app.kubernetes.io/name: inference
       ports:
         - port: {{ .Values.services.matchEngine.grpcPort }}
+    # BFF → match-engine HTTP: the watchlist-admin and alert-history proxies
+    # (MatchEngineClient, PRAHARI_MATCH_ENGINE_BASE_URL). Token-gated like the
+    # gRPC surface; without this rule an enforcing CNI cuts the console off
+    # from alerts entirely.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: bff
+      ports:
+        - port: {{ .Values.services.matchEngine.port }}
 ---
 # The media ports must stay open: browsers reach WHEP/HLS through the k3d
 # port maps and workers pull RTSP — traffic from the host arrives off-node.

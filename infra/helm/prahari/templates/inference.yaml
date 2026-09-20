@@ -138,6 +138,11 @@ spec:
   # and the scale-DOWN curve is part of the elasticity demo. A pool that only
   # grows is not elasticity.
   cooldownPeriod: 120
+  # Redis is requirepass-armed (prahari-redis-auth) — the scaler needs the same
+  # credential or every trigger poll returns NOAUTH and KEDA logs errors while
+  # the replica count sits frozen at minReplicas.
+  authenticationRef:
+    name: prahari-redis-auth
   triggers:
     # The bus is Redis Streams, not a list — the previous `redis` scaler watched
     # `prahari:frames:pending`, a key nothing produces, so the trigger would
@@ -156,4 +161,18 @@ spec:
         stream: prahari:detections
         consumerGroup: prahari-correlation
         pendingEntriesCount: {{ .Values.inference.keda.queueLengthTarget | quote }}
+---
+# The scaler's credential — same Secret the in-chart Redis enforces and every
+# first-party consumer reads (prahari.redisPasswordEnv).
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: prahari-redis-auth
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+spec:
+  secretTargetRef:
+    - parameter: password
+      name: prahari-redis-auth
+      key: password
 {{- end }}
