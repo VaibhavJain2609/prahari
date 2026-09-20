@@ -22,9 +22,12 @@ When a design choice is ambiguous, keep pixels at the edge.
 - **Control plane** — `services/registry`: the camera registry + GIS.
   Small, authoritative, live. Owns camera state; workers only report
   observations to it.
-- **Data plane** — video stays at the edge / the government gateway. Pulled
-  centrally only as an audited evidence request (that pull path is designed,
-  not yet built — `NEXT-PHASE-PLAN.md` §2/S4).
+- **Data plane** — video stays at the edge / the government gateway. Central
+  access exists only as audited requests: live preview rides a scoped,
+  expiring MediaMTX ticket minted *after* the `video_preview` audit row
+  (`docs/SECURITY.md`), and the evidence-request chain (`docs/EVIDENCE.md`)
+  records the clip pull — real clip bytes land when MediaMTX `record: yes`
+  does; the ticket already grants `playback`.
 - **Metadata plane** — detections, plates, tracks, alerts flow centrally as
   protobuf events (`proto/prahari/v1`), on gRPC for the high-rate link and
   Redis Streams for fan-out. One schema, two transports.
@@ -111,10 +114,12 @@ by the same org predicate.
   existing low-dimensional embedding, labelled honestly in output.
 - **Road-network routing** — haversine is strictly more permissive than road
   distance, so the gate errs toward keeping a hop, never toward inventing one.
-- **An IdP** — local sessions/API keys are a seed; Keycloak is the planned
-  replacement (`NEXT-PHASE-PLAN.md` §3).
-- **WHEP preview in the console** — designed, not yet built; preview-only by
-  invariant when it lands.
+- **An IdP beyond Keycloak's realm file** — `auth.kind=keycloak` ships OIDC
+  code+PKCE with server-side exchange (`docs/KEYCLOAK.md`); what remains is
+  real org membership in Keycloak and SCIM/federation for the estate.
+- **MediaMTX recording for evidence clips** — the request chain and
+  `playback` tickets exist; `record: yes` on reconciled paths is the
+  follow-on (`docs/EVIDENCE.md`).
 
 ## 8. Deployment shape
 
