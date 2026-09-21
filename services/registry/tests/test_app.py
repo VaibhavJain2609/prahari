@@ -15,10 +15,10 @@ import asyncpg
 import pytest
 from fastapi.testclient import TestClient
 
-from prahari_registry.app import app
+from prahari_registry.app import WORKER_SECRET_HEADER, app
 from prahari_registry.config import RegistrySettings
 from prahari_registry.models import Camera, HeartbeatSample
-from prahari_registry.repository import _clamp_observed_at
+from prahari_registry.repository import _clamp_observed_at, hash_worker_secret
 
 TOKEN = "test-internal-token"
 HEADERS = {"x-internal-token": TOKEN}
@@ -62,10 +62,24 @@ class FakeRepo:
         return self.history[:limit]
 
 
+class FakeWorkerRepo:
+    """Only the surface `post_heartbeat` touches: the migration-010 secret
+    lookup. `hashes` is worker_id -> stored digest; an absent key is an
+    unbound worker, so existing heartbeat tests are unaffected and the bound
+    path is scripted per test."""
+
+    def __init__(self) -> None:
+        self.hashes: dict[str, str] = {}
+
+    async def bound_secret_hash(self, worker_id: str) -> str | None:
+        return self.hashes.get(worker_id)
+
+
 @pytest.fixture
 def repo():
     repo = FakeRepo()
     app.state.repo = repo
+    app.state.worker_repo = FakeWorkerRepo()
     app.state.settings = RegistrySettings(internal_token=TOKEN, sync_enabled=False)
     app.state.gateway_configured = False
     return repo
@@ -258,6 +272,66 @@ def test_far_future_observed_at_is_clamped_not_stored(repo, client):
     assert resp.status_code == 200
     stored_at = repo.recorded[0][2]
     assert stored_at <= datetime.now(UTC)
+
+
+def test_heartbeat_from_a_bound_worker_requires_its_secret(repo, client):
+    """Migration 010: once a worker_id is bound, the shared inference-token
+    alone can no longer file heartbeats under it — X-Worker-Secret must
+    match the stored digest or the report is refused."""
+    repo.cameras[CAM_ID] = _camera()
+    app.state.worker_repo.hashes["w1"] = hash_worker_secret("s3kr3t")
+
+    assert (
+        client.post(
+            f"/api/v1/cameras/{CAM_ID}/heartbeat",
+            headers=HEADERS,
+            json={"worker_id": "w1", "connected": True},
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            f"/api/v1/cameras/{CAM_ID}/heartbeat",
+            headers={**HEADERS, WORKER_SECRET_HEADER: "wrong"},
+            json={"worker_id": "w1", "connected": True},
+        ).status_code
+        == 403
+    )
+    resp = client.post(
+        f"/api/v1/cameras/{CAM_ID}/heartbeat",
+        headers={**HEADERS, WORKER_SECRET_HEADER: "s3kr3t"},
+        json={"worker_id": "w1", "connected": True},
+    )
+    assert resp.status_code == 200
+    assert repo.recorded[0][0] == CAM_ID
+
+
+def test_heartbeat_secret_is_checked_for_the_worker_id_in_the_body(repo, client):
+    """The credential binds the CLAIMED worker_id, not the caller: another
+    worker's valid secret does not unlock a report filed under w1's name."""
+    repo.cameras[CAM_ID] = _camera()
+    app.state.worker_repo.hashes["w1"] = hash_worker_secret("w1-secret")
+    app.state.worker_repo.hashes["w2"] = hash_worker_secret("w2-secret")
+
+    resp = client.post(
+        f"/api/v1/cameras/{CAM_ID}/heartbeat",
+        headers={**HEADERS, WORKER_SECRET_HEADER: "w2-secret"},
+        json={"worker_id": "w1", "connected": True},
+    )
+    assert resp.status_code == 403
+    assert not repo.recorded
+
+
+def test_heartbeat_from_an_unbound_worker_is_unchanged(repo, client):
+    """Compat: a worker_id with no bound secret needs nothing extra — the
+    pre-binding path, verbatim."""
+    repo.cameras[CAM_ID] = _camera()
+    resp = client.post(
+        f"/api/v1/cameras/{CAM_ID}/heartbeat",
+        headers=HEADERS,
+        json={"worker_id": "w1", "connected": True},
+    )
+    assert resp.status_code == 200
 
 
 @pytest.mark.parametrize(

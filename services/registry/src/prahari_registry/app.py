@@ -8,7 +8,9 @@ low-rate and human-facing, and JSON keeps the console and `curl` on equal terms.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated
@@ -65,6 +67,8 @@ from .repository import (
     CameraRepository,
     OrgRepository,
     WorkerRepository,
+    WorkerSecretError,
+    hash_worker_secret,
     redact_url_credentials,
 )
 from .sync import CatalogueSync
@@ -578,7 +582,13 @@ async def decommission_camera(camera_id: str, repo: RepoDep, scope: ScopeDep) ->
 
 @app.post("/api/v1/cameras/{camera_id}/heartbeat", response_model=HeartbeatAck, tags=["health"])
 async def post_heartbeat(
-    camera_id: str, heartbeat: Heartbeat, repo: RepoDep, settings: SettingsDep, scope: ScopeDep
+    camera_id: str,
+    heartbeat: Heartbeat,
+    request: Request,
+    repo: RepoDep,
+    worker_repo: WorkerRepoDep,
+    settings: SettingsDep,
+    scope: ScopeDep,
 ) -> HeartbeatAck:
     """Accept one health report from an ingest worker.
 
@@ -594,6 +604,12 @@ async def post_heartbeat(
     camera = await repo.get(camera_id, scope=scope)
     if camera is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no camera {camera_id}")
+
+    # The secret binds the worker_id the heartbeat CLAIMS — checked against
+    # `heartbeat.worker_id`, not any other identity on the call, so a bound
+    # worker's credential cannot be lent to a report filed under a different
+    # name (and vice versa: another worker's secret does not unlock this one).
+    await _require_worker_secret(worker_repo, heartbeat.worker_id, request.headers)
 
     policy = HealthPolicy(
         fps_drift_ratio=settings.health_fps_drift_ratio,
@@ -654,10 +670,44 @@ async def health_history(
 # refreshes its lease every assignment cycle, and an operator can ask "what
 # shard does pod X think it owns" without pulling the camera list.
 
+WORKER_SECRET_HEADER = "x-worker-secret"
+"""The per-worker credential's name on the wire (migration 010): a SECOND
+credential layered on `X-Internal-Token`, not a replacement for it. The
+service token authorizes "an inference worker may call"; this header proves
+WHICH worker — minted by the registry at register time, stored as a SHA-256
+digest in `workers.secret_hash`, and sent back on every worker-facing call
+once bound. The inference worker's copy of this constant lives in
+`prahari_inference.worker` and must stay byte-identical."""
+
+
+async def _require_worker_secret(
+    worker_repo: WorkerRepository, worker_id: str, headers: Mapping[str, str]
+) -> None:
+    """Enforce the per-worker credential on the worker-facing calls.
+
+    A no-op for an unbound worker_id (NULL `secret_hash`) — pre-binding
+    callers keep working; binding is opt-in hardening, not a flag day. For a
+    bound row the `X-Worker-Secret` header must hash to the stored digest,
+    `hmac.compare_digest`-compared like every other credential check here.
+    This is the check that stops a stolen `inference-token` from hijacking a
+    live worker's shard or speaking heartbeats under its name — the token
+    still gets the call through the middleware, the secret is what says it
+    may act AS this worker_id.
+    """
+    stored = await worker_repo.bound_secret_hash(worker_id)
+    if stored is None:
+        return
+    presented = headers.get(WORKER_SECRET_HEADER)
+    if presented is None or not hmac.compare_digest(hash_worker_secret(presented), stored):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"worker {worker_id} is bound to a worker secret; present it as X-Worker-Secret",
+        )
+
 
 @app.post("/api/v1/workers/register", response_model=WorkerRegistration, tags=["workers"])
 async def register_worker(
-    payload: WorkerRegister, worker_repo: WorkerRepoDep
+    payload: WorkerRegister, request: Request, worker_repo: WorkerRepoDep
 ) -> WorkerRegistration:
     """Join or refresh the ingest pool; returns the worker's shard coordinates.
 
@@ -667,8 +717,21 @@ async def register_worker(
     missed its lease simply drops out of `shard_count` on the next call, which
     is the whole reaper — no DELETE endpoint exists because a killed pod cannot
     be relied on to make one last request.
+
+    Credential binding (migration 010): a `rotate_secret` body flag on an
+    unbound worker_id mints and binds a secret, returned once in
+    `worker_secret`; on a bound one it rotates the credential, still gated
+    on the current `X-Worker-Secret`. A bound worker_id that cannot present
+    its secret is refused — the token alone no longer claims the id.
     """
-    return await worker_repo.register(payload.worker_id)
+    try:
+        return await worker_repo.register(
+            payload.worker_id,
+            presented_secret=request.headers.get(WORKER_SECRET_HEADER),
+            rotate=payload.rotate_secret,
+        )
+    except WorkerSecretError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
 
 
 @app.get("/api/v1/assignments", response_model=WorkerAssignment, tags=["workers"])
@@ -677,6 +740,7 @@ async def worker_assignments(
         str,
         Query(min_length=1, description="the id this worker registered with"),
     ],
+    request: Request,
     worker_repo: WorkerRepoDep,
     settings: SettingsDep,
 ) -> WorkerAssignment:
@@ -693,6 +757,7 @@ async def worker_assignments(
     whole registry, not one org subtree — taken from settings rather than the
     provisional `org_scope` parameter, which a worker has no business widening.
     """
+    await _require_worker_secret(worker_repo, worker_id, request.headers)
     assignment = await worker_repo.assignment(worker_id, scope=settings.sync_default_org_path)
     if assignment is None:
         raise HTTPException(

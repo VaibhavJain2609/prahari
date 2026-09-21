@@ -39,7 +39,9 @@ from prahari_registry.repository import (
     CameraRepository,
     OrgRepository,
     WorkerRepository,
+    WorkerSecretError,
     _point,
+    hash_worker_secret,
 )
 
 CAM_ID = "00000000-0000-0000-0000-0000000000ab"
@@ -679,11 +681,96 @@ async def test_register_refreshes_the_lease_and_persists_the_coordinates():
     registration = await repo.register("w2")
     assert (registration.shard_index, registration.shard_count) == (1, 2)
     assert registration.lease_s == 60
+    assert registration.worker_secret is None  # no flag, no mint
     statements = [
         sql for _, sql, _ in pool.calls if "INSERT INTO workers" in sql or "UPDATE workers" in sql
     ]
     assert any("ON CONFLICT" in s for s in statements)
     assert any("shard_index" in s for s in statements)
+
+
+async def test_register_mints_a_secret_only_on_the_opt_in_flag():
+    """rotate=true on an UNBOUND worker_id is the bind request: the plaintext
+    is returned once and the upsert stores only its digest. The default path
+    must never mint — a secret the caller did not ask for is a credential it
+    cannot present on the next call."""
+    pool = FakePool()  # fetchval -> None: no stored hash
+    pool.fetch_results.append([{"worker_id": "w1"}])
+    repo = WorkerRepository(pool, RegistrySettings(sync_enabled=False, assignment_lease_s=60))
+
+    registration = await repo.register("w1", rotate=True)
+    assert registration.worker_secret is not None
+    insert_args = next(args for _, sql, args in pool.calls if "INSERT INTO workers" in sql)
+    # $2 is the stored digest — never the plaintext itself.
+    assert insert_args == ("w1", hash_worker_secret(registration.worker_secret))
+
+
+async def test_register_bound_worker_requires_the_current_secret():
+    pool = FakePool()
+    stored = hash_worker_secret("s3kr3t")
+    repo = WorkerRepository(pool, RegistrySettings(sync_enabled=False, assignment_lease_s=60))
+
+    # Missing and wrong both refuse before the upsert — each attempt reads
+    # the same stored digest.
+    pool.fetchval_results.extend([stored, stored])
+    with pytest.raises(WorkerSecretError):
+        await repo.register("w1")
+    with pytest.raises(WorkerSecretError):
+        await repo.register("w1", presented_secret="wrong")
+    assert not any("INSERT INTO workers" in sql for _, sql, _ in pool.calls)
+
+    # The right secret refreshes the lease WITHOUT re-minting.
+    pool.fetchval_results.append(stored)
+    pool.fetch_results.append([{"worker_id": "w1"}])
+    registration = await repo.register("w1", presented_secret="s3kr3t")
+    assert registration.worker_secret is None
+    insert_args = next(args for _, sql, args in pool.calls if "INSERT INTO workers" in sql)
+    assert insert_args[1] is None  # COALESCE($2, ...) keeps the stored hash
+
+
+async def test_register_rotate_replaces_the_hash_and_returns_the_new_secret():
+    pool = FakePool()
+    old_hash = hash_worker_secret("old-secret")
+    repo = WorkerRepository(pool, RegistrySettings(sync_enabled=False, assignment_lease_s=60))
+
+    # Rotation is gated on the CURRENT secret — a stolen one cannot re-key.
+    pool.fetchval_results.append(old_hash)
+    with pytest.raises(WorkerSecretError):
+        await repo.register("w1", presented_secret="wrong", rotate=True)
+
+    pool.fetchval_results.append(old_hash)
+    pool.fetch_results.append([{"worker_id": "w1"}])
+    registration = await repo.register("w1", presented_secret="old-secret", rotate=True)
+    assert registration.worker_secret and registration.worker_secret != "old-secret"
+    insert_args = next(args for _, sql, args in pool.calls if "INSERT INTO workers" in sql)
+    assert insert_args[1] == hash_worker_secret(registration.worker_secret)
+
+
+async def test_worker_secret_required_refuses_an_unbound_registration():
+    """Armed, the flag closes the last unbound path: a register that does not
+    ask for a secret is refused rather than left claimable by any token
+    holder. The mint path itself still works — that is the upgrade path."""
+    repo = WorkerRepository(
+        FakePool(),
+        RegistrySettings(sync_enabled=False, assignment_lease_s=60, worker_secret_required=True),
+    )
+    pool = repo._pool
+    with pytest.raises(WorkerSecretError):
+        await repo.register("w1")  # fetchval -> None: unbound
+
+    pool.fetch_results.append([{"worker_id": "w1"}])
+    registration = await repo.register("w1", rotate=True)
+    assert registration.worker_secret is not None
+
+
+async def test_bound_secret_hash_returns_the_stored_digest_or_none():
+    """None covers both "no row" and "unbound" — the callers only need to
+    know whether a credential must be presented."""
+    pool = FakePool()
+    pool.fetchval_results.extend(["abc123", None])
+    repo = WorkerRepository(pool, RegistrySettings(sync_enabled=False))
+    assert await repo.bound_secret_hash("w1") == "abc123"
+    assert await repo.bound_secret_hash("w2") is None
 
 
 async def test_alive_worker_ids_uses_the_alive_horizon():

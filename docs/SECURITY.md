@@ -125,18 +125,26 @@ Real gaps, tracked against `docs/NEXT-PHASE-PLAN.md` §5/E:
 
 - **mTLS** on internal links — token-in-metadata shipped; a mesh is
   disproportionate at this scale.
-- **Per-pod caller identity** — per-SERVICE internal credentials shipped:
-  `internal_tokens` maps caller names to distinct tokens and each receiver
-  enforces an allowlist, so a compromised worker can no longer impersonate
-  the BFF or correlation. What is still shared is the granularity *within* a
-  service: every inference replica holds the same `inference-token`, so one
-  pod's compromise is that service's compromise (and `GET
-  /api/v1/assignments` `worker_id`s are still bound to the service token,
-  not a per-pod credential). SPIFFE/SPIRE or per-pod minted identities are
-  the fix; the `internal` shared-token compat caller also remains — the
-  loadtest now presents the `inference` identity
-  (`PRAHARI_INFERENCE_TOKEN`), so `internal` survives only for ad-hoc ops
-  tooling that has not minted a named key.
+- **Per-pod caller identity** — per-SERVICE internal credentials plus
+  per-WORKER secret binding shipped: `internal_tokens` maps caller names to
+  distinct tokens and each receiver enforces an allowlist, and the registry
+  now mints a secret per `worker_id` on the register that asks for one
+  (SHA-256 digest in `workers.secret_hash`, migration 010). A bound
+  worker_id must then present it as `X-Worker-Secret` on register,
+  assignments and heartbeats — so a stolen `inference-token` can no longer
+  claim an active worker's lease, hijack its shard, or spoof heartbeats
+  under its name. What is still deferred: the shared token still authorizes
+  registering NEW unbound ids (and unbound pre-upgrade workers) until
+  `worker_secret_required` is armed; the minted secret is held by the
+  worker itself — memory only unless `worker_secret_path` points at a
+  per-pod volume, which is deliberately never a shared one — so a lost
+  secret on a stable worker_id means an operator clears `secret_hash` to
+  rebind; and other inference replicas still share `inference-token`, so
+  service-wide compromise still reaches every *unbound* id. SPIFFE/SPIRE
+  or per-pod minted identities remain the real fix; the `internal`
+  shared-token compat caller also remains — the loadtest presents the
+  `inference` identity (`PRAHARI_INFERENCE_TOKEN`), so `internal` survives
+  only for ad-hoc ops tooling that has not minted a named key.
 - **Evidence pull** — a signed capability `(camera, range, purpose)` redeemed
   for a clip. Preview is solved (audited tickets); the request/ticket chain
   exists and `mediamtx.record` renders recording + a PVC, but recording is

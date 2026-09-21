@@ -95,6 +95,27 @@ class IngestSettings(BaseSettings):
     it explicitly only off-cluster, where several workers on one host would
     otherwise all register as the same machine and be handed the same shard."""
 
+    worker_secret_path: str = ""
+    """File the registry-minted per-worker secret is persisted to — read back
+    on boot and sent as `X-Worker-Secret` on register, assignments and
+    heartbeat calls (migration 010 binding).
+
+    Empty keeps the secret in memory only. That is honest while `worker_id`
+    is the pod name — a rescheduled pod registers as a NEW worker_id — but
+    lossy on a STABLE id (an explicit `worker_id`, or a container restart
+    inside one pod): the secret is gone while the registry still holds its
+    hash, so every call then 403s until the row is reaped at 3x the
+    assignment lease or an operator clears `workers.secret_hash`. A bound
+    worker_id cannot be re-claimed without its secret — that refusal is the
+    feature, not a bug: it is what stops a stolen inference-token taking
+    the id over.
+
+    Production deployments with stable ids should point this at a per-pod
+    volume — deliberately never a SHARED one: the credential's whole value
+    is that it is per-worker, and a shared mount would hand every replica
+    the same identity, recreating the shared-token problem it exists to
+    close."""
+
     snapshot_dir: str = "data/catalogue"
 
     registry_url: str = "http://prahari-registry:8000"

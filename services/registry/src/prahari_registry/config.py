@@ -232,6 +232,19 @@ class RegistrySettings(BaseSettings):
     own refresh cadence (`PRAHARI_INGEST_ASSIGNMENT_REFRESH_S`) so one missed
     refresh does not eject a live pod from the pool."""
 
+    worker_secret_required: bool = False
+    """Refuse worker registrations that would leave the worker_id UNBOUND
+    (`PRAHARI_WORKER_SECRET_REQUIRED`, migration 010).
+
+    With per-worker secrets, `X-Internal-Token` alone no longer suffices to
+    claim a bound worker_id — but a token holder can still mint NEW unbound
+    ids (and steal a not-yet-bound one) while this is off. Arming it refuses
+    any register that does not ask for a secret, closing the last unbound
+    path: flip it only once every ingest worker runs a build that sends
+    `rotate_secret` on first register — a pre-binding worker would be
+    locked out of the pool entirely, which fails closed into dropped
+    cameras rather than open into spoofed heartbeats."""
+
     # --- gap analysis --------------------------------------------------------
 
     gap_dark_zone_radius_m: float = 500.0

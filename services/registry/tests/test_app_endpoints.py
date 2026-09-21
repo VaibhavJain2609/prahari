@@ -138,9 +138,15 @@ class FakeWorkerRepo:
         self.workers = ["w1", "w2"]
         self.reaped: int = 0
         self.prune_calls: int = 0
+        # worker_id -> stored secret digest (migration 010); empty means every
+        # worker is unbound, which is what the heartbeat tests here rely on.
+        self.hashes: dict[str, str] = {}
 
     async def alive_worker_ids(self, conn=None):
         return list(self.workers)
+
+    async def bound_secret_hash(self, worker_id: str) -> str | None:
+        return self.hashes.get(worker_id)
 
     async def prune_stale(self) -> int:
         self.prune_calls += 1
