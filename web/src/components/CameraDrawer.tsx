@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, ApiError, Camera } from "@/lib/api";
 import { useBFF } from "@/lib/use-bff";
 import { usePrincipal } from "@/lib/principal";
@@ -15,10 +15,14 @@ import { HealthBadge } from "@/components/ui/Badge";
 // purpose prompts inline before any fetch happens.
 export default function CameraDrawer({
   cameraId,
+  clipEpoch,
   onClose,
   onChanged,
 }: {
   cameraId: string;
+  // `?clip=<epoch>` from a trace hop's evidence button — pre-fills the
+  // evidence-request window around the sighting.
+  clipEpoch?: number | null;
   onClose: () => void;
   onChanged?: () => void;
 }) {
@@ -37,9 +41,8 @@ export default function CameraDrawer({
     { purposeCode: code },
   );
 
-  // Health-history slot: the endpoint is planned, not yet shipped — a 404
-  // is the expected answer today and renders as a quiet placeholder, not an
-  // error.
+  // Health history is the registry's own per-camera observation log — the
+  // drawer's timeline. A 404 renders as a quiet placeholder, not an error.
   const history = useBFF<Record<string, unknown>[]>(
     code ? `cameras/${encodeURIComponent(cameraId)}/health-history` : null,
     { purposeCode: code ?? undefined },
@@ -218,7 +221,12 @@ export default function CameraDrawer({
                     `evidence_ref` is the edge-side locator; a playback ticket
                     can be minted once issued — real bytes land when MediaMTX
                     recording does. */}
-                <EvidenceRequestPanel cameraId={camera.id} purposeCode={code} onError={setActionError} />
+                <EvidenceRequestPanel
+                  cameraId={camera.id}
+                  purposeCode={code}
+                  clipEpoch={clipEpoch}
+                  onError={setActionError}
+                />
               </Section>
 
               <Section title="Lifecycle">
@@ -462,17 +470,34 @@ function EditForm({
 // rides the body because it is part of the durable record). After creation
 // the panel shows the stored request and can mint its playback ticket —
 // every step is its own row in the hash-chained audit log.
+// `datetime-local` wants `YYYY-MM-DDTHH:MM` in LOCAL time.
+function _localInputValue(epochSeconds: number): string {
+  const d = new Date(epochSeconds * 1000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 function EvidenceRequestPanel({
   cameraId,
   purposeCode,
+  clipEpoch,
   onError,
 }: {
   cameraId: string;
   purposeCode: string | null;
+  clipEpoch?: number | null;
   onError: (msg: string | null) => void;
 }) {
-  const [start, setStart] = useState("");
-  const [end, setEnd] = useState("");
+  // A trace hop's `clip` param suggests a ±2 minute window around the
+  // sighting; the operator can still edit it before the audited POST.
+  const [start, setStart] = useState(clipEpoch != null ? _localInputValue(clipEpoch - 120) : "");
+  const [end, setEnd] = useState(clipEpoch != null ? _localInputValue(clipEpoch + 120) : "");
+  useEffect(() => {
+    if (clipEpoch != null) {
+      setStart(_localInputValue(clipEpoch - 120));
+      setEnd(_localInputValue(clipEpoch + 120));
+    }
+  }, [clipEpoch]);
   const [busy, setBusy] = useState(false);
   const [created, setCreated] = useState<import("@/lib/api").EvidenceRequest | null>(null);
   const [ticket, setTicket] = useState<import("@/lib/api").EvidenceTicket | null>(null);

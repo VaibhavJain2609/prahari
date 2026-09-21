@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { api, ApiError, RouteResult } from "@/lib/api";
+import { api, ApiError, RouteHop, RouteResult } from "@/lib/api";
 import {
   composePurpose,
   PurposeAction,
@@ -24,6 +24,7 @@ export default function TraceDock({
   onConsumeTrace,
   onFlyTo,
   onCameraSelect,
+  onRequestClip,
 }: {
   route: RouteResult | null;
   onRoute: (route: RouteResult | null) => void;
@@ -32,6 +33,9 @@ export default function TraceDock({
   onConsumeTrace: () => void;
   onFlyTo?: (to: Omit<FlyTo, "seq">) => void;
   onCameraSelect?: (cameraId: string) => void;
+  // Per-hop "clip": a hop's evidence_ref resolves into an audited evidence
+  // request on that camera around the sighting time.
+  onRequestClip?: (hop: RouteHop) => void;
 }) {
   const { purpose, setPurpose } = usePurpose();
   const [collapsed, setCollapsed] = useState(false);
@@ -276,6 +280,16 @@ export default function TraceDock({
                         className="rounded px-1 text-[10px] text-slate-500 hover:bg-slate-100 focus:outline-none focus:ring-2 focus:ring-slate-400 dark:text-slate-400 dark:hover:bg-slate-800"
                       >
                         map
+                      </button>
+                    )}
+                    {hop.evidence_ref && onRequestClip && (
+                      <button
+                        onClick={() => onRequestClip(hop)}
+                        aria-label={`Request footage for ${hop.camera_id}`}
+                        title="Request footage (audited)"
+                        className="rounded px-1 text-[10px] font-medium text-sky-600 hover:bg-sky-50 focus:outline-none focus:ring-2 focus:ring-slate-400 dark:text-sky-400 dark:hover:bg-sky-950/40"
+                      >
+                        clip
                       </button>
                     )}
                     {onCameraSelect && (

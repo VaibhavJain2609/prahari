@@ -8,7 +8,7 @@ import SummaryStrip from "@/components/SummaryStrip";
 import TraceDock from "@/components/TraceDock";
 import AlertsRail from "@/components/AlertsRail";
 import PanelErrorBoundary from "@/components/PanelErrorBoundary";
-import { RouteResult } from "@/lib/api";
+import { RouteHop, RouteResult } from "@/lib/api";
 
 // useSearchParams() suspends during prerender — the console has to sit
 // under a Suspense boundary or `next build` fails the page.
@@ -52,6 +52,16 @@ function OpsConsole() {
     (id: string) => mutateParams((qs) => qs.set("camera", id)),
     [mutateParams],
   );
+  // A trace hop's evidence_ref resolves here: open that camera's drawer with
+  // the evidence window pre-filled around the sighting (`?clip=<epoch>`).
+  const requestClip = useCallback(
+    (hop: RouteHop) =>
+      mutateParams((qs) => {
+        qs.set("camera", hop.camera_id);
+        if (hop.wall_clock_s != null) qs.set("clip", String(hop.wall_clock_s));
+      }),
+    [mutateParams],
+  );
   const closeCamera = useCallback(
     () => mutateParams((qs) => qs.delete("camera")),
     [mutateParams],
@@ -85,11 +95,18 @@ function OpsConsole() {
               onConsumeTrace={consumeTrace}
               onFlyTo={requestFlyTo}
               onCameraSelect={openCamera}
+              onRequestClip={requestClip}
             />
           </PanelErrorBoundary>
           {cameraId && (
             <PanelErrorBoundary title="Camera detail">
-              <CameraDrawer cameraId={cameraId} onClose={closeCamera} />
+              <CameraDrawer
+                cameraId={cameraId}
+                clipEpoch={
+                  searchParams.get("clip") ? Number(searchParams.get("clip")) : null
+                }
+                onClose={closeCamera}
+              />
             </PanelErrorBoundary>
           )}
         </div>
