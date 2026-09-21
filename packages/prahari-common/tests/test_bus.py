@@ -7,6 +7,9 @@ adding a `fakeredis` dependency this repo does not otherwise need.
 
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
+
 from prahari_common.bus import RedisStreamConsumer
 
 
@@ -161,3 +164,29 @@ def test_connection_failure_logs_and_returns_empty_list_without_raising() -> Non
     consumer = _consumer(_BrokenClient())  # type: ignore[arg-type]
 
     assert consumer.poll() == []
+
+
+def test_no_injected_client_connects_lazily_from_the_url(monkeypatch) -> None:
+    # `redis` is a lazy import — prahari-common deliberately does not depend
+    # on it — so the connect path is exercised by patching sys.modules, the
+    # same trick as match-engine's `fake_redis` fixture.
+    sentinel = _FakeRedis([[]])
+    calls: list[str] = []
+
+    class _RedisModule:
+        @staticmethod
+        def from_url(url: str):  # noqa: ANN202
+            calls.append(url)
+            return sentinel
+
+    monkeypatch.setitem(sys.modules, "redis", SimpleNamespace(Redis=_RedisModule))
+    consumer = RedisStreamConsumer(
+        redis_url="redis://real-this-time",
+        stream_key="prahari:test",
+        field="payload",
+        decode=lambda raw: raw.decode(),
+    )
+
+    assert consumer.poll() == []
+    assert consumer.poll() == []
+    assert calls == ["redis://real-this-time"]  # built once, then cached

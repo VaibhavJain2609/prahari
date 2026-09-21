@@ -58,6 +58,79 @@ class TestScriptedPlateReader:
         assert reader.calls == [vehicle]
 
 
+def _install_fake_paddleocr(monkeypatch, result):
+    """A `paddleocr` module whose PaddleOCR.ocr() returns a canned result —
+    the documented nested per-image/per-line shape
+    `[[ [box, (text, confidence)], ... ]]`."""
+
+    class FakePaddleOCR:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def ocr(self, _crop, cls=True):  # noqa: ANN001, ANN202
+            return result
+
+    fake = ModuleType("paddleocr")
+    fake.PaddleOCR = FakePaddleOCR
+    monkeypatch.setitem(sys.modules, "paddleocr", fake)
+    return FakePaddleOCR
+
+
+class TestPaddlePlateReaderRead:
+    """`read()` is exercisable without weights — paddleocr only needs to exist
+    as a module for `_load` to import, so a scripted stand-in exercises the
+    whole crop → OCR → confidence-gate path."""
+
+    def test_returns_none_when_the_crop_is_empty(self, monkeypatch) -> None:
+        # Vehicle box entirely outside the frame: the slice is empty and OCR
+        # must not run at all.
+        _install_fake_paddleocr(monkeypatch, "unreachable")
+        reader = PaddlePlateReader()
+        vehicle = VehicleBox(2.0, 2.0, 3.0, 3.0, "car", 0.9)
+
+        assert reader.read(_IMAGE, vehicle) is None
+        assert reader._ocr is None  # noqa: SLF001 -- _load never ran
+
+    def test_reads_the_highest_confidence_line_and_broadcasts_it(self, monkeypatch) -> None:
+        # A plate crop can contain a second line of text (dealer frame,
+        # bumper sticker): the highest-confidence line wins, and the line
+        # confidence is broadcast per-character — honest about what the model
+        # measured, which is what the matcher's substitution pricing needs.
+        _install_fake_paddleocr(
+            monkeypatch,
+            [
+                [
+                    ([[0, 0], [1, 0]], ("DEALER", 0.40)),
+                    ([[0, 1], [1, 1]], ("GJ01AB1234", 0.90)),
+                ]
+            ],
+        )
+        reader = PaddlePlateReader()
+        vehicle = VehicleBox(0.0, 0.0, 1.0, 1.0, "car", 0.9)
+
+        candidate = reader.read(_IMAGE, vehicle)
+
+        assert candidate is not None
+        assert candidate.raw_text == "GJ01AB1234"
+        assert candidate.char_confidence == (0.90,) * len("GJ01AB1234")
+
+    def test_a_line_below_the_confidence_floor_returns_none(self, monkeypatch) -> None:
+        from prahari_inference.config import DetectorSettings
+
+        _install_fake_paddleocr(monkeypatch, [[([[0, 0]], ("X", 0.10))]])
+        reader = PaddlePlateReader(DetectorSettings(plate_confidence=0.95))
+        vehicle = VehicleBox(0.0, 0.0, 1.0, 1.0, "car", 0.9)
+
+        assert reader.read(_IMAGE, vehicle) is None
+
+    def test_no_legible_line_returns_none(self, monkeypatch) -> None:
+        _install_fake_paddleocr(monkeypatch, [[]])  # page exists, no lines
+        reader = PaddlePlateReader()
+        vehicle = VehicleBox(0.0, 0.0, 1.0, 1.0, "car", 0.9)
+
+        assert reader.read(_IMAGE, vehicle) is None
+
+
 class TestPaddleLoadOnce:
     """Same cold-start race as `YoloVehicleDetector._load`: `read()` runs on
     whichever thread the batch landed on, so the check-then-act needs the

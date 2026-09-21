@@ -71,7 +71,9 @@ class TestYoloLoadOnceAndDevice:
     stands in — the real one is deliberately absent from the test env."""
 
     @staticmethod
-    def _install_fake_ultralytics(monkeypatch, load_delay_s: float = 0.05) -> type:
+    def _install_fake_ultralytics(
+        monkeypatch, load_delay_s: float = 0.05, boxes_per_image: list | None = None
+    ) -> type:
         class FakeYOLO:
             loads = 0
             predict_kwargs: dict | None = None
@@ -82,7 +84,7 @@ class TestYoloLoadOnceAndDevice:
 
             def predict(self, images, **kwargs):
                 type(self).predict_kwargs = kwargs
-                return [SimpleNamespace(boxes=[]) for _ in images]
+                return [SimpleNamespace(boxes=boxes_per_image or []) for _ in images]
 
         fake = ModuleType("ultralytics")
         fake.YOLO = FakeYOLO
@@ -118,6 +120,46 @@ class TestYoloLoadOnceAndDevice:
 
         assert fake_yolo.predict_kwargs is not None
         assert fake_yolo.predict_kwargs["device"] == "mps"
+
+    def test_empty_frame_list_short_circuits_before_loading_weights(self, monkeypatch):
+        # An empty batch must not pay the multi-second weights load — detect
+        # returns [] without ever calling _load().
+        fake_yolo = self._install_fake_ultralytics(monkeypatch, load_delay_s=0.0)
+        detector = YoloVehicleDetector(DetectorSettings())
+
+        assert detector.detect([]) == []
+        assert fake_yolo.loads == 0
+
+    def test_detect_maps_result_boxes_to_normalised_vehicle_boxes(self, monkeypatch):
+        # Pixel xyxy in, normalised [0,1] VehicleBox out — the contract every
+        # later stage relies on. A class outside _VEHICLE_CLASSES lands as the
+        # generic "vehicle" label, not a KeyError.
+        boxes = [
+            SimpleNamespace(xyxy=[[1.0, 2.0, 5.0, 6.0]], cls=[2], conf=[0.9]),  # car
+            SimpleNamespace(xyxy=[[0.0, 0.0, 10.0, 10.0]], cls=[99], conf=[0.5]),
+        ]
+        self._install_fake_ultralytics(monkeypatch, load_delay_s=0.0, boxes_per_image=boxes)
+        detector = YoloVehicleDetector(DetectorSettings())
+
+        (result,) = detector.detect([_frame("cam-1")])
+
+        assert len(result) == 2
+        car, unknown = result
+        assert (car.x_min, car.y_min, car.x_max, car.y_max) == (0.1, 0.2, 0.5, 0.6)
+        assert car.vehicle_class == "car" and car.confidence == 0.9
+        assert unknown.vehicle_class == "vehicle" and unknown.confidence == 0.5
+
+    def test_predict_filters_to_vehicle_classes_inside_the_model(self, monkeypatch):
+        # `classes=` must carry exactly _VEHICLE_CLASSES' ids — filtering
+        # after the model would waste confidence/NMS budget on persons and
+        # traffic lights.
+        fake_yolo = self._install_fake_ultralytics(monkeypatch, load_delay_s=0.0)
+        detector = YoloVehicleDetector(DetectorSettings(vehicle_confidence=0.4))
+
+        detector.detect([_frame("cam-1")])
+
+        assert sorted(fake_yolo.predict_kwargs["classes"]) == [2, 3, 5, 7]
+        assert fake_yolo.predict_kwargs["conf"] == 0.4
 
 
 class TestYoloImportDiscipline:
