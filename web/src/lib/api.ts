@@ -361,6 +361,19 @@ export type EvidenceTicket = {
   expires_in: number;
 };
 
+// One hash-chained audit row, as `GET /audit` serialises `AuditEntry`.
+export type AuditEntry = {
+  id: number;
+  actor: string;
+  org_path: string;
+  purpose_code: string;
+  resource: string;
+  action: string;
+  occurred_at: string;
+  prev_hash: string;
+  hash: string;
+};
+
 // One stored heartbeat, as the registry's health-history endpoint serves it
 // (HeartbeatSample): the raw worker observation, not the derived verdict.
 export type HeartbeatSample = {
@@ -549,6 +562,23 @@ export const api = {
   // of the first entry whose hash doesn't chain, if any.
   verifyAudit: () =>
     request<{ ok: boolean; first_broken_entry: string | null }>("audit/verify"),
+
+  // Admin-only audit read — the browsable half of the chain next to
+  // verifyAudit's integrity check. Filters map straight to the BFF's
+  // query params (actor/action substring, ISO `since`, limit/offset).
+  listAudit: (opts: {
+    limit?: number;
+    offset?: number;
+    actor?: string;
+    action?: string;
+  } = {}) => {
+    const qs = new URLSearchParams();
+    qs.set("limit", String(opts.limit ?? 50));
+    if (opts.offset) qs.set("offset", String(opts.offset));
+    if (opts.actor) qs.set("actor", opts.actor);
+    if (opts.action) qs.set("action", opts.action);
+    return request<AuditEntry[]>(`audit?${qs.toString()}`);
+  },
 
   // The match engine's one snapshot: entry count, skeleton buckets, bloom
   // stats — the reload-readiness readout the admin page needs. Admin-only
