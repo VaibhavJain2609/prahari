@@ -361,6 +361,19 @@ export type EvidenceTicket = {
   expires_in: number;
 };
 
+// One stored heartbeat, as the registry's health-history endpoint serves it
+// (HeartbeatSample): the raw worker observation, not the derived verdict.
+export type HeartbeatSample = {
+  observed_at: string;
+  worker_id: string;
+  connected: boolean;
+  measured_fps: number | null;
+  consecutive_failures: number;
+  black_frame_ratio: number | null;
+  tamper_suspected: boolean;
+  last_error: string | null;
+};
+
 export const api = {
   // Escape hatch for endpoints that don't need a named method yet —
   // useBFF(path) calls this. Same-origin proxy, same 401 handling.

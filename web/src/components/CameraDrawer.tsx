@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { api, ApiError, Camera } from "@/lib/api";
+import { api, ApiError, Camera, HeartbeatSample } from "@/lib/api";
 import { useBFF } from "@/lib/use-bff";
 import { usePrincipal } from "@/lib/principal";
 import { composePurpose, PurposePrompt, usePurpose } from "@/lib/purpose";
@@ -43,7 +43,7 @@ export default function CameraDrawer({
 
   // Health history is the registry's own per-camera observation log — the
   // drawer's timeline. A 404 renders as a quiet placeholder, not an error.
-  const history = useBFF<Record<string, unknown>[]>(
+  const history = useBFF<HeartbeatSample[]>(
     code ? `cameras/${encodeURIComponent(cameraId)}/health-history` : null,
     { purposeCode: code ?? undefined },
   );
@@ -163,12 +163,43 @@ export default function CameraDrawer({
                   <p className="text-red-600 dark:text-red-400">tamper suspected</p>
                 )}
                 <Row k="Last error" v={camera.health.last_error} />
-                {/* Health-history slot: renders nothing while the endpoint
-                    is unshipped (404 tolerated inside useBFF's result). */}
+                {/* Health history: the worker-observation timeline behind
+                    the derived verdict. A 404/absent payload renders the
+                    quiet placeholder, not an error. */}
                 {history.data && history.data.length > 0 ? (
-                  <p className="text-slate-500 dark:text-slate-400">
-                    {history.data.length} historical entries.
-                  </p>
+                  // Newest-first raw worker observations — the rows the
+                  // registry's derived verdict was computed from. Bounded to
+                  // the most recent few; the endpoint's own limit is 100.
+                  <ul className="max-h-36 space-y-1 overflow-y-auto text-xs">
+                    {history.data.slice(0, 12).map((hb, i) => (
+                      <li
+                        key={`${hb.observed_at}-${i}`}
+                        className="flex items-center justify-between gap-2"
+                      >
+                        <span className="flex items-center gap-1.5">
+                          <span
+                            className={`inline-block h-1.5 w-1.5 rounded-full ${
+                              hb.connected
+                                ? "bg-emerald-500"
+                                : "bg-red-500"
+                            }`}
+                            aria-hidden="true"
+                          />
+                          <span className="text-slate-600 dark:text-slate-300">
+                            {hb.connected
+                              ? `connected${hb.measured_fps != null ? ` · ${hb.measured_fps.toFixed(1)} fps` : ""}`
+                              : `disconnected${hb.consecutive_failures > 0 ? ` · ${hb.consecutive_failures} fail` : ""}`}
+                          </span>
+                          {hb.tamper_suspected && (
+                            <span className="text-red-600 dark:text-red-400">tamper</span>
+                          )}
+                        </span>
+                        <span className="text-slate-400 dark:text-slate-500">
+                          {timeAgo(hb.observed_at)}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
                 ) : (
                   !history.loading && (
                     <p className="text-slate-400 dark:text-slate-500">
