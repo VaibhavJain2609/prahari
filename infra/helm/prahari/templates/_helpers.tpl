@@ -105,14 +105,18 @@ Out-of-band Secret shared by the internal-token callers. Created once, by hand
 or Terraform, never from values.yaml:
 
   kubectl create secret generic prahari-internal \
-    --from-literal=internal-token=$(openssl rand -base64 32) \
+    --from-literal=internal-token=$(openssl rand -hex 32) \
+    --from-literal=worker-token=$(openssl rand -hex 32) \
     --from-literal=credential-key=$(openssl rand -base64 32)
 
-optional: true so the local profile still comes up without it — the registry
-treats an empty internal_token as "enforcement off" (see
-RegistrySettings.internal_token). Non-local profiles MUST create it: without
-internal-token the registry's org-scope gate is decorative, and without
-credential-key camera stream credentials cannot be written or read.
+`security.internalSecretRequired` drives `optional:` on every reference to
+this Secret. False (local default) lets pods boot without it — the registry
+then treats an empty internal_token as "enforcement off" and warns loudly
+(see RegistrySettings.internal_token). True (every real profile) makes a
+missing Secret a pod-start failure instead of a silent disarm: without
+internal-token the org-scope gate is decorative, without worker-token every
+worker stream read is refused, and without credential-key camera stream
+credentials cannot be written or read.
 */}}
 
 {{/*
@@ -150,22 +154,33 @@ because a missing credential must not take down camera health as well as sync.
 # lease would eject live pods from the pool and leave their slice unpulled.
 - name: PRAHARI_ASSIGNMENT_LEASE_S
   value: {{ .Values.registry.assignment.leaseSeconds | quote }}
-# Internal API gate (X-Internal-Token) and the AES-256 key for stored camera
-# stream credentials — both real RegistrySettings fields, both optional:true so
-# local dev runs without the Secret. A non-local profile MUST create
-# `prahari-internal`; enforcement off in the cloud is a silent no-op.
+# Internal API gate (X-Internal-Token), the AES-256 key for stored camera
+# stream credentials, and the MediaMTX reader token embedded in worker
+# fan-out URLs — all real RegistrySettings fields. `worker-token` is a
+# SEPARATE secret from `internal-token` on purpose: the media credential
+# lives inside URLs on every worker pod, so it must not also be the
+# internal-API credential, and the two rotate independently. optional is
+# driven by security.internalSecretRequired: false for local dev, true in
+# real profiles so a missing Secret fails the pod instead of disarming
+# every gate silently.
 - name: PRAHARI_INTERNAL_TOKEN
   valueFrom:
     secretKeyRef:
       name: prahari-internal
       key: internal-token
-      optional: true
+      optional: {{ not .Values.security.internalSecretRequired }}
 - name: PRAHARI_CREDENTIAL_KEY
   valueFrom:
     secretKeyRef:
       name: prahari-internal
       key: credential-key
-      optional: true
+      optional: {{ not .Values.security.internalSecretRequired }}
+- name: PRAHARI_WORKER_MEDIA_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: prahari-internal
+      key: worker-token
+      optional: {{ not .Values.security.internalSecretRequired }}
 {{- if .Values.mediamtx.enabled }}
 # The registry writes MediaMTX paths from the catalogue at runtime. The
 # ConfigMap ships with `paths:` empty on purpose — a hardcoded path passes
@@ -309,7 +324,7 @@ password.
     secretKeyRef:
       name: prahari-internal
       key: internal-token
-      optional: true
+      optional: {{ not .Values.security.internalSecretRequired }}
 {{- end -}}
 
 {{/*
@@ -356,13 +371,13 @@ is what it sends to a gated registry for camera-location lookups.
     secretKeyRef:
       name: prahari-internal
       key: internal-token
-      optional: true
+      optional: {{ not .Values.security.internalSecretRequired }}
 - name: PRAHARI_CORRELATION_REGISTRY_INTERNAL_TOKEN
   valueFrom:
     secretKeyRef:
       name: prahari-internal
       key: internal-token
-      optional: true
+      optional: {{ not .Values.security.internalSecretRequired }}
 {{- end -}}
 
 {{/*
@@ -385,7 +400,7 @@ registry, relays alerts off Redis Streams, and owns the hash-chained audit log
     secretKeyRef:
       name: prahari-internal
       key: internal-token
-      optional: true
+      optional: {{ not .Values.security.internalSecretRequired }}
 # The match engine's HTTP admin + gRPC are gated by PRAHARI_MATCH_INTERNAL_TOKEN
 # on its side; the BFF sends the same shared value (BFFSettings.internal_token).
 - name: PRAHARI_INTERNAL_TOKEN
@@ -393,7 +408,7 @@ registry, relays alerts off Redis Streams, and owns the hash-chained audit log
     secretKeyRef:
       name: prahari-internal
       key: internal-token
-      optional: true
+      optional: {{ not .Values.security.internalSecretRequired }}
 # Watchlist summary/reload + alert history proxy targets.
 - name: PRAHARI_MATCH_ENGINE_BASE_URL
   value: "http://prahari-match-engine:{{ .Values.services.matchEngine.port }}"
@@ -410,9 +425,11 @@ registry, relays alerts off Redis Streams, and owns the hash-chained audit log
 - name: PRAHARI_AUDIT_DB_PATH
   value: "/var/lib/prahari/audit/audit.db"
 # Media preview tickets (BFFSettings.media_*). The signing key rides in the
-# existing prahari-internal Secret under `media-jwt-private-key`; optional so
-# the local profile still boots — the BFF then generates an ephemeral keypair
-# and warns (a restart invalidates outstanding tickets, which are ~60s lived).
+# existing prahari-internal Secret under `media-jwt-private-key`. Stays
+# optional even under security.internalSecretRequired: the fallback is an
+# ephemeral per-boot keypair — a documented graceful degradation (a restart
+# invalidates outstanding tickets, which are ~60s lived), not a gate going
+# silently open the way an empty internal_token would be.
 - name: PRAHARI_MEDIA_JWT_PRIVATE_KEY
   valueFrom:
     secretKeyRef:

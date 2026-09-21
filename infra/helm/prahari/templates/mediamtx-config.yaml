@@ -27,11 +27,12 @@ data:
     # (media_auth.py) recognises both shapes the estate needs:
     #
     #   * machines  — HTTP basic. Inference workers read with
-    #     `worker:<internal-token>` embedded in the fan-out URL the registry
+    #     `worker:<worker-token>` embedded in the fan-out URL the registry
     #     hands them; the registry's own reconcile calls the control API as
-    #     `internal:<internal-token>`. The shared secret is the
-    #     `prahari-internal` Secret's `internal-token` key — no second
-    #     credential is minted.
+    #     `internal:<internal-token>`. Two SEPARATE secrets — the
+    #     `worker-token` and `internal-token` keys of `prahari-internal` —
+    #     because the media credential travels inside URLs on every worker
+    #     pod and must not also be the internal-API credential.
     #   * browsers  — a short-lived Ed25519 JWT minted by the BFF's audited
     #     /api/v1/media/preview-ticket. The client sends it as
     #     `Authorization: Bearer` or `?jwt=`; mediamtx forwards it in the auth

@@ -78,6 +78,19 @@ class RegistrySettings(BaseSettings):
 
     media_auth_jwks_timeout_s: float = 5.0
 
+    media_auth_rate_limit_attempts: int = 20
+    """Sliding-window cap on `/api/v1/mediamtx/auth` calls per source IP per
+    `media_auth_rate_limit_window_s`. The endpoint is unauthenticated by
+    necessity (MediaMTX cannot hold the secret it asks about), which makes it
+    a password-equality oracle — the window bounds guess attempts. It must
+    stay above the expected auth-callback rate: every new MediaMTX session
+    (worker RTSP connect, browser WHEP POST, reconcile API call) costs one
+    call, all from the restreamer's pod IP, so a reconnect storm across the
+    whole fleet can briefly deny legitimate reads — MediaMTX treats a 429 as
+    a refusal and the worker retries on its own backoff."""
+
+    media_auth_rate_limit_window_s: float = 60.0
+
     # --- connectivity probe ----------------------------------------------------
 
     probe_allowed_ports: set[int] = {554}
@@ -103,6 +116,18 @@ class RegistrySettings(BaseSettings):
     shared value; leaving it empty in the cloud profile would be the same
     silent-no-op failure `CLAUDE.md`'s hard invariant on `PRAHARI_*` env
     already warns about."""
+
+    worker_media_token: str = ""
+    """The MediaMTX reader credential embedded in fan-out URLs as
+    `worker:<worker-media-token>` userinfo (`mediamtx.fanout_endpoints`,
+    checked by `media_auth.authorize`).
+
+    Deliberately a SEPARATE secret from `internal_token`: the media credential
+    travels inside URLs handed to every inference pod, so it is the token most
+    exposed to leaks — coupling it to the internal API token would make a
+    leaked pull URL an internal-API credential as well, and rotating either
+    would force rotating both. `worker:` auth fails closed when this is empty:
+    a credential that cannot be checked cannot be granted."""
 
     credential_key: str = ""
     """32-byte AES-256 key, urlsafe-base64-encoded, for `cameras.stream_secret`

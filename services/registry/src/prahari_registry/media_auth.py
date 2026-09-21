@@ -8,10 +8,16 @@ which POSTs every authentication decision here as
 non-2xx as a refusal. One endpoint then recognises the two credential shapes
 the estate actually has:
 
-* **Machines — HTTP basic.** `worker:<internal-token>` grants `read` on
+* **Machines — HTTP basic.** `worker:<worker-media-token>` grants `read` on
   `cam-*` paths (embedded in the fan-out URLs `fanout_endpoints` hands to
   inference workers — RTSP consumers have no header channel). `internal:
-  <internal-token>` grants `api` (this service's own reconcile client).
+  <internal-token>` grants `api` (this service's own reconcile client). The
+  two passwords are INDEPENDENT secrets (`worker_media_token` vs
+  `internal_token`): the media credential lives inside URLs on every worker
+  pod, so it must not also unlock the internal API, and each rotates on its
+  own schedule. A `worker:` request is refused outright when no
+  `worker_media_token` is configured — a credential that cannot be checked
+  cannot be granted.
 * **Browsers — a BFF ticket.** An Ed25519 JWT minted by the BFF's
   `/api/v1/media/preview-ticket` (grant: `read`) or
   `/api/v1/evidence/requests/{id}/ticket` (grants: `read` + `playback`,
@@ -28,8 +34,14 @@ local default. With a token set this endpoint fails closed.
 The endpoint itself is exempt from the `X-Internal-Token` middleware:
 MediaMTX cannot send that header, and gating the credential check behind the
 credential it exists to check would deadlock. That makes the route a
-password-equality oracle by construction — the comparison is
-`hmac.compare_digest`, same as the token gate it mirrors.
+password-equality oracle by construction — two mitigations, since the gate
+itself cannot exist:
+
+* `hmac.compare_digest` on every secret comparison, same as the token gate
+  it mirrors — no byte-at-a-time timing leak.
+* A per-source-IP sliding-window rate limit (`SlidingWindowRateLimiter`
+  below, enforced in `app.py:mediamtx_auth`), bounding guess attempts to
+  `media_auth_rate_limit_attempts` per window.
 """
 
 from __future__ import annotations
@@ -39,7 +51,10 @@ import binascii
 import hmac
 import json
 import logging
+import threading
 import time
+from collections import deque
+from collections.abc import Callable
 from urllib.parse import parse_qs
 
 import httpx
@@ -52,11 +67,78 @@ from .mediamtx import MTX_API_USER, MTX_READER_USER
 
 log = logging.getLogger(__name__)
 
-__all__ = ["MediaMTXAuthRequest", "TicketVerifier", "authorize"]
+__all__ = [
+    "MediaMTXAuthRequest",
+    "SlidingWindowRateLimiter",
+    "TicketVerifier",
+    "authorize",
+    "log_safe",
+]
 
 _PATH_PREFIX = "cam-"
 """Every path this registry reconciles into MediaMTX is `cam-<uuid>`
 (`mediamtx.path_name`). Internal credentials never read outside that prefix."""
+
+_LOG_FIELD_MAX_LEN = 128
+"""Ceiling on an attacker-controlled field echoed into a log line."""
+
+
+def log_safe(value: str, *, max_len: int = _LOG_FIELD_MAX_LEN) -> str:
+    """An attacker-controlled string made safe to put in a log line.
+
+    `user`, `path` and friends arrive in the auth POST body — a caller can
+    stuff newlines (forged log lines), terminal escapes, or a megabyte of
+    padding into them. Kept characters are printable ASCII only; everything
+    else (control chars, newlines, non-ASCII) becomes `?`, and the result is
+    truncated at `max_len` with a `…` marker so truncation is visible rather
+    than silent.
+    """
+    cleaned = "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in value)
+    if len(cleaned) > max_len:
+        return cleaned[:max_len] + "…"
+    return cleaned
+
+
+class SlidingWindowRateLimiter:
+    """Per-key sliding-window limiter, in-memory and dependency-free.
+
+    Exists because `/api/v1/mediamtx/auth` cannot be credential-gated (it IS
+    the credential check) and so must not be an unbounded guess-an-per-request
+    oracle. Per-process is deliberate, same reasoning as the BFF's login
+    limiter: a limiter that dies with Redis would take the video plane down
+    with it, and per-pod is already enough to bound a stuffing script.
+    """
+
+    def __init__(
+        self,
+        max_attempts: int,
+        window_s: float,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._max_attempts = max_attempts
+        self._window_s = window_s
+        self._clock = clock
+        self._events: dict[str, deque[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, key: str) -> bool:
+        """Record one attempt; True while `key` has seen fewer than
+        `max_attempts` inside the trailing `window_s`."""
+        now = self._clock()
+        with self._lock:
+            events = self._events.setdefault(key, deque())
+            while events and now - events[0] >= self._window_s:
+                events.popleft()
+            if len(events) >= self._max_attempts:
+                return False
+            events.append(now)
+            if len(self._events) > 4096:
+                # Bound the key map: a scanner sweeping source addresses would
+                # otherwise grow `_events` one entry per distinct spoofed key.
+                cutoff = now - self._window_s
+                self._events = {k: v for k, v in self._events.items() if v and v[-1] >= cutoff}
+            return True
 
 
 class MediaMTXAuthRequest(BaseModel):
@@ -77,10 +159,15 @@ def _b64url_decode(value: str) -> bytes:
 
 
 def _ticket_grants(payload: dict, *, action: str, path: str) -> bool:
-    """MediaMTX's own permission semantics, minimally: an entry matches when
-    the action is equal and the entry's path is empty (any path) or exactly
-    the requested one. The BFF mints exact `cam-<id>` paths only; `~`-regex
-    entries are treated as literals and simply never match."""
+    """MediaMTX's own permission semantics, minimally, minus its wildcard: an
+    entry matches when the action is equal and the entry's path is exactly the
+    requested one. The BFF mints exact `cam-<id>` paths only; `~`-regex
+    entries are treated as literals and simply never match.
+
+    An empty or absent `path` in a grant is NOT "any path" here — a ticket
+    naming no path grants nothing. The BFF never mints one, so a grant that
+    claims everything is indistinguishable from a malformed (or attacker-
+    edited) payload and is refused the same way."""
     permissions = payload.get("mediamtx_permissions")
     if not isinstance(permissions, list):
         return False
@@ -90,7 +177,7 @@ def _ticket_grants(payload: dict, *, action: str, path: str) -> bool:
         if entry.get("action") != action:
             continue
         granted_path = entry.get("path")
-        if granted_path in (None, "") or granted_path == path:
+        if granted_path and granted_path == path:
             return True
     return False
 
@@ -104,13 +191,25 @@ class TicketVerifier:
     A JWKS fetch failure keeps serving the last good set: if the BFF is down
     no new tickets can be minted anyway, and the outstanding ones are
     seconds-lived.
+
+    The forced refresh is negative-cached (`_UNKNOWN_KID_TTL_S`): without it,
+    a flood of tickets all naming a bogus `kid` would turn this endpoint into
+    a request amplifier against the BFF — every ticket costing a JWKS fetch.
+    Within the window a still-unknown kid is denied locally; a real rotation
+    becomes visible after the window, bounded and harmless.
     """
+
+    _UNKNOWN_KID_TTL_S = 30.0
+    """How long a `kid` confirmed absent from the JWKS stays denied without a
+    re-fetch. Short because the BFF's keypair can be ephemeral per boot — a
+    restart is the only legitimate new-kid event and 30 s bounds the cost."""
 
     def __init__(self, settings: RegistrySettings, client: httpx.AsyncClient | None = None) -> None:
         self._s = settings
         self._client = client
         self._keys: dict[str, Ed25519PublicKey] = {}
         self._fetched_at = 0.0
+        self._unknown_kids: dict[str, float] = {}
 
     async def _http(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -148,13 +247,27 @@ class TicketVerifier:
         if kid in self._keys:
             return self._keys[kid]
         # Unknown kid — one forced refresh in case the BFF rotated its key
-        # since the cache was filled. Still unknown after that means forged
-        # or expired-issuer tickets; deny.
+        # since the cache was filled, negative-cached so a flood of forged
+        # tickets cannot each cost a fetch. Still unknown after that means
+        # forged or expired-issuer tickets; deny.
+        denied_at = self._unknown_kids.get(kid)
+        if denied_at is not None and time.monotonic() - denied_at < self._UNKNOWN_KID_TTL_S:
+            return None
         try:
             await self._refresh()
         except (httpx.HTTPError, ValueError, KeyError) as exc:
             log.warning("media JWKS fetch failed: %s", exc)
-        return self._keys.get(kid)
+        key = self._keys.get(kid)
+        if key is None:
+            self._unknown_kids[kid] = time.monotonic()
+            if len(self._unknown_kids) > 1024:
+                # Bound the negative cache the same way the JWKS itself is
+                # bounded — forged kids are unbounded input.
+                cutoff = time.monotonic() - self._UNKNOWN_KID_TTL_S
+                self._unknown_kids = {k: t for k, t in self._unknown_kids.items() if t >= cutoff}
+        else:
+            self._unknown_kids.pop(kid, None)
+        return key
 
     async def allows(self, token: str, *, action: str, path: str) -> bool:
         """True iff `token` is a valid BFF ticket granting `action` on `path`."""
@@ -200,15 +313,30 @@ async def authorize(
     if req.action == "publish":
         return False
 
-    if req.password and hmac.compare_digest(
-        req.password.encode(), settings.internal_token.encode()
-    ):
-        if req.user == MTX_API_USER:
+    # Machine credentials are keyed on the user, and each user compares
+    # against its OWN secret — `internal` against `internal_token` (API
+    # callers), `worker` against `worker_media_token` (stream readers). The
+    # two are independent: a leaked fan-out URL is a media credential, not an
+    # internal-API one, and each rotates without dragging the other.
+    if req.user == MTX_API_USER:
+        if req.password and hmac.compare_digest(
+            req.password.encode(), settings.internal_token.encode()
+        ):
             # The reconcile client — path config on :9997. Metrics too: the
             # chart excludes `metrics` from the auth callback anyway, so an
             # arriving request means someone asked with the credential.
             return req.action in ("api", "metrics", "pprof")
-        if req.user == MTX_READER_USER:
+        return False
+
+    if req.user == MTX_READER_USER:
+        if not settings.worker_media_token:
+            # Fail closed: a credential that cannot be checked cannot be
+            # granted. Enforcement is armed (internal_token is set), so the
+            # empty reader token is a misconfiguration, not local dev.
+            return False
+        if req.password and hmac.compare_digest(
+            req.password.encode(), settings.worker_media_token.encode()
+        ):
             return req.action == "read" and req.path.startswith(_PATH_PREFIX)
         return False
 

@@ -30,6 +30,14 @@ profile: gpu
 postgres:
   storage: 50Gi
 
+# This profile REQUIRES the `prahari-internal` Secret (internal-token,
+# worker-token, credential-key): pods refuse to start without it rather than
+# booting with empty tokens — empty means every internal gate silently OFF.
+# Create it before install (`make internal-secret` or Terraform); locally it
+# stays optional because enforcement-off is the documented dev default.
+security:
+  internalSecretRequired: true
+
 # The console plane runs here too — correlation is REQUIRED for the KEDA
 # trigger: it creates the `prahari-correlation` consumer group on
 # `prahari:detections`, and the ScaledObject reads that group's pending count.

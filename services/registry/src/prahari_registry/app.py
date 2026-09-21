@@ -25,7 +25,13 @@ from .config import RegistrySettings, registry_settings
 from .crypto import CredentialKeyError
 from .db import apply_migrations, create_pool, timescale_available
 from .health import HealthPolicy, derive_state
-from .media_auth import MediaMTXAuthRequest, TicketVerifier, authorize
+from .media_auth import (
+    MediaMTXAuthRequest,
+    SlidingWindowRateLimiter,
+    TicketVerifier,
+    authorize,
+    log_safe,
+)
 from .mediamtx import MediaMTXClient
 from .metrics import HEARTBEATS_RECEIVED, METRICS, refresh_gauges
 from .models import (
@@ -48,7 +54,13 @@ from .models import (
     WorkerRegister,
     WorkerRegistration,
 )
-from .probe import ProbeError, ProbeResult, SSRFBlockedError, probe_rtsp
+from .probe import (
+    ProbeError,
+    ProbeResult,
+    SSRFBlockedError,
+    probe_rtsp,
+    validate_rtsp_url,
+)
 from .repository import (
     CameraRepository,
     OrgRepository,
@@ -148,6 +160,10 @@ async def lifespan(app: FastAPI):
     app.state.sync = sync
     app.state.mediamtx = mediamtx
     app.state.ticket_verifier = ticket_verifier
+    app.state.media_auth_limiter = SlidingWindowRateLimiter(
+        settings.media_auth_rate_limit_attempts,
+        settings.media_auth_rate_limit_window_s,
+    )
     app.state.gateway_configured = gateway is not None
 
     sync.start()
@@ -455,7 +471,22 @@ async def create_camera(
     arrive this way. Once registered they are indistinguishable to everything
     downstream, which is what "vendor-neutral registry" has to mean to be worth
     claiming.
+
+    `rtsp_url` gets the same SSRF check the probe applies (`validate_rtsp_url`)
+    at write time, not only at probe time: the stored URL is what MediaMTX
+    later connects to on our behalf, so accepting `rtsp://169.254.169.254/...`
+    would hand the restreamer a connect-anywhere primitive — same primitive,
+    slower path. The policy is deliberately the probe's, unchanged: RFC1918
+    stays allowed because DVRs legitimately live there; loopback, link-local/
+    metadata, multicast, reserved, non-rtsp schemes and non-allowlisted ports
+    are refused. An unresolvable host fails closed — it cannot be checked.
     """
+    if payload.rtsp_url is not None:
+        try:
+            await validate_rtsp_url(payload.rtsp_url, allowed_ports=settings.probe_allowed_ports)
+        except ProbeError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+
     if payload.org_id is not None:
         target_org = await org_repo.get(payload.org_id)
         if target_org is None:
@@ -637,12 +668,25 @@ async def worker_assignments(
 ) -> WorkerAssignment:
     """This worker's slice of the active camera estate.
 
-    Register-or-refresh happens inside the call, so polling this endpoint alone
-    keeps the lease warm. The scope is the estate root — workers pull for the
+    Serves only a `worker_id` that is registered AND alive (last_seen inside
+    the lease): worker identity is not caller-asserted, so a token holder
+    cannot mint phantom workers — and their would-be slices, which carry the
+    credential-bearing fan-out URLs — just by querying. Workers call
+    `POST /api/v1/workers/register` first (the keep-alive, on every refresh
+    tick); an unregistered or lapsed id gets a 404 and must re-register.
+
+    The scope is the estate root — workers pull for the
     whole registry, not one org subtree — taken from settings rather than the
     provisional `org_scope` parameter, which a worker has no business widening.
     """
-    return await worker_repo.assignment(worker_id, scope=settings.sync_default_org_path)
+    assignment = await worker_repo.assignment(worker_id, scope=settings.sync_default_org_path)
+    if assignment is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"worker {worker_id} is not registered or its lease has expired; "
+            "register via POST /api/v1/workers/register first",
+        )
+    return assignment
 
 
 # --- catalogue sync ----------------------------------------------------------
@@ -700,20 +744,43 @@ async def mediamtx_auth(
 ) -> Response:
     """The credential check MediaMTX defers to (`authMethod: http`).
 
-    Answers 200 to allow, 401 to refuse — MediaMTX treats any non-2xx as a
+    Answers 200 to allow, 401 to refuse, 429 when the caller's source IP has
+    exceeded the auth-callback window — MediaMTX treats any non-2xx as a
     refusal. Exempt from `require_internal_token` by necessity (see the
     middleware): the restreamer cannot hold the token it is asking us to
-    check. The policy itself lives in `media_auth.authorize`.
+    check. That makes it an unauthenticated password-equality oracle, so it
+    carries the two mitigations it can: constant-time comparisons inside
+    `authorize`, and the per-source-IP sliding-window limit below bounding
+    guess attempts. The policy itself lives in `media_auth.authorize`.
     """
+    limiter: SlidingWindowRateLimiter | None = getattr(
+        request.app.state, "media_auth_limiter", None
+    )
+    if limiter is None:
+        # Lifespan wires this; tests that install only settings get a limiter
+        # built from those same settings rather than an AttributeError.
+        limiter = SlidingWindowRateLimiter(
+            settings.media_auth_rate_limit_attempts,
+            settings.media_auth_rate_limit_window_s,
+        )
+        request.app.state.media_auth_limiter = limiter
+    source_ip = request.client.host if request.client else "unknown"
+    if not limiter.allow(source_ip):
+        log.warning("mediamtx auth rate limit exceeded: ip=%s", log_safe(source_ip))
+        return Response(status_code=status.HTTP_429_TOO_MANY_REQUESTS)
+
     verifier: TicketVerifier = request.app.state.ticket_verifier
     allowed = await authorize(settings, verifier, payload)
     if not allowed:
+        # user/path/ip come from the request body — attacker-controlled, so
+        # they go through log_safe (bounded length, no control chars) rather
+        # than landing raw in the log where a newline forges a fake line.
         log.info(
             "mediamtx auth denied: action=%s path=%s user=%s ip=%s",
-            payload.action,
-            payload.path,
-            payload.user,
-            payload.ip,
+            log_safe(payload.action),
+            log_safe(payload.path),
+            log_safe(payload.user),
+            log_safe(payload.ip),
         )
         return Response(status_code=status.HTTP_401_UNAUTHORIZED)
     return Response(status_code=status.HTTP_200_OK)

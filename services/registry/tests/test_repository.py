@@ -73,7 +73,11 @@ def test_response_never_carries_upstream_urls():
     """The catalogued `rtsp_url` is the government's pull URL — the invariant
     this whole change exists for. A Camera must contain no upstream URL and
     no credential, whatever the row holds."""
-    settings = RegistrySettings(internal_token="tok", mediamtx_public_host="mtx")
+    settings = RegistrySettings(
+        internal_token="internal-secret",
+        worker_media_token="media-secret",
+        mediamtx_public_host="mtx",
+    )
     camera = camera_from_row(_row(), settings)
     dumped = camera.model_dump()
 
@@ -82,10 +86,12 @@ def test_response_never_carries_upstream_urls():
     assert "whep_url" not in dumped["endpoints"]
     text = str(dumped)
     assert "gateway.gov.example" not in text
+    # The media credential is the WORKER token, never the internal-API one.
+    assert "internal-secret" not in text
 
     # What remains: fan-out URLs for workers (credentialed) and the public
     # capability flag.
-    assert dumped["endpoints"]["fanout_rtsp_url"].startswith("rtsp://worker:tok@mtx:8554/")
+    assert dumped["endpoints"]["fanout_rtsp_url"].startswith("rtsp://worker:media-secret@mtx:8554/")
     assert dumped["preview"]["available"] is True
 
 

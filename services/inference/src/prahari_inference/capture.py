@@ -27,6 +27,7 @@ from prahari_common.catalogue import CameraEntry
 from prahari_common.config import GatewaySettings, gateway_settings
 
 from .config import IngestSettings, ingest_settings
+from .redact import redact_url_credentials
 from .rtsp_env import capture_options, cv2
 from .timing import FrameTiming, PTSClock
 
@@ -163,7 +164,9 @@ class StreamCapture:
         log.info(
             "connecting camera=%s url=%s codec=%s opts=%s",
             self.camera.id,
-            self.url,
+            # The fan-out URL carries `worker:<token>` userinfo — a real
+            # credential; the log gets the redacted form.
+            redact_url_credentials(self.url),
             self.camera.properties.codec or "unknown",
             capture_options(),
         )

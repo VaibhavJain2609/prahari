@@ -60,17 +60,24 @@ class FakeWorkerRepo:
             lease_s=self.lease_s,
         )
 
-    async def assignment(self, worker_id: str, *, scope: str) -> WorkerAssignment:
+    async def assignment(self, worker_id: str, *, scope: str) -> WorkerAssignment | None:
+        """Mirrors the real repo's post-M2 contract: serves only a worker_id
+        already registered AND alive — no implicit register on the fetch."""
         self.scopes.append(scope)
-        registration = await self.register(worker_id)
+        alive = self._alive()
+        if worker_id not in alive:
+            return None
+        index, count = shard_membership(worker_id, alive)
         ordered = sorted(self.cameras, key=lambda c: c.id)
         # Mirrors `(rn - 1) % shard_count = shard_index` over ORDER BY id.
-        shard = [
-            c
-            for i, c in enumerate(ordered)
-            if i % registration.shard_count == registration.shard_index
-        ]
-        return WorkerAssignment(**registration.model_dump(), cameras=shard)
+        shard = [c for i, c in enumerate(ordered) if i % count == index]
+        return WorkerAssignment(
+            worker_id=worker_id,
+            shard_index=index,
+            shard_count=count,
+            lease_s=self.lease_s,
+            cameras=shard,
+        )
 
     def elapse(self, seconds: float) -> None:
         self.clock += seconds
@@ -232,26 +239,35 @@ def test_assignments_partitions_cover_the_estate_without_overlap(workers, client
     assert len(flat) == len(set(flat))  # disjoint
 
 
-def test_assignments_registers_an_unknown_worker_rather_than_404(workers, client):
-    """A pod's first call after a cold start IS its registration — a worker
-    that only ever polls /assignments still joins the pool."""
+def test_assignments_404s_for_an_unregistered_worker(workers, client):
+    """M2: worker identity is not caller-asserted — a token holder cannot
+    mint a phantom worker (and read its would-be slice, which carries the
+    credential-bearing fan-out URLs) just by querying with a made-up id."""
     resp = client.get("/api/v1/assignments", headers=HEADERS, params={"worker_id": "w9"})
-    assert resp.status_code == 200
-    assert resp.json()["worker_id"] == "w9"
-    assert workers.seen["w9"] == workers.clock
+    assert resp.status_code == 404
+    assert "w9" not in workers.seen  # nothing was registered as a side effect
 
 
-def test_assignments_refresh_counts_toward_the_lease(workers, client):
-    """Polling /assignments alone keeps last_seen warm — the lease renews on
-    the fetch, not only on the register call."""
+def test_assignments_404s_for_a_worker_whose_lease_expired(workers, client):
+    """Registered is not enough — a worker whose last_seen has aged past the
+    alive horizon must re-register, not keep pulling assignments forever."""
     client.post("/api/v1/workers/register", headers=HEADERS, json={"worker_id": "w1"})
-    workers.elapse(LEASE_S)  # one lease passes with only assignment polls
-    for _ in range(2):
-        client.get("/api/v1/assignments", headers=HEADERS, params={"worker_id": "w2"})
-        workers.elapse(LEASE_S)
-    # w2 stayed alive through the gap; w1 (never refreshed) has fallen out.
-    resp = client.post("/api/v1/workers/register", headers=HEADERS, json={"worker_id": "w2"})
-    assert resp.json()["shard_count"] == 1
+    workers.elapse(2 * LEASE_S + 1)  # past the 2x-lease alive horizon
+    resp = client.get("/api/v1/assignments", headers=HEADERS, params={"worker_id": "w1"})
+    assert resp.status_code == 404
+    # Registering again re-joins the pool and the poll works.
+    client.post("/api/v1/workers/register", headers=HEADERS, json={"worker_id": "w1"})
+    resp = client.get("/api/v1/assignments", headers=HEADERS, params={"worker_id": "w1"})
+    assert resp.status_code == 200
+
+
+def test_register_then_poll_is_the_full_assignment_cycle(workers, client):
+    """The worker client's actual flow: register refreshes the lease, the
+    assignment fetch then serves the shard."""
+    client.post("/api/v1/workers/register", headers=HEADERS, json={"worker_id": "w1"})
+    resp = client.get("/api/v1/assignments", headers=HEADERS, params={"worker_id": "w1"})
+    assert resp.status_code == 200
+    assert resp.json()["worker_id"] == "w1"
 
 
 def test_assignments_requires_a_worker_id(client):
@@ -265,5 +281,6 @@ def test_assignments_requires_a_worker_id(client):
 def test_assignments_uses_the_estate_root_scope_not_a_client_claim(workers, client):
     """Workers pull for the whole registry — the scope is
     `sync_default_org_path`, never an `org_scope` the caller passed."""
+    client.post("/api/v1/workers/register", headers=HEADERS, json={"worker_id": "w1"})
     client.get("/api/v1/assignments", headers=HEADERS, params={"worker_id": "w1"})
     assert workers.scopes == ["gj"]

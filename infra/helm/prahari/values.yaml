@@ -64,12 +64,10 @@ redis:
   # with an empty password) — loudly equivalent to the internal-token
   # convention, not a silent half-authenticated state.
   #
-  # KNOWN GAP: the KEDA redis-streams scaler in inference.yaml connects to
-  # `prahari-redis:6379` without a credential — its metadata has no secret
-  # reference. With requirepass armed the scaler reads NOAUTH and the gpu
-  # profile's scale trigger goes dark; fix is a TriggerAuthentication
-  # (secretTargetRef → prahari-redis-auth/password) in inference.yaml, which
-  # is owned outside this change.
+  # The KEDA redis-streams scaler in inference.yaml carries the same
+  # credential — it mounts it via a TriggerAuthentication
+  # (secretTargetRef → prahari-redis-auth/password), so a requirepass-armed
+  # Redis does not leave the gpu profile's scale trigger reading NOAUTH.
   existingSecret: ""
   resources:
     requests: { cpu: 50m,  memory: 128Mi }
@@ -275,6 +273,21 @@ inference:
     queueLengthTarget: 100
 
 # --- security ----------------------------------------------------------------
+
+security:
+  # When true, every secretKeyRef into the `prahari-internal` Secret mounts
+  # with `optional: false` — a pod refuses to start if the Secret (or the
+  # token key it needs) is absent. That is the loud failure a real profile
+  # wants: with `optional: true` a missing Secret starts every pod with
+  # empty tokens, and empty tokens mean enforcement OFF — the registry's
+  # X-Internal-Token gate, the match-engine gRPC interceptor, and the
+  # MediaMTX auth callback all silently disarm at once.
+  #
+  # False here because the local profile is the documented enforcement-off
+  # dev mode; every real profile sets it true. The media-JWT key is exempt
+  # (see bffEnv) — its absence degrades to an ephemeral keypair, which is a
+  # loud, documented behaviour rather than a gate going open.
+  internalSecretRequired: false
 
 # The audit log is not optional and not profile-switched: it is the BFF's
 # append-only SQLite file on the prahari-audit PVC, always on in every profile.

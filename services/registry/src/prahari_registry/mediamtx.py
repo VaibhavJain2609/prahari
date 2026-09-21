@@ -33,7 +33,10 @@ log = logging.getLogger(__name__)
 # The two MediaMTX internal users. MediaMTX runs `authMethod: http` and defers
 # every credential check to this service's `/api/v1/mediamtx/auth` (see
 # `media_auth.py`), so these names exist only as the convention that endpoint
-# pattern-matches on — the shared secret itself is `internal_token`.
+# pattern-matches on. Each user carries its OWN secret — `internal_token` for
+# the API user, `worker_media_token` for the reader — because the reader
+# credential lives inside URLs on every inference pod and must not also be
+# the internal-API token.
 MTX_API_USER = "internal"
 """Basic-auth user the registry presents to the MediaMTX control API (:9997).
 Grants `action: api` — path reconcile. Never used for stream reads."""
@@ -52,19 +55,23 @@ def path_name(camera_id: str) -> str:
 def fanout_endpoints(settings: RegistrySettings, camera_id: str) -> StreamEndpoints:
     """The MediaMTX URLs a worker connects to for this camera.
 
-    The RTSP/HLS URLs embed `worker:<internal-token>` userinfo when a token is
-    configured — with `authMethod: http` armed on the restreamer, an
+    The RTSP/HLS URLs embed `worker:<worker-media-token>` userinfo when that
+    token is configured — with `authMethod: http` armed on the restreamer, an
     uncredentialed read is refused, and RTSP consumers have no header channel
-    to carry one on. Empty token = auth enforcement off (the local default);
-    the URLs then carry no userinfo at all.
+    to carry one on. This is the MEDIA credential, deliberately not
+    `internal_token`: it travels inside URLs on every worker pod, so coupling
+    it to the internal-API token would turn a leaked pull URL into an API
+    credential. Empty token = no userinfo — under armed enforcement those
+    reads simply fail closed, which is the correct loud failure for a
+    deployment that forgot `worker-token`.
 
     These URLs must only leave this service on the internal-token-gated API —
     the BFF strips `endpoints` before a camera payload can reach a browser.
     """
     name = path_name(camera_id)
     host = settings.mediamtx_public_host
-    if settings.internal_token:
-        creds = f"{MTX_READER_USER}:{quote(settings.internal_token, safe='')}@"
+    if settings.worker_media_token:
+        creds = f"{MTX_READER_USER}:{quote(settings.worker_media_token, safe='')}@"
     else:
         creds = ""
     return StreamEndpoints(

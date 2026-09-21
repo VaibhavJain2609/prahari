@@ -98,14 +98,19 @@ bff-bootstrap: ## Create the prahari-bff-bootstrap Secret (first-login admin) fr
 	fi
 
 .PHONY: internal-secret
-internal-secret: ## Create the prahari-internal Secret (service token + credential key)
-	# Two keys every real deployment needs:
+internal-secret: ## Create the prahari-internal Secret (service token + media token + credential key)
+	# Three keys every real deployment needs:
 	#   internal-token  — required as X-Internal-Token on the registry's /api/*;
 	#                     must match on every internal caller (BFF, correlation).
+	#   worker-token    — the MediaMTX reader credential embedded in worker
+	#                     fan-out URLs as `worker:<token>` userinfo. SEPARATE
+	#                     from internal-token on purpose: it lives inside URLs
+	#                     on every inference pod, so it must not also unlock
+	#                     the internal API, and it rotates independently.
 	#   credential-key  — 32-byte AES-256 key, urlsafe-base64, encrypting
 	#                     cameras.stream_secret (registry crypto.py).
-	# Production should supply real values via INTERNAL_TOKEN and
-	# CREDENTIAL_KEY in .env (or a secrets manager); the generated fallbacks
+	# Production should supply real values via INTERNAL_TOKEN, WORKER_MEDIA_TOKEN
+	# and CREDENTIAL_KEY in .env (or a secrets manager); the generated fallbacks
 	# exist so a local cluster works out of the box. This is create-if-absent
 	# on purpose: re-running with generated values would rotate the key that
 	# stored camera credentials were encrypted under.
@@ -115,6 +120,7 @@ internal-secret: ## Create the prahari-internal Secret (service token + credenti
 	  test ! -f .env || { set -a; . ./.env; set +a; }; \
 	  kubectl create secret generic prahari-internal --namespace $(NAMESPACE) \
 	    --from-literal=internal-token="$${INTERNAL_TOKEN:-$$(openssl rand -hex 32)}" \
+	    --from-literal=worker-token="$${WORKER_MEDIA_TOKEN:-$$(openssl rand -hex 32)}" \
 	    --from-literal=credential-key="$${CREDENTIAL_KEY:-$$(python3 -c 'import secrets,base64;print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())')}" \
 	    --dry-run=client -o yaml | kubectl apply -f -; \
 	fi

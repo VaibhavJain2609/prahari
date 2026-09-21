@@ -24,12 +24,15 @@ from prahari_registry.app import app
 from prahari_registry.config import RegistrySettings
 from prahari_registry.media_auth import (
     MediaMTXAuthRequest,
+    SlidingWindowRateLimiter,
     TicketVerifier,
     _ticket_grants,
     authorize,
+    log_safe,
 )
 
 TOKEN = "test-internal-token"
+WORKER_TOKEN = "test-worker-media-token"
 
 
 def _b64url(data: bytes) -> str:
@@ -85,8 +88,14 @@ def _req(**kwargs) -> MediaMTXAuthRequest:
 # --- policy: internal credentials --------------------------------------------
 
 
+def _settings(**kwargs) -> RegistrySettings:
+    kwargs.setdefault("internal_token", TOKEN)
+    kwargs.setdefault("worker_media_token", WORKER_TOKEN)
+    return RegistrySettings(**kwargs)
+
+
 async def test_api_user_gets_api_and_nothing_else():
-    settings = RegistrySettings(internal_token=TOKEN)
+    settings = _settings()
     verifier = _verifier(settings, {"keys": []})
     assert await authorize(settings, verifier, _req(user="internal", password=TOKEN, action="api"))
     # The api credential is not a stream credential.
@@ -96,30 +105,71 @@ async def test_api_user_gets_api_and_nothing_else():
 
 
 async def test_worker_reads_cam_paths_only():
-    settings = RegistrySettings(internal_token=TOKEN)
+    settings = _settings()
     verifier = _verifier(settings, {"keys": []})
     assert await authorize(
-        settings, verifier, _req(user="worker", password=TOKEN, action="read", path="cam-42")
+        settings,
+        verifier,
+        _req(user="worker", password=WORKER_TOKEN, action="read", path="cam-42"),
     )
     assert not await authorize(
         # The worker credential must not reach the control API — a leaked
         # assignment URL is a reader, not an operator.
         settings,
         verifier,
-        _req(user="worker", password=TOKEN, action="api"),
+        _req(user="worker", password=WORKER_TOKEN, action="api"),
     )
     assert not await authorize(
         settings,
         verifier,
-        _req(user="worker", password=TOKEN, action="read", path="debug-clip"),
+        _req(user="worker", password=WORKER_TOKEN, action="read", path="debug-clip"),
     )
 
 
-async def test_wrong_password_is_denied():
-    settings = RegistrySettings(internal_token=TOKEN)
+async def test_the_media_credential_is_not_the_internal_token():
+    """H1: the two machine secrets are independent — the internal API token
+    must NOT read streams, and the worker media token must NOT reach the API.
+    A leaked fan-out URL is a media credential, nothing more."""
+    settings = _settings()
     verifier = _verifier(settings, {"keys": []})
     assert not await authorize(
-        settings, verifier, _req(user="worker", password="nope", action="read", path="cam-1")
+        settings, verifier, _req(user="worker", password=TOKEN, action="read", path="cam-1")
+    )
+    assert not await authorize(
+        settings,
+        verifier,
+        _req(user="internal", password=WORKER_TOKEN, action="api"),
+    )
+
+
+async def test_worker_auth_fails_closed_without_a_worker_token():
+    """Enforcement armed (internal_token set) but no worker_media_token:
+    `worker:` requests are denied outright — a credential that cannot be
+    checked cannot be granted. This is the missing-Secret case, and it must
+    be loud denial, not an allow."""
+    settings = _settings(worker_media_token="")
+    verifier = _verifier(settings, {"keys": []})
+    assert not await authorize(
+        settings,
+        verifier,
+        _req(user="worker", password=TOKEN, action="read", path="cam-1"),
+    )
+    assert not await authorize(
+        settings,
+        verifier,
+        _req(user="worker", password="anything", action="read", path="cam-1"),
+    )
+    # The internal API user is unaffected — its own secret is configured.
+    assert await authorize(settings, verifier, _req(user="internal", password=TOKEN, action="api"))
+
+
+async def test_wrong_password_is_denied():
+    settings = _settings()
+    verifier = _verifier(settings, {"keys": []})
+    assert not await authorize(
+        settings,
+        verifier,
+        _req(user="worker", password="nope", action="read", path="cam-1"),
     )
 
 
@@ -128,14 +178,14 @@ async def test_publish_and_playback_are_denied_for_internal_credentials():
     and `worker` may neither write into the restreamer nor replay out of it.
     Playback exists only as a BFF-ticket grant — see the playback block
     below."""
-    settings = RegistrySettings(internal_token=TOKEN)
+    settings = _settings()
     verifier = _verifier(settings, {"keys": []})
     for action in ("publish", "playback"):
-        for user in ("internal", "worker"):
+        for user, secret in (("internal", TOKEN), ("worker", WORKER_TOKEN)):
             assert not await authorize(
                 settings,
                 verifier,
-                _req(user=user, password=TOKEN, action=action, path="cam-1"),
+                _req(user=user, password=secret, action=action, path="cam-1"),
             )
 
 
@@ -273,8 +323,11 @@ async def test_playback_without_a_ticket_is_denied():
 
 @pytest.fixture
 def armed_client():
-    app.state.settings = RegistrySettings(internal_token=TOKEN, sync_enabled=False)
+    app.state.settings = RegistrySettings(
+        internal_token=TOKEN, worker_media_token=WORKER_TOKEN, sync_enabled=False
+    )
     app.state.ticket_verifier = _verifier(app.state.settings, {"keys": []})
+    app.state.media_auth_limiter = SlidingWindowRateLimiter(20, 60.0)
     return TestClient(app)
 
 
@@ -283,9 +336,63 @@ def test_auth_endpoint_is_exempt_from_the_internal_token(armed_client):
     behind the credential would deadlock the video plane."""
     resp = armed_client.post(
         "/api/v1/mediamtx/auth",
-        json={"user": "worker", "password": TOKEN, "action": "read", "path": "cam-1"},
+        json={"user": "worker", "password": WORKER_TOKEN, "action": "read", "path": "cam-1"},
     )
     assert resp.status_code == 200
+
+
+def test_auth_endpoint_rate_limits_per_source_ip(armed_client):
+    """The endpoint is an unauthenticated credential oracle by necessity —
+    the sliding window is what bounds guess attempts. Past the cap the
+    answer is 429, which MediaMTX reads as a refusal like any non-2xx."""
+    app.state.media_auth_limiter = SlidingWindowRateLimiter(3, 60.0)
+    body = {"user": "worker", "password": "guess", "action": "read", "path": "cam-1"}
+    codes = [armed_client.post("/api/v1/mediamtx/auth", json=body).status_code for _ in range(6)]
+    assert codes[:3] == [401, 401, 401]
+    assert codes[3:] == [429, 429, 429]
+
+
+def test_auth_denial_log_is_sanitized(armed_client, caplog):
+    """`user`/`path` are attacker-controlled body fields — a newline or
+    control char in them must not forge extra log lines."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="prahari_registry.app")
+    armed_client.post(
+        "/api/v1/mediamtx/auth",
+        json={
+            "user": "worker\nFAKE-LOG-LINE",
+            "password": "wrong",
+            "action": "read",
+            "path": "cam-1\x00\x1b[31m",
+        },
+    )
+    denied = [r for r in caplog.records if "auth denied" in r.getMessage()]
+    assert denied, "expected a denial log line"
+    message = denied[-1].getMessage()
+    # No raw control characters survive — the injected newline cannot split
+    # the line into a forged second entry, the escape cannot colour it.
+    assert "\n" not in message and "\x1b" not in message and "\x00" not in message
+    # The text itself stays (replaced chars mark the tampering rather than
+    # hiding it): one log line, visibly sanitized.
+    assert "worker?FAKE-LOG-LINE" in message
+
+
+def test_auth_denial_log_bounds_field_length(armed_client, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="prahari_registry.app")
+    armed_client.post(
+        "/api/v1/mediamtx/auth",
+        json={
+            "user": "u" * 4096,
+            "password": "wrong",
+            "action": "read",
+            "path": "cam-1",
+        },
+    )
+    denied = [r for r in caplog.records if "auth denied" in r.getMessage()]
+    assert denied and len(denied[-1].getMessage()) < 1024
 
 
 def test_auth_endpoint_denies_bad_credentials(armed_client):
@@ -315,11 +422,23 @@ def test_ticket_grants_action_must_match_exactly():
     assert not _ticket_grants(payload, action="read", path="cam-1")
 
 
-def test_ticket_grants_empty_path_means_any_path():
+def test_ticket_grants_empty_path_grants_nothing():
+    """L2: a grant naming no path is not "any path" — the BFF never mints
+    one, so an empty/absent path is indistinguishable from a malformed (or
+    attacker-edited) payload and is refused."""
     payload = {"mediamtx_permissions": [{"action": "read", "path": ""}]}
-    assert _ticket_grants(payload, action="read", path="cam-anything")
+    assert not _ticket_grants(payload, action="read", path="cam-anything")
     payload = {"mediamtx_permissions": [{"action": "read"}]}
-    assert _ticket_grants(payload, action="read", path="cam-anything")
+    assert not _ticket_grants(payload, action="read", path="cam-anything")
+    payload = {"mediamtx_permissions": [{"action": "read", "path": None}]}
+    assert not _ticket_grants(payload, action="read", path="cam-anything")
+
+
+def test_log_safe_strips_control_chars_and_bounds_length():
+    assert log_safe("worker\nforged-line") == "worker?forged-line"
+    assert log_safe("cam-1\x00\x1b[31m") == "cam-1??[31m"
+    assert len(log_safe("x" * 1000)) <= 129  # 128 chars + the truncation marker
+    assert log_safe("x" * 1000).endswith("…")
 
 
 async def test_authorize_correct_token_under_an_unknown_user_is_denied():
@@ -383,6 +502,45 @@ async def test_unknown_kid_forces_one_refresh_then_denies():
 
     assert not await verifier.allows(ticket, action="read", path="cam-abc")
     assert len(calls) == 2  # one cache-fill refresh plus the forced re-check
+
+
+async def test_a_still_unknown_kid_is_negative_cached_and_costs_no_fetch():
+    """L2: a flood of tickets all naming a bogus `kid` must not each cost a
+    JWKS fetch — that turns this endpoint into a request amplifier against
+    the BFF. Within the negative-cache window the same unknown kid is denied
+    locally, no refresh."""
+    settings = RegistrySettings(internal_token=TOKEN)
+    key = Ed25519PrivateKey.generate()
+    http, calls = _counting_jwks_client([_jwks_for(key), _jwks_for(key)])
+    verifier = TicketVerifier(settings, client=http)
+    ticket = _make_ticket(key, kid="k9", path="cam-abc")
+
+    assert not await verifier.allows(ticket, action="read", path="cam-abc")
+    assert len(calls) == 2
+    # Second and third requests with the same forged kid: denied locally.
+    assert not await verifier.allows(ticket, action="read", path="cam-abc")
+    assert not await verifier.allows(ticket, action="read", path="cam-abc")
+    assert len(calls) == 2  # no further fetches
+
+
+async def test_an_unknown_kid_retries_after_the_negative_window():
+    """The negative cache is short: a real BFF key rotation must become
+    visible again after the window, not be remembered as forged forever."""
+    settings = RegistrySettings(internal_token=TOKEN)
+    key = Ed25519PrivateKey.generate()
+    rotated = _jwks_for(key)
+    rotated["keys"][0]["kid"] = "k9"  # the post-rotation JWKS knows k9
+    http, calls = _counting_jwks_client([_jwks_for(key), _jwks_for(key), rotated])
+    verifier = TicketVerifier(settings, client=http)
+    ticket = _make_ticket(key, kid="k9", path="cam-abc")
+
+    assert not await verifier.allows(ticket, action="read", path="cam-abc")
+    assert len(calls) == 2
+    # Age the negative-cache entry past its TTL: the next check re-fetches
+    # and the rotated key now verifies the ticket.
+    verifier._unknown_kids["k9"] -= verifier._UNKNOWN_KID_TTL_S + 1
+    assert await verifier.allows(ticket, action="read", path="cam-abc")
+    assert len(calls) == 3
 
 
 async def test_unknown_kid_with_an_unreachable_bff_denies():

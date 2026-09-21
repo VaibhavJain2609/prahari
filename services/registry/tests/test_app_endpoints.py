@@ -389,7 +389,7 @@ def test_create_camera_under_an_explicit_org(state, client):
     resp = client.post(
         "/api/v1/cameras",
         headers=HEADERS,
-        json={"external_id": "dvr-1", "org_id": ORG_ID, "rtsp_url": "rtsp://dvr/ch1"},
+        json={"external_id": "dvr-1", "org_id": ORG_ID, "rtsp_url": "rtsp://10.0.0.7/ch1"},
     )
     assert resp.status_code == 201
     # The duplicate check runs against the org the camera would land in.
@@ -425,6 +425,67 @@ def test_create_camera_credential_key_error_is_a_400(state, client):
         json={"external_id": "dvr-1", "stream_password": "pw"},
     )
     assert resp.status_code == 400
+
+
+def test_create_camera_rejects_a_link_local_rtsp_url(state, client):
+    """L1: the stored rtsp_url is what MediaMTX later connects to on our
+    behalf — write-time validation must apply the same SSRF policy as the
+    probe, or the registry stores a connect-anywhere primitive. 169.254.x.x
+    is the cloud-metadata range."""
+    resp = client.post(
+        "/api/v1/cameras",
+        headers=HEADERS,
+        json={"external_id": "dvr-1", "rtsp_url": "rtsp://169.254.169.254/latest"},
+    )
+    assert resp.status_code == 400
+    assert state.create_calls == []  # nothing was stored
+
+
+def test_create_camera_rejects_loopback_multicast_and_reserved_targets(state, client):
+    for url in (
+        "rtsp://127.0.0.1:554/x",
+        "rtsp://[::1]:554/x",
+        "rtsp://224.0.0.1:554/x",
+    ):
+        resp = client.post(
+            "/api/v1/cameras",
+            headers=HEADERS,
+            json={"external_id": "dvr-1", "rtsp_url": url},
+        )
+        assert resp.status_code == 400, url
+
+
+def test_create_camera_rejects_a_non_rtsp_scheme_and_a_disallowed_port(state, client):
+    """The policy is the probe's, not tighter: scheme must be rtsp and the
+    port must be in probe_allowed_ports (default {554})."""
+    for url in (
+        "http://169.254.169.254/latest/meta-data",
+        "rtsp://10.0.0.7:6379/ch1",
+        "file:///etc/passwd",
+    ):
+        resp = client.post(
+            "/api/v1/cameras",
+            headers=HEADERS,
+            json={"external_id": "dvr-1", "rtsp_url": url},
+        )
+        assert resp.status_code == 400, url
+
+
+def test_create_camera_allows_rfc1918_dvr_addresses(state, client):
+    """DVRs legitimately live on private ranges — the probe's policy allows
+    them, so registration must not tighten past it."""
+    resp = client.post(
+        "/api/v1/cameras",
+        headers=HEADERS,
+        json={"external_id": "dvr-1", "rtsp_url": "rtsp://192.168.10.20:554/ch1"},
+    )
+    assert resp.status_code == 201
+    assert state.create_calls[0].rtsp_url == "rtsp://192.168.10.20:554/ch1"
+
+
+def test_create_camera_without_an_rtsp_url_skips_validation(state, client):
+    resp = client.post("/api/v1/cameras", headers=HEADERS, json={"external_id": "cam-x"})
+    assert resp.status_code == 201
 
 
 def test_get_camera_404s_for_a_camera_outside_scope(state, client):

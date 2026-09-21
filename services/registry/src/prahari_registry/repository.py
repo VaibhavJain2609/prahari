@@ -936,22 +936,35 @@ class WorkerRepository:
         )
         return [r["worker_id"] for r in rows]
 
-    async def assignment(self, worker_id: str, *, scope: str) -> WorkerAssignment:
-        """Register-or-refresh the worker, then return its slice of the estate.
+    async def assignment(self, worker_id: str, *, scope: str) -> WorkerAssignment | None:
+        """The camera slice for an already-registered, still-alive worker.
 
-        The fetch re-registers rather than 404ing an unknown worker: a pod's
-        first call after a cold start IS its registration, and a worker that
-        only ever polls `/assignments` still keeps its lease warm — the same
-        way a camera heartbeat refreshes the camera without a separate
-        keep-alive endpoint.
-        """
-        registration = await self.register(worker_id)
+        Returns None when `worker_id` is not in the alive set — the endpoint
+        turns that into a 404. Register-or-refresh used to happen inside this
+        call, which made identity caller-asserted: anyone holding the internal
+        token could mint a phantom worker (and read its would-be slice, which
+        carries the credential-bearing fan-out URLs) just by querying with a
+        made-up id. Membership is now granted ONLY by `register` — a worker
+        calls register() then polls this, which is also its lease keep-alive,
+        so the alive check doubles as the liveness gate: a worker whose lease
+        has expired must re-announce itself rather than keep pulling
+        assignments forever."""
+        alive = await self.alive_worker_ids()
+        if worker_id not in alive:
+            return None
+        shard_index, shard_count = shard_membership(worker_id, alive)
         cameras = await self.shard_of_cameras(
             scope=scope,
-            shard_index=registration.shard_index,
-            shard_count=registration.shard_count,
+            shard_index=shard_index,
+            shard_count=shard_count,
         )
-        return WorkerAssignment(**registration.model_dump(), cameras=cameras)
+        return WorkerAssignment(
+            worker_id=worker_id,
+            shard_index=shard_index,
+            shard_count=shard_count,
+            lease_s=self._s.assignment_lease_s,
+            cameras=cameras,
+        )
 
     async def shard_of_cameras(
         self, *, scope: str, shard_index: int, shard_count: int
