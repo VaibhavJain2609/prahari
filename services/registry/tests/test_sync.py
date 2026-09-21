@@ -332,7 +332,10 @@ class LockPool(FakePool):
 
 
 def _gateway() -> GatewaySettings:
-    return GatewaySettings(host="gateway.example", password="pw")
+    # _env_file=None: the repo's real .env (gitignored, with a live
+    # DIRECT_HOST) otherwise leaks in through pydantic-settings' env_file
+    # source and the test asserts against whatever machine it runs on.
+    return GatewaySettings(host="gateway.example", password="pw", _env_file=None)
 
 
 async def test_run_once_locked_skips_when_another_replica_holds_the_lock():
