@@ -113,14 +113,16 @@ spec:
             # One token authenticates the worker to BOTH gated peers —
             # X-Internal-Token on registry heartbeats/assignments and
             # x-internal-token metadata on the match-engine gRPC stream.
-            # optional:true so a local profile without the Secret still runs
-            # (empty token = enforcement off, warned at startup).
+            # optional is security.internalSecretRequired-driven: false for
+            # local dev (empty token = enforcement off, warned at startup),
+            # true in real profiles so a missing prahari-internal Secret
+            # fails the pod instead of silently disarming the gates.
             - name: PRAHARI_INGEST_INTERNAL_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: prahari-internal
                   key: internal-token
-                  optional: true
+                  optional: {{ not .Values.security.internalSecretRequired }}
             # Model device — selected here, never sniffed at runtime. The gpu
             # profile sets cuda; local stays cpu.
             - name: PRAHARI_DETECT_DEVICE

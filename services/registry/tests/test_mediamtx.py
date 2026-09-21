@@ -80,7 +80,7 @@ def test_fanout_urls_embed_the_worker_credential_when_a_token_is_set():
     URL's userinfo. Only ever on the internal-token-gated API."""
     settings = RegistrySettings(
         mediamtx_public_host="prahari-mediamtx",
-        internal_token="t0k/en",  # URL-unsafe chars must be quoted
+        worker_media_token="t0k/en",  # URL-unsafe chars must be quoted
     )
     endpoints = fanout_endpoints(settings, "abc")
 
@@ -91,9 +91,25 @@ def test_fanout_urls_embed_the_worker_credential_when_a_token_is_set():
     assert endpoints.fanout_whep_url == "http://prahari-mediamtx:8889/cam-abc/whep"
 
 
+def test_fanout_urls_embed_the_media_token_not_the_internal_token():
+    """H1: the URL userinfo is `worker_media_token`, a separate secret —
+    a leaked pull URL must not also be an internal-API credential."""
+    settings = RegistrySettings(
+        mediamtx_public_host="prahari-mediamtx",
+        internal_token="internal-secret",
+        worker_media_token="media-secret",
+    )
+    endpoints = fanout_endpoints(settings, "abc")
+
+    assert "media-secret" in endpoints.fanout_rtsp_url
+    assert "internal-secret" not in endpoints.fanout_rtsp_url
+    assert "internal-secret" not in endpoints.fanout_hls_url
+
+
 def test_fanout_urls_carry_no_credential_when_enforcement_is_off():
-    """Empty internal_token = auth off on both sides (the documented local
-    default) — the URLs must then contain no userinfo at all."""
+    """Empty worker_media_token = no media credential to embed — the URLs
+    must then contain no userinfo at all (local dev is enforcement-off;
+    an armed deployment without the worker token fails closed instead)."""
     for url in fanout_endpoints(SETTINGS, "abc").model_dump().values():
         assert url is None or "@" not in urlsplit(url).netloc
 

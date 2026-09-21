@@ -47,6 +47,7 @@ from .detect import (
 )
 from .grpc_client import MatchEngineClient
 from .metrics import Metrics, MetricsServer
+from .redact import redact_url_credentials, redact_url_in_text
 
 log = logging.getLogger(__name__)
 
@@ -191,14 +192,20 @@ class RegistryClient:
         """Ask the registry what to pull — this worker's shard when the
         registry supports sharding, the estate's first-N otherwise.
 
-        Sharded path: re-register (the lease keep-alive), then GET
-        /api/v1/assignments for the modulo slice of the active estate the
-        registry computed for this worker_id. That is what stops N workers
-        racing the same first-N cameras.
+        Sharded path: re-register (the lease keep-alive AND the membership
+        grant), then GET /api/v1/assignments for the modulo slice of the
+        active estate the registry computed for this worker_id. That is what
+        stops N workers racing the same first-N cameras. The order is
+        load-bearing: `/assignments` only serves a registered, still-alive
+        worker_id — it is not caller-asserted, so a phantom id gets a 404
+        rather than minting a worker on the spot.
 
         Fallback: a 404 on either endpoint means a pre-sharding registry —
         deployment order during a rollout can pair a new worker with an old
-        registry. The worker stays functional and unsharded, logged loudly,
+        registry. (A 404 on /assignments after a SUCCESSFUL register is
+        unreachable in the matched-version case — the register just refreshed
+        last_seen — so treating it as unsharded remains correct.) The worker
+        stays functional and unsharded, logged loudly,
         because two unsharded workers pulling the same cameras is the exact
         defect this endpoint exists to fix and silence would hide it.
 
@@ -406,7 +413,9 @@ class IngestWorker:
             "pulling camera=%s (%s) from %s",
             assignment.camera_id,
             assignment.site_name or "unnamed",
-            assignment.url,
+            # The fan-out URL carries `worker:<token>` userinfo — a real
+            # credential. It must never land in a pod log.
+            redact_url_credentials(assignment.url),
         )
         thread = threading.Thread(
             target=self._pump, args=(assignment, capture), name=f"pump-{assignment.camera_id[:8]}"
@@ -456,9 +465,16 @@ class IngestWorker:
         except Exception as exc:
             # The capture's own reconnect loop handles connection loss; reaching
             # here means something else broke. Record it so the camera shows as
-            # unreachable with a reason rather than silently going quiet.
+            # unreachable with a reason rather than silently going quiet. The
+            # exception text can echo the credentialed fan-out URL back
+            # (ffmpeg reports the connect target), so it goes through the
+            # redactor — `last_error` travels to the registry on heartbeats
+            # and into pod logs, both places the token must not appear.
             log.exception("camera=%s pump failed", assignment.camera_id)
-            stats.update(connected=False, last_error=f"{type(exc).__name__}: {exc}")
+            stats.update(
+                connected=False,
+                last_error=redact_url_in_text(f"{type(exc).__name__}: {exc}", assignment.url),
+            )
         finally:
             # Close the capture: we hold a connection slot on a shared feed for
             # exactly as long as we are processing the camera, and no longer.

@@ -42,7 +42,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
 
-__all__ = ["ProbeError", "ProbeResult", "SSRFBlockedError", "probe_rtsp"]
+__all__ = ["ProbeError", "ProbeResult", "SSRFBlockedError", "probe_rtsp", "validate_rtsp_url"]
 
 _DEFAULT_RTSP_PORT = 554
 _CONNECT_TIMEOUT_S = 3.0
@@ -119,6 +119,48 @@ async def _resolve_pinned_ip(host: str) -> str:
     ip_str = infos[0][4][0]
     _guard_ip(ip_str)
     return ip_str
+
+
+async def validate_rtsp_url(
+    url: str, *, allowed_ports: Iterable[int] = DEFAULT_ALLOWED_PORTS
+) -> str:
+    """The SSRF guard, without the connect — everything `probe_rtsp` checks
+    before it opens a socket: scheme is rtsp, a host exists, the port is in
+    the allowlist, and the resolved IP is not loopback/link-local/multicast/
+    reserved. Returns the pinned IP (the checked address the caller may then
+    connect to).
+
+    Shared with camera registration (`POST /api/v1/cameras`): the stored
+    `rtsp_url` is what MediaMTX later connects to on our behalf, so an
+    unvalidated stored URL is the same server-side-fetch primitive the probe
+    is guarded against, reached by a slower path. Policy here is exactly the
+    probe's — RFC1918 stays allowed because DVRs legitimately live on it —
+    applied at write time rather than only at probe time.
+
+    Raises `ProbeError` for malformed/unresolvable input and
+    `SSRFBlockedError` for a policy refusal; callers turn both into a 400 —
+    a URL that cannot be resolved cannot be checked, so unresolvable fails
+    closed here (the probe reports it as simply "unreachable" instead).
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError as exc:
+        raise ProbeError(f"malformed URL: {exc}") from exc
+    if parts.scheme != "rtsp":
+        raise ProbeError(f"unsupported scheme {parts.scheme!r} — only rtsp:// is allowed")
+    host = parts.hostname
+    if not host:
+        raise ProbeError("URL has no host")
+    try:
+        port = parts.port or _DEFAULT_RTSP_PORT
+    except ValueError as exc:
+        # urlsplit defers port validation to `.port` access — a garbage port
+        # in the URL surfaces here, not at parse time.
+        raise ProbeError(f"invalid port in URL: {exc}") from exc
+    # Port check happens before DNS: there is no reason to resolve a host we
+    # would refuse to connect to anyway.
+    _guard_port(port, allowed_ports)
+    return await _resolve_pinned_ip(host)
 
 
 def _digest_header(
@@ -239,33 +281,16 @@ async def probe_rtsp(
     password: str | None = None,
     allowed_ports: Iterable[int] = DEFAULT_ALLOWED_PORTS,
 ) -> ProbeResult:
-    try:
-        parts = urlsplit(url)
-    except ValueError as exc:
-        raise ProbeError(f"malformed URL: {exc}") from exc
-    if parts.scheme != "rtsp":
-        raise ProbeError(f"unsupported scheme {parts.scheme!r} — only rtsp:// is probed")
-    host = parts.hostname
-    if not host:
-        raise ProbeError("URL has no host")
-    try:
-        port = parts.port or _DEFAULT_RTSP_PORT
-    except ValueError as exc:
-        # urlsplit defers port validation to `.port` access — a garbage port
-        # in the URL surfaces here, not at parse time.
-        raise ProbeError(f"invalid port in URL: {exc}") from exc
-    # Port check happens before DNS: there is no reason to resolve a host we
-    # would refuse to connect to anyway.
-    _guard_port(port, allowed_ports)
-
-    ip = await _resolve_pinned_ip(host)
+    ip = await validate_rtsp_url(url, allowed_ports=allowed_ports)
+    parts = urlsplit(url)
+    port = parts.port or _DEFAULT_RTSP_PORT
 
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(ip, port), timeout=_CONNECT_TIMEOUT_S
         )
     except (OSError, TimeoutError) as exc:
-        raise ProbeError(f"could not connect to {host}:{port} ({ip}): {exc}") from exc
+        raise ProbeError(f"could not connect to {parts.hostname}:{port} ({ip}): {exc}") from exc
 
     try:
         session = _RTSPSession(reader, writer, url)
