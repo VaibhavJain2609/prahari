@@ -212,6 +212,15 @@ export default function CameraDrawer({
                 )}
               </Section>
 
+              <Section title="Evidence">
+                {/* The clip-pull chain (docs/EVIDENCE.md): a stored, audited
+                    request naming this camera + a window. The request's
+                    `evidence_ref` is the edge-side locator; a playback ticket
+                    can be minted once issued — real bytes land when MediaMTX
+                    recording does. */}
+                <EvidenceRequestPanel cameraId={camera.id} purposeCode={code} onError={setActionError} />
+              </Section>
+
               <Section title="Lifecycle">
                 <Row k="State" v={camera.lifecycle} />
                 <Row k="In catalogue" v={camera.present_in_catalogue ? "yes" : "no"} />
@@ -446,5 +455,114 @@ function EditForm({
         </button>
       </div>
     </form>
+  );
+}
+
+// The evidence-request form: one audited POST per request (the purpose code
+// rides the body because it is part of the durable record). After creation
+// the panel shows the stored request and can mint its playback ticket —
+// every step is its own row in the hash-chained audit log.
+function EvidenceRequestPanel({
+  cameraId,
+  purposeCode,
+  onError,
+}: {
+  cameraId: string;
+  purposeCode: string | null;
+  onError: (msg: string | null) => void;
+}) {
+  const [start, setStart] = useState("");
+  const [end, setEnd] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [created, setCreated] = useState<import("@/lib/api").EvidenceRequest | null>(null);
+  const [ticket, setTicket] = useState<import("@/lib/api").EvidenceTicket | null>(null);
+
+  const input =
+    "w-full rounded border border-slate-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-800 dark:focus:ring-slate-500";
+
+  async function submit() {
+    if (!purposeCode || !start || !end) return;
+    setBusy(true);
+    onError(null);
+    try {
+      const req = await api.createEvidenceRequest({
+        camera_id: cameraId,
+        start_ts: new Date(start).toISOString(),
+        end_ts: new Date(end).toISOString(),
+        purpose_code: purposeCode,
+      });
+      setCreated(req);
+    } catch (err) {
+      onError(err instanceof ApiError ? err.message : "evidence request failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function mint() {
+    if (!created || !purposeCode) return;
+    setBusy(true);
+    onError(null);
+    try {
+      setTicket(await api.mintEvidenceTicket(created.id, purposeCode));
+    } catch (err) {
+      onError(err instanceof ApiError ? err.message : "ticket mint failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!created) {
+    return (
+      <div className="space-y-2">
+        <div className="flex gap-2">
+          <input
+            type="datetime-local"
+            aria-label="Clip start"
+            value={start}
+            onChange={(e) => setStart(e.target.value)}
+            className={input}
+          />
+          <input
+            type="datetime-local"
+            aria-label="Clip end"
+            value={end}
+            onChange={(e) => setEnd(e.target.value)}
+            className={input}
+          />
+        </div>
+        <button
+          type="button"
+          disabled={!purposeCode || !start || !end || busy}
+          onClick={submit}
+          className="rounded-md border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+        >
+          {busy ? "Requesting…" : "Request clip (audited)"}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-1 text-xs">
+      <Row k="Request" v={created.id} mono />
+      <Row k="Status" v={created.status} />
+      <Row k="Window" v={`${created.start_ts.slice(0, 16)} → ${created.end_ts.slice(11, 16)}`} />
+      <Row k="Clip ref" v={created.evidence_ref} mono />
+      {ticket ? (
+        <p className="text-emerald-600 dark:text-emerald-400">
+          playback ticket issued — expires in {ticket.expires_in}s
+        </p>
+      ) : (
+        <button
+          type="button"
+          disabled={busy || !purposeCode}
+          onClick={mint}
+          className="rounded-md bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-slate-400"
+        >
+          {busy ? "Minting…" : "Mint playback ticket"}
+        </button>
+      )}
+    </div>
   );
 }

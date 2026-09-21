@@ -337,6 +337,30 @@ export type PreviewTicket = {
   expires_in: number;
 };
 
+// The audited evidence-request chain (docs/EVIDENCE.md): a stored request
+// naming a camera and a window, minting a playback-scoped ticket after the
+// audit row lands. `evidence_ref` is the edge-side clip locator — real clip
+// bytes land when MediaMTX recording does.
+export type EvidenceRequest = {
+  id: string;
+  camera_id: string;
+  purpose_code: string;
+  start_ts: string;
+  end_ts: string;
+  evidence_ref: string;
+  status: "pending" | "issued" | "expired";
+  created_at: string;
+  ticket_expires_at: string | null;
+};
+
+export type EvidenceTicket = {
+  request_id: string;
+  camera_id: string;
+  ticket: string;
+  evidence_ref: string;
+  expires_in: number;
+};
+
 export const api = {
   // Escape hatch for endpoints that don't need a named method yet —
   // useBFF(path) calls this. Same-origin proxy, same 401 handling.
@@ -348,6 +372,25 @@ export const api = {
     request<PreviewTicket>("media/preview-ticket", {
       method: "POST",
       body: JSON.stringify({ camera_id: cameraId }),
+      purposeCode,
+    }),
+
+  // Evidence requests put the purpose code in the BODY — it is part of the
+  // durable record, not a per-call header.
+  createEvidenceRequest: (body: {
+    camera_id: string;
+    start_ts: string;
+    end_ts: string;
+    purpose_code: string;
+  }) =>
+    request<EvidenceRequest>("evidence/requests", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  mintEvidenceTicket: (requestId: string, purposeCode: string) =>
+    request<EvidenceTicket>(`evidence/requests/${requestId}/ticket`, {
+      method: "POST",
       purposeCode,
     }),
 
