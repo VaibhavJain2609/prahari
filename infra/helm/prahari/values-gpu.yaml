@@ -31,10 +31,14 @@ postgres:
   storage: 50Gi
 
 # This profile REQUIRES the `prahari-internal` Secret (internal-token,
-# worker-token, credential-key): pods refuse to start without it rather than
-# booting with empty tokens — empty means every internal gate silently OFF.
-# Create it before install (`make internal-secret` or Terraform); locally it
-# stays optional because enforcement-off is the documented dev default.
+# bff-token, correlation-token, inference-token, worker-token,
+# credential-key): pods refuse to start without it rather than booting with
+# empty tokens — empty means every internal gate silently OFF. With the
+# per-service keys present the gates run "isolated": each caller
+# authenticates as its own identity. Create it before install
+# (`make internal-secret` — also tops an existing Secret up with any missing
+# keys — or Terraform); locally it stays optional because enforcement-off is
+# the documented dev default.
 security:
   internalSecretRequired: true
 

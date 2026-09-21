@@ -105,6 +105,99 @@ def test_empty_token_disables_enforcement(repo):
     assert TestClient(app).get("/api/v1/streams/paths").status_code == 200
 
 
+# --- isolated mode: per-service caller tokens ---------------------------------
+
+
+class TestIsolatedInternalTokens:
+    """With `internal_tokens` configured the gate resolves a presented token
+    to a caller identity and checks it against the registry's allowlist
+    (bff, correlation, inference — plus the `internal` compat identity
+    `internal_token` still resolves to). A token that is VALID but belongs
+    to a caller this service does not accept must be denied — that is the
+    entire point of per-service credentials."""
+
+    CALLERS = {"bff": "tok-bff", "correlation": "tok-cor", "inference": "tok-inf"}
+
+    @pytest.fixture
+    def isolated(self, repo):
+        app.state.settings = RegistrySettings(
+            internal_token=TOKEN,
+            internal_tokens=dict(self.CALLERS),
+            sync_enabled=False,
+        )
+        return TestClient(app)
+
+    def test_every_allowlisted_caller_is_accepted(self, isolated):
+        for token in self.CALLERS.values():
+            response = isolated.get("/api/v1/streams/paths", headers={"x-internal-token": token})
+            assert response.status_code == 200, token
+
+    def test_unknown_token_is_denied(self, isolated):
+        assert (
+            isolated.get("/api/v1/streams/paths", headers={"x-internal-token": "nope"}).status_code
+            == 401
+        )
+        assert isolated.get("/api/v1/streams/paths").status_code == 401
+
+    def test_shared_token_still_passes_as_internal_compat(self, isolated):
+        # The migration path: anything still holding the legacy shared token
+        # resolves to "internal", accepted everywhere.
+        assert isolated.get("/api/v1/streams/paths", headers=HEADERS).status_code == 200
+
+    def test_map_without_shared_token_arms_the_gate(self, repo):
+        # caller_tokens alone (internal_token unset) must still fail closed —
+        # a map is a gate configuration, not an absence of one.
+        app.state.settings = RegistrySettings(
+            internal_token="",
+            internal_tokens=dict(self.CALLERS),
+            sync_enabled=False,
+        )
+        client = TestClient(app)
+        assert client.get("/api/v1/streams/paths").status_code == 401
+        assert (
+            client.get("/api/v1/streams/paths", headers={"x-internal-token": "tok-bff"}).status_code
+            == 200
+        )
+
+
+class TestCallerTokenSettings:
+    """The settings plumbing the chart writes: PRAHARI_CALLER_TOKEN_* envs
+    merge into `internal_tokens`, and PRAHARI_INTERNAL_TOKENS accepts both
+    JSON and the comma form."""
+
+    def test_caller_token_envs_merge_into_the_map(self, monkeypatch):
+        monkeypatch.setenv("PRAHARI_CALLER_TOKEN_BFF", "tok-bff")
+        monkeypatch.setenv("PRAHARI_CALLER_TOKEN_CORRELATION", "tok-cor")
+        monkeypatch.setenv("PRAHARI_CALLER_TOKEN_INFERENCE", "tok-inf")
+        settings = RegistrySettings()
+        assert settings.internal_tokens == {
+            "bff": "tok-bff",
+            "correlation": "tok-cor",
+            "inference": "tok-inf",
+        }
+
+    def test_internal_tokens_json(self, monkeypatch):
+        monkeypatch.setenv("PRAHARI_INTERNAL_TOKENS", '{"bff": "tok-bff"}')
+        settings = RegistrySettings()
+        assert settings.internal_tokens == {"bff": "tok-bff"}
+
+    def test_internal_tokens_comma_form(self, monkeypatch):
+        monkeypatch.setenv("PRAHARI_INTERNAL_TOKENS", "bff:tok-bff,inference:tok-inf")
+        settings = RegistrySettings()
+        assert settings.internal_tokens == {"bff": "tok-bff", "inference": "tok-inf"}
+
+    def test_caller_token_env_beats_json_for_the_same_name(self, monkeypatch):
+        monkeypatch.setenv("PRAHARI_INTERNAL_TOKENS", '{"bff": "json-val"}')
+        monkeypatch.setenv("PRAHARI_CALLER_TOKEN_BFF", "env-val")
+        settings = RegistrySettings()
+        assert settings.internal_tokens["bff"] == "env-val"
+
+    def test_empty_envs_leave_the_map_empty(self, monkeypatch):
+        for name in ("PRAHARI_INTERNAL_TOKENS", "PRAHARI_CALLER_TOKEN_BFF"):
+            monkeypatch.delenv(name, raising=False)
+        assert RegistrySettings().internal_tokens == {}
+
+
 # --- streams/paths credential leak --------------------------------------------
 
 

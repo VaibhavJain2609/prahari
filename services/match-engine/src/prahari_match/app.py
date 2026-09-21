@@ -19,7 +19,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import PlainTextResponse
-from prahari_common.internal_auth import expected_token_ok, provided_token
+from prahari_common.internal_auth import caller_accepted, gate_posture, provided_token
 from pydantic import BaseModel
 
 from .alert_store import (
@@ -30,7 +30,7 @@ from .alert_store import (
 )
 from .alerts import AlertPublisher, FanOutPublisher, RedisStreamPublisher
 from .bloom import BloomFilter
-from .config import MatchSettings, match_settings
+from .config import ACCEPTED_CALLERS, MatchSettings, match_settings
 from .db import apply_migrations, create_pool
 from .dedup import Deduper
 from .detections import DetectionPublisher, NullDetectionPublisher, RedisDetectionPublisher
@@ -147,11 +147,15 @@ async def lifespan(app: FastAPI):
         )
     else:
         log.warning("PRAHARI_MATCH_REDIS_URL not set; alerts fan out only to /api/v1/alerts")
-    if not settings.internal_token:
+    posture = gate_posture(settings.internal_token, settings.internal_tokens)
+    if posture == "open":
         log.warning(
-            "internal auth disabled: PRAHARI_MATCH_INTERNAL_TOKEN is unset, so /api/* "
-            "and MetadataIngestService are reachable by anything that can reach this pod"
+            "internal auth disabled: neither PRAHARI_MATCH_INTERNAL_TOKEN nor a "
+            "caller-token map is set, so /api/* and MetadataIngestService are "
+            "reachable by anything that can reach this pod"
         )
+    else:
+        log.info("internal auth posture: %s", posture)
     fan_out: AlertPublisher = FanOutPublisher(publishers) if len(publishers) > 1 else publishers[0]
 
     detection_publisher: DetectionPublisher
@@ -204,14 +208,21 @@ async def require_internal_token(request: Request, call_next):
     depend on a secret being wired correctly to answer. `/metrics` is exempt
     too: Prometheus cannot hold a bearer credential for a pod scrape (and the
     observability NetworkPolicy restricts the port to the monitoring
-    namespace on any CNI that enforces it). Empty `internal_token` disables
-    the gate entirely (`expected_token_ok`)."""
+    namespace on any CNI that enforces it). With neither `internal_token` nor
+    `internal_tokens` configured the gate is off entirely (`caller_accepted`);
+    with `internal_tokens` set it runs isolated — a token must resolve to an
+    accepted caller (`inference`, `bff`), not merely match a shared value."""
     # Tests that build the app without lifespan never set app.state.settings —
     # an absent settings object means an absent token, which is gate-off anyway.
     settings: MatchSettings | None = getattr(request.app.state, "settings", None)
-    token = settings.internal_token if settings else ""
-    if token and request.url.path not in ("/healthz", "/readyz", "/metrics"):
-        if not expected_token_ok(provided_token(request.headers), token):
+    armed = bool(settings and (settings.internal_token or settings.internal_tokens))
+    if armed and request.url.path not in ("/healthz", "/readyz", "/metrics"):
+        if not caller_accepted(
+            provided_token(request.headers),
+            internal_token=settings.internal_token,
+            caller_tokens=settings.internal_tokens,
+            accepted_callers=ACCEPTED_CALLERS,
+        ):
             return Response(
                 status_code=status.HTTP_401_UNAUTHORIZED, content="internal token required"
             )
@@ -269,18 +280,37 @@ async def readyz(request: Request, store: StoreDep, response: Response) -> dict:
     (the configured pool can no longer serve a query). It is reported, not
     gated: a 503 here would restart pods while live alerting still works --
     history rides a different sink than the relay on purpose.
+
+    `internal_auth` reports the token gate's posture -- `isolated` |
+    `shared` | `open` -- so the credential model a pod is enforcing is
+    visible without reading its env.
     """
+    settings: MatchSettings | None = getattr(request.app.state, "settings", None)
+    posture = gate_posture(
+        settings.internal_token if settings else "",
+        settings.internal_tokens if settings else {},
+    )
     summary = _watchlist_summary(store)
     if summary["entries"] == 0:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return {"status": "unavailable", "reason": "watchlist has 0 entries", **summary}
+        return {
+            "status": "unavailable",
+            "reason": "watchlist has 0 entries",
+            "internal_auth": posture,
+            **summary,
+        }
     persistence = getattr(request.app.state, "persistence", "memory")
     if persistence == "postgres":
         try:
             await request.app.state.alert_pool.fetchval("SELECT 1")
         except Exception as exc:  # noqa: BLE001 - report the failure mode, any failure mode
             persistence = f"degraded ({type(exc).__name__})"
-    return {"status": "ready", "persistence": persistence, **summary}
+    return {
+        "status": "ready",
+        "persistence": persistence,
+        "internal_auth": posture,
+        **summary,
+    }
 
 
 @app.get("/metrics", tags=["ops"], response_class=PlainTextResponse)

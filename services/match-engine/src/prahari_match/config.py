@@ -6,8 +6,18 @@ checkout needs no `.env` to pass the Day 2 gate.
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Annotated
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from prahari_common.internal_auth import parse_caller_tokens
+from pydantic import field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+# Caller names this service accepts in isolated mode: the ingest workers on
+# the gRPC `MetadataIngestService` link and the BFF on the HTTP admin/alerts
+# surface. "internal" — the shared `internal_token` identity — is
+# additionally accepted on every service as the backward-compat path; see
+# prahari_common.internal_auth.caller_accepted.
+ACCEPTED_CALLERS = frozenset({"inference", "bff"})
 
 
 class MatchSettings(BaseSettings):
@@ -78,7 +88,49 @@ class MatchSettings(BaseSettings):
     exactly what access control exists for, and an unauthenticated
     `MetadataIngestService` lets anything cluster-reachable inject detections
     into the evidence trail. Empty disables both gates -- the local/dev
-    default; the chart arms it per profile."""
+    default; the chart arms it per profile.
+
+    When `internal_tokens` is configured this value keeps working as the
+    `"internal"` caller identity -- the backward-compat credential accepted
+    on every service for anything still holding the shared token."""
+
+    internal_tokens: Annotated[dict[str, str], NoDecode] = {}
+    """Caller-name -> token map for per-service isolation
+    (`PRAHARI_MATCH_INTERNAL_TOKENS`, JSON or `name:token` comma form).
+    Non-empty means both gates run "isolated" -- a presented token must
+    resolve to a caller in `ACCEPTED_CALLERS` (`inference`, `bff`) rather
+    than merely match the shared value, so a leaked worker token no longer
+    unlocks the admin surface. Empty falls back to the shared check on
+    `internal_token`, which is what keeps pre-isolation deployments working.
+
+    `NoDecode` keeps pydantic-settings from JSON-decoding the env value
+    itself, so the field validator sees the raw string and can accept the
+    comma form as well as JSON."""
+
+    caller_token_inference: str = ""
+    caller_token_bff: str = ""
+    """The chart's delivery mechanism for `internal_tokens`: Kubernetes env
+    expansion cannot assemble a JSON map from several `secretKeyRef`s, so the
+    chart emits `PRAHARI_MATCH_CALLER_TOKEN_{INFERENCE,BFF}` (the
+    `inference-token` / `bff-token` keys of `prahari-internal`) and the
+    validator below merges them in. A `caller_token_*` entry wins over the
+    same name in `internal_tokens` -- the specific env beats the
+    aggregate."""
+
+    @field_validator("internal_tokens", mode="before")
+    @classmethod
+    def _parse_internal_tokens(cls, value: object) -> dict[str, str]:
+        return parse_caller_tokens(value)
+
+    @model_validator(mode="after")
+    def _merge_caller_tokens(self) -> MatchSettings:
+        merged = dict(self.internal_tokens)
+        for name in ("inference", "bff"):
+            token = getattr(self, f"caller_token_{name}")
+            if token:
+                merged[name] = token
+        self.internal_tokens = merged
+        return self
 
     # --- watchlist -------------------------------------------------------
 

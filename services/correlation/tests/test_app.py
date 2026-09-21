@@ -103,6 +103,94 @@ class TestInternalToken:
             assert client.get("/healthz").status_code == 200
 
 
+class TestIsolatedInternalTokens:
+    """Isolated mode: `internal_tokens` configured means a presented token
+    must resolve to a caller this service accepts — `bff` only. A VALID
+    token belonging to another caller (inference) is denied, which is the
+    whole point of per-service credentials."""
+
+    def _isolated_client(self, monkeypatch) -> TestClient:
+        monkeypatch.setenv("PRAHARI_CORRELATION_INTERNAL_TOKEN", "tok-shared")
+        # The map holds BOTH callers so "a valid token belonging to a caller
+        # this service does not accept" is exercisable — the inference token
+        # resolves to a real identity and is still denied. The chart's
+        # per-key CALLER_TOKEN_* plumbing is covered in test_config.py.
+        monkeypatch.setenv(
+            "PRAHARI_CORRELATION_INTERNAL_TOKENS",
+            '{"bff": "tok-bff", "inference": "tok-inf"}',
+        )
+        store = DetectionStore(max_per_plate=10, max_plates=10)
+        app.dependency_overrides[get_store] = lambda: store
+        app.dependency_overrides[get_registry] = lambda: _FakeRegistry({})
+        return TestClient(app)
+
+    def _clear(self) -> None:
+        app.dependency_overrides.clear()
+
+    def test_bff_token_is_accepted(self, monkeypatch) -> None:
+        try:
+            with self._isolated_client(monkeypatch) as client:
+                response = client.get(
+                    "/api/v1/routes/GJ01AB1234", headers={"x-internal-token": "tok-bff"}
+                )
+        finally:
+            self._clear()
+        assert response.status_code == 200
+
+    def test_another_service_s_token_is_denied(self, monkeypatch) -> None:
+        # inference-token is a valid credential SOMEWHERE — just not here.
+        try:
+            with self._isolated_client(monkeypatch) as client:
+                response = client.get(
+                    "/api/v1/routes/GJ01AB1234",
+                    headers={"x-internal-token": "tok-inf"},
+                )
+        finally:
+            self._clear()
+        assert response.status_code == 401
+
+    def test_unknown_token_is_denied(self, monkeypatch) -> None:
+        try:
+            with self._isolated_client(monkeypatch) as client:
+                assert (
+                    client.get(
+                        "/api/v1/routes/GJ01AB1234",
+                        headers={"x-internal-token": "nope"},
+                    ).status_code
+                    == 401
+                )
+                assert client.get("/api/v1/routes/GJ01AB1234").status_code == 401
+        finally:
+            self._clear()
+
+    def test_shared_token_passes_as_internal_compat(self, monkeypatch) -> None:
+        # The migration path: the legacy shared token resolves to "internal",
+        # accepted on every service.
+        try:
+            with self._isolated_client(monkeypatch) as client:
+                response = client.get(
+                    "/api/v1/routes/GJ01AB1234",
+                    headers={"x-internal-token": "tok-shared"},
+                )
+        finally:
+            self._clear()
+        assert response.status_code == 200
+
+    def test_readyz_reports_the_isolated_posture(self, monkeypatch) -> None:
+        class _Connected:
+            def is_connected(self) -> bool:
+                return True
+
+        try:
+            with self._isolated_client(monkeypatch) as client:
+                app.dependency_overrides[get_consumer] = lambda: _Connected()
+                response = client.get("/readyz")
+        finally:
+            self._clear()
+        assert response.status_code == 200
+        assert response.json()["internal_auth"] == "isolated"
+
+
 class TestProbes:
     def test_healthz_never_touches_the_consumer(self) -> None:
         with _client() as client:
@@ -134,7 +222,11 @@ class TestProbes:
         finally:
             app.dependency_overrides.clear()
         assert response.status_code == 200
-        assert response.json() == {"status": "ready", "persistence": "in-memory"}
+        assert response.json() == {
+            "status": "ready",
+            "persistence": "in-memory",
+            "internal_auth": "open",
+        }
 
     def test_readyz_reports_postgres_persistence_when_the_db_pings(self) -> None:
         class _Connected:
@@ -153,7 +245,11 @@ class TestProbes:
         finally:
             app.dependency_overrides.clear()
         assert response.status_code == 200
-        assert response.json() == {"status": "ready", "persistence": "postgres"}
+        assert response.json() == {
+            "status": "ready",
+            "persistence": "postgres",
+            "internal_auth": "open",
+        }
 
     def test_readyz_is_unavailable_when_the_configured_db_is_down(self) -> None:
         # Configured-but-unreachable Postgres means the consumer can only

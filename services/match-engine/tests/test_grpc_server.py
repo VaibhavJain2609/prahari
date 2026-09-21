@@ -315,6 +315,31 @@ class TestServe:
         finally:
             server.stop(0)
 
+    def test_serve_arms_the_interceptor_on_a_caller_map_alone(self, monkeypatch) -> None:
+        # `internal_tokens` without `internal_token` must still gate — a
+        # configured caller map is an armed gate, not an absent one.
+        captured: dict = {}
+        real_server = grpc.server
+
+        def _spy(executor, options=None, interceptors=()):  # noqa: ANN001, ANN202
+            captured["interceptors"] = interceptors
+            return real_server(executor, options=options, interceptors=interceptors)
+
+        monkeypatch.setattr("prahari_match.grpc_server.grpc.server", _spy)
+
+        settings = MatchSettings(grpc_port=0, internal_tokens={"inference": "tok"})
+        server = serve(
+            _store_with("GJ01AB1234"),
+            Deduper(bucket_s=8.0, max_entries=1000),
+            NullPublisher(),
+            settings,
+        )
+        try:
+            assert len(captured["interceptors"]) == 1
+            assert isinstance(captured["interceptors"][0], InternalTokenInterceptor)
+        finally:
+            server.stop(0)
+
 
 class TestInternalTokenInterceptor:
     """`InternalTokenInterceptor` on a real loopback server -- the wire check
@@ -323,8 +348,8 @@ class TestInternalTokenInterceptor:
     directly like the tests above do.
 
     `serve()` only installs the interceptor when `MatchSettings.internal_token`
-    is set, so the empty-token case needs no wire test at all: no interceptor,
-    no check.
+    or `internal_tokens` is set, so the unconfigured case needs no wire test
+    at all: no interceptor, no check.
     """
 
     @pytest.fixture
@@ -367,6 +392,80 @@ class TestInternalTokenInterceptor:
                 self._request(), metadata=(("x-internal-token", "wrong"),)
             )
         assert exc.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+
+class TestIsolatedInternalTokenInterceptor:
+    """Isolated mode on the gRPC surface — the wire twin of
+    `TestIsolatedInternalTokens` in test_app.py. With a caller map
+    configured, metadata must resolve to an accepted caller identity
+    (`inference`, `bff`), not merely match a shared value."""
+
+    @pytest.fixture
+    def isolated_server(self):
+        store = _store_with("GJ01AB1234")
+        servicer, _recent, _detections = _servicer(store)
+        server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=2),
+            interceptors=[
+                InternalTokenInterceptor(
+                    "tok-shared",
+                    caller_tokens={
+                        "inference": "tok-inf",
+                        "bff": "tok-bff",
+                        "correlation": "tok-cor",
+                    },
+                    accepted_callers={"inference", "bff"},
+                )
+            ],
+        )
+        adapter_pb2_grpc.add_MetadataIngestServiceServicer_to_server(servicer, server)
+        port = server.add_insecure_port("127.0.0.1:0")
+        server.start()
+        channel = grpc.insecure_channel(f"127.0.0.1:{port}")
+        try:
+            yield adapter_pb2_grpc.MetadataIngestServiceStub(channel)
+        finally:
+            channel.close()
+            server.stop(grace=None)
+
+    def _request(self) -> Iterator[adapter_pb2.StreamDetectionsRequest]:
+        return iter(
+            [adapter_pb2.StreamDetectionsRequest(detection=_detection("CAM-1", "GJ01AB1234"))]
+        )
+
+    def test_inference_caller_reaches_the_servicer(self, isolated_server) -> None:
+        response = isolated_server.StreamDetections(
+            self._request(), metadata=(("x-internal-token", "tok-inf"),)
+        )
+        assert response.ack.accepted == 1
+
+    def test_bff_caller_is_accepted(self, isolated_server) -> None:
+        response = isolated_server.StreamDetections(
+            self._request(), metadata=(("x-internal-token", "tok-bff"),)
+        )
+        assert response.ack.accepted == 1
+
+    def test_a_known_but_unaccepted_caller_is_denied(self, isolated_server) -> None:
+        # correlation's token resolves to a real identity — just not one this
+        # service accepts. A leaked per-service token opens nothing else.
+        with pytest.raises(grpc.RpcError) as exc:
+            isolated_server.StreamDetections(
+                self._request(), metadata=(("x-internal-token", "tok-cor"),)
+            )
+        assert exc.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+    def test_an_unknown_token_is_denied(self, isolated_server) -> None:
+        with pytest.raises(grpc.RpcError) as exc:
+            isolated_server.StreamDetections(
+                self._request(), metadata=(("x-internal-token", "nope"),)
+            )
+        assert exc.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+    def test_the_shared_token_passes_as_internal_compat(self, isolated_server) -> None:
+        response = isolated_server.StreamDetections(
+            self._request(), metadata=(("x-internal-token", "tok-shared"),)
+        )
+        assert response.ack.accepted == 1
 
 
 class TestStreamHealth:

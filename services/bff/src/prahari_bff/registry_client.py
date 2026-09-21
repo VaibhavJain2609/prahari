@@ -28,7 +28,13 @@ class RegistryClient:
         self._client = client or httpx.AsyncClient(
             base_url=settings.registry_base_url,
             timeout=settings.registry_timeout_s,
-            headers={"X-Internal-Token": settings.registry_internal_token},
+            # One caller identity per service: `internal_token` is the BFF's
+            # own credential (resolves to `bff` on isolated receivers);
+            # `registry_internal_token` survives as an optional override for
+            # deployments that still send the registry a distinct value.
+            headers={
+                "X-Internal-Token": settings.registry_internal_token or settings.internal_token
+            },
         )
 
     async def get(self, path: str, params: dict | None = None) -> httpx.Response:

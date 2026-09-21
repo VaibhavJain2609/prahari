@@ -84,6 +84,12 @@ _DELIBERATELY_INTERNAL = {
         "a memory/retention safety cap on the higher-rate stream, not something a "
         "profile tunes -- same reasoning as dedup_max_entries"
     ),
+    "internal_tokens": (
+        "the JSON/comma form of the caller map, for non-chart deployments; "
+        "the chart delivers the same map via PRAHARI_MATCH_CALLER_TOKEN_* "
+        "envs (one secretKeyRef per caller) because Kubernetes env expansion "
+        "cannot assemble a JSON object from several secretKeyRefs"
+    ),
 }
 
 

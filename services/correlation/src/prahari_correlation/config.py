@@ -6,8 +6,17 @@ gate without a `.env`.
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Annotated
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from prahari_common.internal_auth import parse_caller_tokens
+from pydantic import field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+# Caller names this service accepts in isolated mode: only the BFF — route
+# reconstruction is reached through the BFF's authenticated, audited proxy
+# and by nothing else. "internal" (the shared `internal_token` identity) is
+# additionally accepted on every service as the backward-compat path.
+ACCEPTED_CALLERS = frozenset({"bff"})
 
 
 class CorrelationSettings(BaseSettings):
@@ -116,7 +125,44 @@ class CorrelationSettings(BaseSettings):
     anything cluster-reachable can read route reconstructions, which are exactly
     the movement history the BFF's authorisation exists to control. Empty
     disables enforcement -- the local/dev default; the chart arms it per
-    profile."""
+    profile.
+
+    When `internal_tokens` is configured this value keeps working as the
+    `"internal"` caller identity -- the backward-compat credential accepted
+    on every service for anything still holding the shared token."""
+
+    internal_tokens: Annotated[dict[str, str], NoDecode] = {}
+    """Caller-name -> token map for per-service isolation
+    (`PRAHARI_CORRELATION_INTERNAL_TOKENS`, JSON or `name:token` comma form).
+    Non-empty means the gate runs "isolated" -- a presented token must
+    resolve to a caller in `ACCEPTED_CALLERS` (just `bff` here) rather than
+    merely match the shared value. Empty falls back to the shared check on
+    `internal_token`, which is what keeps pre-isolation deployments working.
+
+    `NoDecode` keeps pydantic-settings from JSON-decoding the env value
+    itself, so the field validator sees the raw string and can accept the
+    comma form as well as JSON."""
+
+    caller_token_bff: str = ""
+    """The chart's delivery mechanism for `internal_tokens`: Kubernetes env
+    expansion cannot assemble a JSON map from several `secretKeyRef`s, so the
+    chart emits `PRAHARI_CORRELATION_CALLER_TOKEN_BFF` (the `bff-token` key
+    of `prahari-internal`) and the validator below merges it in. Wins over a
+    `bff` entry in `internal_tokens` -- the specific env beats the
+    aggregate."""
+
+    @field_validator("internal_tokens", mode="before")
+    @classmethod
+    def _parse_internal_tokens(cls, value: object) -> dict[str, str]:
+        return parse_caller_tokens(value)
+
+    @model_validator(mode="after")
+    def _merge_caller_tokens(self) -> CorrelationSettings:
+        merged = dict(self.internal_tokens)
+        if self.caller_token_bff:
+            merged["bff"] = self.caller_token_bff
+        self.internal_tokens = merged
+        return self
 
     # --- registry client -----------------------------------------------------
 
@@ -124,9 +170,12 @@ class CorrelationSettings(BaseSettings):
     registry_timeout_s: float = 5.0
 
     registry_internal_token: str = ""
-    """Sent as `X-Internal-Token` on every registry call -- must match
-    `RegistrySettings.internal_token` on the other side exactly. Empty sends no
-    credential, matching the registry's empty-means-open gate."""
+    """Sent as `X-Internal-Token` on every registry call -- this service's own
+    caller identity, resolving to `correlation` on a registry running in
+    isolated mode (the chart wires it to the `correlation-token` key of
+    `prahari-internal`). Empty falls back to `internal_token` at the client
+    (the shared credential) and, failing that, sends no credential --
+    matching the registry's empty-means-open gate."""
 
 
 @lru_cache(maxsize=1)
