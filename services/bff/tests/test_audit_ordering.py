@@ -144,12 +144,13 @@ class FakeUserRepo:
 
 class _Request:
     """The pieces of `Request` the handlers touch: `await .json()` or
-    `await .body()` for payloads, `app.state.pool`/`.user_repo` for the
-    org lookups and repo writes."""
+    `await .body()`/`.stream()` for payloads, `app.state.pool`/`.user_repo`
+    for the org lookups and repo writes."""
 
     def __init__(self, json_body=None, raw_body: bytes = b"", pool=None, user_repo=None) -> None:
         self._json = json_body
         self._raw = raw_body
+        self.headers: dict = {}
         self.app = SimpleNamespace(
             state=SimpleNamespace(pool=pool or FakePool(), user_repo=user_repo or FakeUserRepo())
         )
@@ -159,6 +160,9 @@ class _Request:
 
     async def body(self) -> bytes:
         return self._raw
+
+    async def stream(self):
+        yield self._raw
 
 
 # --- the core ordering contract, exercised through create_camera -------------

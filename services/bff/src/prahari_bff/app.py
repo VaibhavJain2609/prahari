@@ -24,7 +24,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Literal
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 
 import asyncpg
 import httpx
@@ -78,7 +78,12 @@ from .security import SlidingWindowRateLimiter, verify_password
 log = logging.getLogger(__name__)
 
 
-async def _seed_bootstrap_admin(pool, settings: BFFSettings, user_repo: UserRepository) -> None:
+async def _seed_bootstrap_admin(
+    pool,
+    settings: BFFSettings,
+    user_repo: UserRepository,
+    audit: AuditLog | None = None,
+) -> None:
     """Create exactly one admin, once, only when the operator has explicitly
     asked for it and no user exists yet. See `BFFSettings.
     bootstrap_admin_username` for why this exists instead of a CLI."""
@@ -104,6 +109,23 @@ async def _seed_bootstrap_admin(pool, settings: BFFSettings, user_repo: UserRepo
             role="admin",
         )
     )
+    # Recorded after the create, best-effort: the seed runs inside lifespan,
+    # before any request exists, and the users row it wrote is itself the
+    # durable record — a failed append here is logged, not fatal. The
+    # strict `_audit_auth_event` ordering (audit before mutation) is for
+    # request paths where a failed append can still abort the mutation;
+    # there is nothing left to abort once the row exists.
+    if audit is not None:
+        try:
+            await audit.append(
+                actor=settings.bootstrap_admin_username,
+                org_path=settings.bootstrap_admin_org_path,
+                purpose_code="auth",
+                resource=f"user:{settings.bootstrap_admin_username}",
+                action="auth_admin_seeded",
+            )
+        except Exception as exc:  # noqa: BLE001 - log, never mask a successful seed
+            log.error("audit append failed for auth_admin_seeded: %s", exc)
     log.warning(
         "bootstrap admin '%s' created at org %r — this only ever runs once, while the "
         "users table is empty. Create a second admin and stop setting "
@@ -123,7 +145,12 @@ async def lifespan(app: FastAPI):
     session_repo = SessionRepository(pool)
     api_key_repo = ApiKeyRepository(pool)
 
-    await _seed_bootstrap_admin(pool, settings, user_repo)
+    # Built before the bootstrap seed so `auth_admin_seeded` lands in the
+    # same hash chain every other auth event does — the first account ever
+    # created on a deployment is exactly the row an auditor most wants to
+    # see recorded.
+    audit = AuditLog(settings.audit_db_path)
+    await _seed_bootstrap_admin(pool, settings, user_repo, audit=audit)
 
     registry = RegistryClient(settings)
     correlation = CorrelationClient(settings)
@@ -134,7 +161,6 @@ async def lifespan(app: FastAPI):
         root_scope=settings.state_root_org_path,
         ttl_s=settings.camera_org_cache_ttl_s,
     )
-    audit = AuditLog(settings.audit_db_path)
     media_issuer = MediaTicketIssuer(settings)
 
     app.state.pool = pool
@@ -324,10 +350,15 @@ async def _audit_event(
 ) -> None:
     """`_audit_access` for events with no Principal — authentication itself.
     A police platform's audit log that records every camera read but no
-    login is missing its most security-relevant entries. Non-fatal on
-    failure or a missing audit log: these wrap an already-failing or
-    session-establishing path (and a test app without lifespan has no
-    audit state at all)."""
+    login is missing its most security-relevant entries.
+
+    Best-effort, and ONLY for denied/failed attempts (`auth_login_denied`,
+    `oidc_link_denied`): the attempt failed anyway, so a lost row records a
+    loss that changed nothing — and a failed append must never mask the 401
+    the caller is owed, or turn a missing audit log into a second failure.
+    Successful authentication *mutations* take `_audit_auth_event` instead —
+    fail-closed, because a session that exists unrecorded is the exact hole
+    this log exists to close."""
     audit: AuditLog | None = getattr(request.app.state, "audit", None)
     if audit is None:
         return
@@ -341,6 +372,45 @@ async def _audit_event(
         )
     except Exception as exc:
         log.error("audit append failed for %s on %s: %s", action, resource, exc)
+
+
+async def _audit_auth_event(
+    request: Request,
+    *,
+    actor: str,
+    org_path: str,
+    resource: str,
+    action: str,
+) -> None:
+    """The fail-closed half of the auth-event pair — `_audit_access` for the
+    mutations authentication itself commits: a session minted (`auth_login`),
+    a session revoked (`auth_logout`), an SSO user provisioned
+    (`auth_user_provisioned`).
+
+    Same contract as `_audit_access` and `_audit_mutation`'s intent row: the
+    append lands BEFORE the mutation runs, and a failed append — or an audit
+    log that is absent entirely — aborts the request with 500 so no session
+    or account can ever commit unrecorded. Callers place this between
+    "credentials verified" and "mutation", never after."""
+    audit: AuditLog | None = getattr(request.app.state, "audit", None)
+    if audit is None:
+        log.error(
+            "audit log unavailable for %s on %s — refusing to commit unaudited",
+            action,
+            resource,
+        )
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "audit log unavailable")
+    try:
+        await audit.append(
+            actor=actor,
+            org_path=org_path,
+            purpose_code="auth",
+            resource=resource,
+            action=action,
+        )
+    except Exception as exc:
+        log.error("audit append failed for %s on %s: %s", action, resource, exc)
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "audit log unavailable") from exc
 
 
 async def _require_session_admin(
@@ -511,7 +581,10 @@ async def login(payload: LoginRequest, request: Request, response: Response) -> 
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
 
     org_path = await org_path_for_id(request.app.state.pool, user.org_id) or "-"
-    await _audit_event(
+    # Fail-closed, BEFORE the session row exists: a session minted while the
+    # audit log is down is a live credential no record can name, so a failed
+    # append is a 500 here — never a logged warning beside a minted session.
+    await _audit_auth_event(
         request,
         actor=user.username,
         org_path=org_path,
@@ -541,13 +614,15 @@ async def logout(request: Request, response: Response) -> dict:
     session_id = request.cookies.get(settings.session_cookie_name)
     if session_id:
         # Resolve BEFORE revoking — the revoked session no longer resolves.
-        # Audit before the revoke commits, the same ordering `_audit_mutation`
-        # enforces everywhere else: a destroyed session must never exist
-        # without a record of who signed out.
+        # Audit fail-closed before the revoke commits, the same ordering
+        # `_audit_mutation` enforces everywhere else: a destroyed session
+        # must never exist without a record of who signed out. An
+        # unresolvable (already-dead) session writes no row and is still
+        # revoked — there is nothing to record, and the cleanup is safe.
         resolved = await session_repo.resolve(session_id)
         if resolved is not None:
             user, org_path = resolved
-            await _audit_event(
+            await _audit_auth_event(
                 request,
                 actor=user.username,
                 org_path=org_path,
@@ -1130,6 +1205,34 @@ async def decommission_camera(
     )
 
 
+def _redact_url_credentials(url: str) -> str:
+    """`url` minus userinfo and query — the audit-log-safe form of an
+    operator-supplied stream URL.
+
+    The probe endpoint's audit `resource` names the URL being probed, and
+    the audit log is the immutable hash chain: `rtsp://user:pass@host/...`
+    written there verbatim would pin operator credentials into a log that
+    exists to be kept. Same rule the registry's `redact_url_credentials`
+    applies to its own diagnostic surface — reimplemented here rather than
+    imported because the BFF does not depend on the registry *package*
+    (their contract is HTTP, not code).
+
+    The query string is dropped entirely: some DVR/NVR lines accept
+    `?username=&password=` auth. `parts.port` is guarded — a malformed port
+    degrades to host-only rather than a 500 from the audit path.
+    """
+    parts = urlsplit(url)
+    netloc = parts.hostname or ""
+    if ":" in netloc and not netloc.startswith("["):
+        netloc = f"[{netloc}]"  # IPv6 literal — hostname strips the brackets
+    try:
+        if parts.port is not None:
+            netloc += f":{parts.port}"
+    except ValueError:
+        pass  # malformed port — emit host-only rather than fail the endpoint
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
 @app.post("/api/v1/cameras/probe", tags=["cameras"])
 async def probe_camera(
     principal: OperatorDep,
@@ -1145,6 +1248,15 @@ async def probe_camera(
     org — the registry endpoint itself has no principal concept to enforce
     that with."""
     body = await request.json()
+    # The URL goes upstream verbatim for the probe itself, but into the
+    # audit resource only redacted — the hash chain must never carry the
+    # credential-bearing form (or a query string DVRs accept as auth).
+    rtsp_url = body.get("rtsp_url")
+    resource = (
+        f"camera-probe:{_redact_url_credentials(rtsp_url)}"
+        if isinstance(rtsp_url, str)
+        else "camera-probe:<unparsable>"
+    )
 
     async def _probe() -> dict:
         return _forward_json(await registry.post("/api/v1/cameras/probe", json=body))
@@ -1153,7 +1265,7 @@ async def probe_camera(
         audit,
         principal,
         purpose_code=purpose_code,
-        resource=f"camera-probe:{body.get('rtsp_url', '')}",
+        resource=resource,
         action="probe",
         mutation=_probe,
     )
@@ -1239,6 +1351,41 @@ async def preview_ticket(
 # this is not a second, looser path. Row failures are collected rather than
 # aborting the batch, so one bad row does not cost the other 199.
 
+_IMPORT_MAX_BODY_BYTES = 2 * 1024 * 1024
+"""Largest CSV body `/api/v1/cameras/import` will accept. 2 MB is ~10x a
+generous 200-camera import with every column populated; anything bigger is
+not an import, it is a memory attack on a single-worker async service —
+`request.body()` buffers the whole thing, so the bound is enforced while
+streaming, before the payload can land in memory whole."""
+
+
+async def _read_bounded_body(request: Request, *, max_bytes: int) -> bytes:
+    """The request body, refusing anything over `max_bytes` with 413.
+
+    A declared Content-Length is checked before a single byte is read;
+    chunked or absent lengths are bounded while streaming so an oversized
+    body never assembles in full — `await request.body()` alone would bound
+    the *response*, not the memory."""
+    headers = getattr(request, "headers", None) or {}
+    declared = headers.get("content-length")
+    if declared is not None and declared.strip().isdigit() and int(declared) > max_bytes:
+        raise HTTPException(
+            status.HTTP_413_CONTENT_TOO_LARGE,
+            f"import body exceeds the {max_bytes}-byte limit",
+        )
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status.HTTP_413_CONTENT_TOO_LARGE,
+                f"import body exceeds the {max_bytes}-byte limit",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 _IMPORT_STRING_FIELDS = (
     "external_id",
     "site_name",
@@ -1286,7 +1433,7 @@ def _row_to_camera_payload(row: dict[str, str]) -> dict:
 async def import_cameras(
     principal: OperatorDep, registry: RegistryDep, audit: AuditDep, request: Request
 ) -> dict:
-    raw = (await request.body()).decode("utf-8-sig")
+    raw = (await _read_bounded_body(request, max_bytes=_IMPORT_MAX_BODY_BYTES)).decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(raw))
     if not reader.fieldnames or "external_id" not in reader.fieldnames:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "CSV must have an external_id column")
@@ -1640,17 +1787,24 @@ async def acknowledge_alert(
             action="alert_ack_denied",
         )
         raise HTTPException(status.HTTP_403_FORBIDDEN, "alert is outside your own org subtree")
-    await _audit_access(
+
+    async def _ack() -> dict:
+        # `_forward_json` inside the mutation so an upstream 4xx/5xx lands
+        # `alert_ack_failed` next to `alert_ack_requested` — the same
+        # convention every other mutation follows, instead of an `alert_ack`
+        # row written before the upstream call was even attempted.
+        return _forward_json(
+            await match_engine.post(f"/api/v1/alerts/{alert_id}/ack", {"by": principal.subject})
+        )
+
+    return await _audit_mutation(
         audit,
         principal,
         purpose_code=_ADMIN_PURPOSE,
         resource=f"alert:{alert_id}",
         action="alert_ack",
+        mutation=_ack,
     )
-    response = await match_engine.post(f"/api/v1/alerts/{alert_id}/ack", {"by": principal.subject})
-    if response.status_code >= 400:
-        return _forward_json(response)
-    return response.json()
 
 
 @app.get("/api/v1/alerts/stream", tags=["alerts"])
@@ -1840,19 +1994,35 @@ async def oidc_callback(request: Request, code: str = "", state: str = "") -> Re
     token = await oidc.exchange_code(code=code, verifier=str(sealed.get("v", "")))
     claims = await oidc.validate_id_token(token["id_token"], expected_nonce=state)
 
-    username = claims.get("preferred_username") or claims.get("sub")
-    if not username:
+    # `sub` is guaranteed present by validate_id_token (pyjwt `require`), and
+    # it is the ONLY claim account resolution may key on: `preferred_username`
+    # is mutable realm data, so keying the link on it would let a realm user
+    # named `admin` silently inherit the builtin admin account.
+    sub = claims["sub"]
+    if not sub:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "id_token carries no usable subject")
+    username = claims.get("preferred_username") or sub
     org_path_claim = validate_org_path_claim(claims)
 
-    # Resolve or JIT-provision. For an existing user Postgres stays
-    # authoritative — role and org come from the users row, and a present
-    # org_path claim is only a consistency check that must agree with it.
-    # For a new user the claim is the only org signal, so it is mandatory,
-    # alphabet-validated, and must name an org that actually exists.
-    resolved = await user_repo.get_by_username_with_hash(username)
-    if resolved is not None:
-        user, _password_hash = resolved
+    # Resolve or JIT-provision — by `sub` FIRST, and only by `sub`. The
+    # decided linking rule (security review L4):
+    #
+    #   * `sub` already bound to a users row → that account logs in;
+    #     Postgres stays authoritative for role and org, and a present
+    #     org_path claim is only a consistency check that must agree with
+    #     the row.
+    #   * `sub` unbound AND a user with the token's `preferred_username`
+    #     exists → DENY, audited `oidc_link_denied`. A builtin account is
+    #     never silently claimed by a same-named realm user, and an account
+    #     bound to a *different* sub is not re-bindable through this path
+    #     either. Binding an existing builtin account is an explicit admin
+    #     act (a migration/tool writes users.oidc_sub directly), not
+    #     something a login attempt can negotiate.
+    #   * `sub` unbound AND no username collision → JIT-provision a new
+    #     user row carrying this `sub`; the org_path claim is mandatory and
+    #     must name an org that exists.
+    user = await user_repo.get_by_oidc_sub(sub)
+    if user is not None:
         if user.disabled_at is not None:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "account is disabled")
         if org_path_claim is not None:
@@ -1863,6 +2033,20 @@ async def oidc_callback(request: Request, code: str = "", state: str = "") -> Re
                     "org_path claim does not match this account's org",
                 )
     else:
+        collision = await user_repo.get_by_username_with_hash(username)
+        if collision is not None:
+            await _audit_event(
+                request,
+                actor=f"oidc:{sub}",
+                org_path=org_path_claim or "-",
+                resource=f"user:{username}",
+                action="oidc_link_denied",
+            )
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "an account with this username already exists and is not linked "
+                "to this identity — an administrator must link it explicitly",
+            )
         if org_path_claim is None:
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
@@ -1871,29 +2055,32 @@ async def oidc_callback(request: Request, code: str = "", state: str = "") -> Re
         org_id = await pool.fetchval("SELECT id FROM orgs WHERE path = $1::ltree", org_path_claim)
         if org_id is None:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "org_path claim names no known org")
-        # Random unusable password: an SSO-provisioned row can never satisfy
-        # builtin password login, which remains the bootstrap admin's alone.
-        await _audit_event(
+        # Fail-closed before the row exists — a provisioned account with no
+        # audit row is a session-granting identity the log cannot name.
+        await _audit_auth_event(
             request,
             actor=username,
             org_path=org_path_claim,
             resource=f"user:{username}",
             action="auth_user_provisioned",
         )
+        # Random unusable password: an SSO-provisioned row can never satisfy
+        # builtin password login, which remains the bootstrap admin's alone.
         user = await user_repo.create(
             UserCreate(
                 username=username,
                 password=secrets.token_urlsafe(32),
                 org_id=str(org_id),
                 role=map_realm_role(claims),
-            )
+            ),
+            oidc_sub=sub,
         )
 
-    # Same event builtin login writes, in the same order — before the session
-    # row exists. Until now an SSO sign-in committed a session with no audit
-    # row at all.
+    # Same event builtin login writes, in the same order — fail-closed before
+    # the session row exists. A session minted while the audit log is down is
+    # a live credential no record can name.
     org_path = org_path_claim or await org_path_for_id(pool, user.org_id) or "-"
-    await _audit_event(
+    await _audit_auth_event(
         request,
         actor=user.username,
         org_path=org_path,
@@ -1939,12 +2126,15 @@ async def oidc_logout(request: Request, response: Response) -> dict:
     session_id = request.cookies.get(settings.session_cookie_name)
     if session_id:
         # Same event and same ordering as builtin `logout`: resolve (the
-        # revoked session no longer resolves), audit, then revoke. This path
-        # previously wrote no audit row at all.
+        # revoked session no longer resolves), audit fail-closed, then
+        # revoke. The actor is the session's OWN user — `resolve` returns
+        # the users row the session belongs to — never anything read from a
+        # token claim, so a forged or stale id_token cannot rename who
+        # signed out.
         resolved = await session_repo.resolve(session_id)
         if resolved is not None:
             user, org_path = resolved
-            await _audit_event(
+            await _audit_auth_event(
                 request,
                 actor=user.username,
                 org_path=org_path,

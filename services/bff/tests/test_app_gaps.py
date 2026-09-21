@@ -24,10 +24,13 @@ from prahari.v1 import events_pb2
 
 import prahari_bff.app as app_module
 from prahari_bff.app import (
+    _IMPORT_MAX_BODY_BYTES,
     _audit_event,
     _audit_mutation,
     _data_error_handler,
     _forward_json,
+    _read_bounded_body,
+    _redact_url_credentials,
     _seed_bootstrap_admin,
     _upstream_detail,
     acknowledge_alert,
@@ -413,6 +416,36 @@ async def test_bootstrap_admin_creates_the_first_admin_at_the_seed_org():
     assert created.role == Role.ADMIN
 
 
+async def test_bootstrap_admin_seed_writes_auth_admin_seeded():
+    """The lifespan now builds the audit log BEFORE the seed runs, so the
+    first account a deployment ever creates lands in the hash chain."""
+    repo = FakeUserRepo()
+    settings = SimpleNamespace(
+        bootstrap_admin_username="root",
+        bootstrap_admin_password="secret-pw",
+        bootstrap_admin_org_path="gj",
+    )
+    audit = FakeAudit()
+    await _seed_bootstrap_admin(FakePool(paths={"gj": "org-root"}), settings, repo, audit=audit)
+    assert [e["action"] for e in audit.entries] == ["auth_admin_seeded"]
+    assert audit.entries[0]["actor"] == "root"
+    assert audit.entries[0]["purpose_code"] == "auth"
+
+
+async def test_bootstrap_admin_seed_survives_a_failed_audit_append():
+    """Best-effort by design: the users row is itself the durable record of
+    the seed, so a dead audit store is logged, never fatal to boot."""
+    repo = FakeUserRepo()
+    settings = SimpleNamespace(
+        bootstrap_admin_username="root",
+        bootstrap_admin_password="secret-pw",
+        bootstrap_admin_org_path="gj",
+    )
+    audit = FakeAudit(fail_on={"*"})
+    await _seed_bootstrap_admin(FakePool(paths={"gj": "org-root"}), settings, repo, audit=audit)
+    assert len(repo.created) == 1
+
+
 # --- lifespan -----------------------------------------------------------------
 
 
@@ -557,6 +590,83 @@ async def test_logout_with_an_unresolvable_or_absent_session_still_clears_the_co
     request = _request(session_repo=session_repo, cookies={})
     assert await logout(request, Response()) == {"status": "ok"}
     assert session_repo.revoked == ["sess-x"]
+
+
+# --- fail-closed auth events (M3) --------------------------------------------------
+#
+# Successful auth mutations — a session minted or revoked — must never
+# commit unaudited. A failed append is a 500 BEFORE the mutation, not a
+# logged warning beside a committed one. Denied attempts keep the lenient
+# `_audit_event` (covered by test_login_denied_writes_an_auth_event...).
+
+
+async def test_login_with_a_failed_audit_append_500s_and_mints_no_session(monkeypatch):
+    monkeypatch.setattr(app_module, "verify_password", lambda pw, h: True)
+    user = User(id="u1", username="ops", org_id="org-zone4", role=Role.OPERATOR)
+    session_repo = FakeSessionRepo()
+    request = _request(
+        user_repo=FakeUserRepo(resolved=(user, hash_password("x"))),
+        session_repo=session_repo,
+        pool=FakePool({"org-zone4": "gj.ahmedabad_city.zone_4"}),
+        audit=FakeAudit(fail_on={"*"}),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await login(LoginRequest(username="ops", password="pw"), request, Response())
+    assert exc.value.status_code == 500
+    assert session_repo.created_for is None  # no session without its audit row
+
+
+async def test_login_with_no_audit_log_at_all_is_fail_closed(monkeypatch):
+    """`app.state.audit` absent (broken lifespan) is not a silent skip on the
+    success path — it is the same 500 as a failed append."""
+    monkeypatch.setattr(app_module, "verify_password", lambda pw, h: True)
+    user = User(id="u1", username="ops", org_id="org-zone4", role=Role.OPERATOR)
+    session_repo = FakeSessionRepo()
+    request = _request(  # deliberately no audit on state
+        user_repo=FakeUserRepo(resolved=(user, hash_password("x"))),
+        session_repo=session_repo,
+        pool=FakePool({"org-zone4": "gj.ahmedabad_city.zone_4"}),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await login(LoginRequest(username="ops", password="pw"), request, Response())
+    assert exc.value.status_code == 500
+    assert session_repo.created_for is None
+
+
+async def test_logout_with_a_failed_audit_append_500s_and_keeps_the_session():
+    """Revoking unaudited is the same hole as minting unaudited: the session
+    stays alive rather than dying unrecorded."""
+    user = User(id="u1", username="ops", org_id="org-zone4", role=Role.OPERATOR)
+    session_repo = FakeSessionRepo({"sess-1": (user, "gj.ahmedabad_city.zone_4")})
+    request = _request(
+        session_repo=session_repo,
+        cookies={"prahari_session": "sess-1"},
+        audit=FakeAudit(fail_on={"*"}),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await logout(request, Response())
+    assert exc.value.status_code == 500
+    assert session_repo.revoked == []
+
+
+async def test_logout_auth_row_lands_before_the_revoke_commits(monkeypatch):
+    """Ordering, not just presence: at the instant the session is revoked
+    the `auth_logout` row must already exist."""
+    user = User(id="u1", username="ops", org_id="org-zone4", role=Role.OPERATOR)
+    audit = FakeAudit()
+    seen_at_revoke: list[list[str]] = []
+
+    class RecordingSessions(FakeSessionRepo):
+        async def revoke(self, session_id: str):
+            seen_at_revoke.append([e["action"] for e in audit.entries])
+            await super().revoke(session_id)
+
+    session_repo = RecordingSessions({"sess-1": (user, "gj.ahmedabad_city.zone_4")})
+    request = _request(
+        session_repo=session_repo, cookies={"prahari_session": "sess-1"}, audit=audit
+    )
+    assert await logout(request, Response()) == {"status": "ok"}
+    assert seen_at_revoke == [["auth_logout"]]
 
 
 async def test_me_returns_the_principal():
@@ -821,16 +931,63 @@ async def test_probe_camera_audits_and_forwards_upstream_errors():
     assert audit.entries[-1]["action"] == "probe_failed"
 
 
+async def test_probe_audit_resource_redacts_credentials_and_query():
+    """The L1 finding: the audit `resource` used to carry the raw
+    `rtsp://user:pass@host/...` verbatim, pinning operator credentials into
+    the immutable hash chain. The upstream probe still gets the real URL —
+    only the log's copy is redacted."""
+    audit = FakeAudit()
+    registry = FakeRegistry(200, {"reachable": True})
+    url = "rtsp://operator:s3cret@10.0.0.1:554/cam1?token=abc123"
+    request = _json_request({"rtsp_url": url})
+    result = await probe_camera(OPERATOR, "case-1", registry, audit, request)
+    assert result == {"reachable": True}
+
+    resources = [e["resource"] for e in audit.entries]
+    assert resources == ["camera-probe:rtsp://10.0.0.1:554/cam1"] * 2
+    for entry in audit.entries:
+        assert "s3cret" not in entry["resource"]
+        assert "operator@" not in entry["resource"]
+        assert "token" not in entry["resource"]
+    # The credential-bearing form is still what the registry probes.
+    assert registry.calls[0][2]["rtsp_url"] == url
+
+
+async def test_probe_audit_resource_handles_a_nonstring_rtsp_url():
+    audit = FakeAudit()
+    registry = FakeRegistry(200, {"reachable": False})
+    request = _json_request({"rtsp_url": {"unexpected": "shape"}})
+    await probe_camera(OPERATOR, "case-1", registry, audit, request)
+    assert audit.entries[0]["resource"] == "camera-probe:<unparsable>"
+
+
+def test_redact_url_credentials_unit_cases():
+    assert _redact_url_credentials("rtsp://u:p@10.0.0.5:554/ch1") == "rtsp://10.0.0.5:554/ch1"
+    # Query strings drop entirely — DVRs accept ?username=&password= auth.
+    assert _redact_url_credentials("rtsp://u:p@dvr/live?x=1") == "rtsp://dvr/live"
+    # Credential-free URLs pass through untouched.
+    assert _redact_url_credentials("rtsp://10.0.0.5/ch") == "rtsp://10.0.0.5/ch"
+    # A malformed port degrades to host-only, never a raise from the audit path.
+    assert _redact_url_credentials("rtsp://u:p@dvr:abc/ch") == "rtsp://dvr/ch"
+    # IPv6 literals get their brackets back (hostname strips them).
+    assert _redact_url_credentials("rtsp://u:p@[fd00::1]:8554/ch") == "rtsp://[fd00::1]:8554/ch"
+
+
 # --- CSV import edge cases ---------------------------------------------------------
 
 
-def _csv_request(raw: bytes, **kwargs) -> SimpleNamespace:
+def _csv_request(raw: bytes, headers: dict | None = None, **kwargs) -> SimpleNamespace:
     request = _request(**kwargs)
+    request.headers = headers or {}
 
     async def _body():
         return raw
 
+    async def _stream():
+        yield raw
+
     request.body = _body
+    request.stream = _stream
     return request
 
 
@@ -915,6 +1072,45 @@ async def test_import_abort_mid_batch_writes_camera_import_failed():
         await import_cameras(OPERATOR, registry, audit, request)
     actions = [e["action"] for e in audit.entries]
     assert actions == ["camera_import_requested", "camera_import_failed"]
+
+
+async def test_import_body_over_the_size_cap_is_413():
+    """The L5 bound: the body is refused before any CSV parsing or upstream
+    call — a multi-megabyte POST is not an import, it is a memory attack."""
+    audit = FakeAudit()
+    registry = FakeRegistry(201, {"id": "x"})
+    big = b"external_id,site_name\n" + b"cam-x," + b"y" * _IMPORT_MAX_BODY_BYTES
+    request = _csv_request(big)
+    with pytest.raises(HTTPException) as exc:
+        await import_cameras(OPERATOR, registry, audit, request)
+    assert exc.value.status_code == 413
+    assert registry.calls == []
+    assert audit.entries == []  # refused before the intent row too
+
+
+async def test_import_declared_content_length_over_the_cap_is_413():
+    """A truthfully-declared oversized body is refused on the header alone —
+    the streaming bound stays as the backstop for chunked/lying lengths."""
+    request = _csv_request(
+        b"external_id\ncam-1\n",
+        headers={"content-length": str(_IMPORT_MAX_BODY_BYTES + 1)},
+    )
+    with pytest.raises(HTTPException) as exc:
+        await import_cameras(OPERATOR, FakeRegistry(201, {"id": "x"}), FakeAudit(), request)
+    assert exc.value.status_code == 413
+
+
+async def test_bounded_body_allows_exactly_the_cap_and_refuses_one_byte_more():
+    """The boundary itself, exercised on the helper: exactly `max_bytes` is
+    a body, one byte more is a 413."""
+    at_cap = _csv_request(b"x" * _IMPORT_MAX_BODY_BYTES)
+    assert len(await _read_bounded_body(at_cap, max_bytes=_IMPORT_MAX_BODY_BYTES)) == (
+        _IMPORT_MAX_BODY_BYTES
+    )
+    over = _csv_request(b"x" * (_IMPORT_MAX_BODY_BYTES + 1))
+    with pytest.raises(HTTPException) as exc:
+        await _read_bounded_body(over, max_bytes=_IMPORT_MAX_BODY_BYTES)
+    assert exc.value.status_code == 413
 
 
 # --- routes & export error paths ---------------------------------------------------
@@ -1037,7 +1233,9 @@ async def test_ack_alert_audits_and_proxies_the_ack():
     result = await acknowledge_alert("a1", OPERATOR, match, resolver, audit, _request())
     assert result == {"alert_id": "a1", "acknowledged": True}
     assert match.calls[-1] == ("POST", "/api/v1/alerts/a1/ack", {"by": "ops.zone4"})
-    assert [e["action"] for e in audit.entries] == ["alert_ack"]
+    # `_audit_mutation` ordering, same as every other mutation: intent row
+    # before the upstream POST, outcome row after it.
+    assert [e["action"] for e in audit.entries] == ["alert_ack_requested", "alert_ack"]
 
 
 async def test_ack_alert_forwards_an_ack_post_failure():
@@ -1054,6 +1252,26 @@ async def test_ack_alert_forwards_an_ack_post_failure():
     with pytest.raises(HTTPException) as exc:
         await acknowledge_alert("a1", OPERATOR, AckMatch(), resolver, audit, _request())
     assert exc.value.status_code == 409
+
+
+async def test_ack_alert_upstream_failure_writes_requested_then_failed():
+    """The M3 finding: an `alert_ack` row written BEFORE the upstream POST
+    means an upstream 500 leaves a success-looking row for a mutation that
+    never happened. `_audit_mutation` gives the honest pair instead."""
+    audit = FakeAudit()
+
+    class AckMatch(FakeMatchEngine):
+        def __init__(self):
+            super().__init__(200, {"alert_id": "a1", "detection": {"camera_id": "cam-1"}})
+
+        async def post(self, path, json=None):
+            return httpx.Response(500, json={"detail": "match engine exploded"})
+
+    resolver = FakeScopeResolver({"cam-1": "gj.ahmedabad_city.zone_4"})
+    with pytest.raises(HTTPException) as exc:
+        await acknowledge_alert("a1", OPERATOR, AckMatch(), resolver, audit, _request())
+    assert exc.value.status_code == 500
+    assert [e["action"] for e in audit.entries] == ["alert_ack_requested", "alert_ack_failed"]
 
 
 # --- SSE relay ---------------------------------------------------------------------

@@ -63,17 +63,25 @@ class UserRepository:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
 
-    async def create(self, payload: UserCreate) -> User:
+    async def create(self, payload: UserCreate, *, oidc_sub: str | None = None) -> User:
+        """`oidc_sub` binds the row to one Keycloak `sub` claim — set only on
+        the OIDC JIT path (migration 009_users_oidc_sub.sql). It stays a
+        keyword arg rather than a `UserCreate` field deliberately: the admin
+        `create_user` route takes `UserCreate` from request JSON, and a
+        caller-supplied `oidc_sub` there would let an admin claim arbitrary
+        realm identities — binding a builtin account is an explicit
+        migration/tooling act, not an API parameter."""
         row = await self._pool.fetchrow(
             """
-            INSERT INTO users (username, password_hash, org_id, role)
-            VALUES ($1, $2, $3::uuid, $4)
+            INSERT INTO users (username, password_hash, org_id, role, oidc_sub)
+            VALUES ($1, $2, $3::uuid, $4, $5)
             RETURNING id, username, org_id, role, created_at, disabled_at
             """,
             payload.username,
             hash_password(payload.password),
             payload.org_id,
             payload.role.value,
+            oidc_sub,
         )
         return _user_from_row(row)
 
@@ -142,6 +150,22 @@ class UserRepository:
         if row is None:
             return None
         return _user_from_row(row), row["password_hash"]
+
+    async def get_by_oidc_sub(self, sub: str) -> User | None:
+        """The account bound to this Keycloak `sub` claim, or None.
+
+        `sub` is the one claim the IdP guarantees is stable and unique per
+        realm user — it is the ONLY claim SSO account resolution may key on
+        (`preferred_username` is mutable and attacker-adjacent). Returns the
+        row disabled or not; the callback decides what a disabled link means.
+        `oidc_sub` itself is never projected onto `User` — like
+        `password_hash`, it is a lookup key, not API payload."""
+        row = await self._pool.fetchrow(
+            "SELECT id, username, org_id, role, created_at, disabled_at "
+            "FROM users WHERE oidc_sub = $1",
+            sub,
+        )
+        return _user_from_row(row) if row else None
 
     async def count(self) -> int:
         return await self._pool.fetchval("SELECT count(*) FROM users")

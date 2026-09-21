@@ -368,8 +368,13 @@ async def test_csv_import_writes_an_intent_then_outcome_audit_entry():
     async def _body():
         return b"external_id,site_name\ncam-1,Alpha\ncam-2,Beta\n"
 
+    async def _stream():
+        yield b"external_id,site_name\ncam-1,Alpha\ncam-2,Beta\n"
+
     request = _request()
+    request.headers = {}
     request.body = _body
+    request.stream = _stream
     result = await import_cameras(OPERATOR, registry, audit, request)
     assert result["succeeded"] == 2
     assert [e["action"] for e in audit.entries] == ["camera_import_requested", "camera_import"]

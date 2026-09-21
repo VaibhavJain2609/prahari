@@ -152,16 +152,44 @@ def _oidc(idp: FakeIdP) -> OidcClient:
 
 
 class FakeUserRepo:
-    def __init__(self, resolved=None) -> None:
+    """`resolved` answers the username lookup (collision check); `by_sub`
+    answers `get_by_oidc_sub` — an account already bound to an IdP subject.
+    `created`/`created_oidc_subs` record JIT provisioning calls."""
+
+    def __init__(self, resolved=None, by_sub: dict | None = None) -> None:
         self._resolved = resolved
+        self._by_sub = by_sub or {}
         self.created = []
+        self.created_oidc_subs: list[str | None] = []
+
+    async def get_by_oidc_sub(self, sub: str):
+        return self._by_sub.get(sub)
 
     async def get_by_username_with_hash(self, username: str):
         return self._resolved
 
-    async def create(self, payload):
+    async def create(self, payload, *, oidc_sub=None):
         self.created.append(payload)
+        self.created_oidc_subs.append(oidc_sub)
         return User(id="u-new", username=payload.username, org_id=payload.org_id, role=payload.role)
+
+
+class FakeAudit:
+    """Recording audit sink; `fail` turns every append into a store outage
+    for the fail-closed auth-event assertions."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.entries: list[dict] = []
+        self._fail = fail
+
+    async def append(self, **kwargs):
+        if self._fail:
+            raise RuntimeError("audit store unavailable")
+        self.entries.append(kwargs)
+        return kwargs
+
+    def actions(self) -> list[str]:
+        return [e["action"] for e in self.entries]
 
 
 class FakeSessionRepo:
@@ -202,6 +230,7 @@ def _request(
     user_repo=None,
     session_repo=None,
     pool=None,
+    audit=None,
     settings=SETTINGS,
 ):
     return SimpleNamespace(
@@ -213,6 +242,9 @@ def _request(
                 user_repo=user_repo or FakeUserRepo(),
                 session_repo=session_repo or FakeSessionRepo(),
                 pool=pool or FakePool(),
+                # Always present: successful auth mutations are fail-closed
+                # against it, which is exactly what several tests assert.
+                audit=audit if audit is not None else FakeAudit(),
             )
         ),
     )
@@ -312,12 +344,14 @@ async def test_callback_happy_path_jit_provisions_and_sets_session():
     )
 
     # JIT: one user row created, org from the validated claim, role mapped
-    # from realm roles, and a password nobody knows.
+    # from realm roles, a password nobody knows — and bound to the token's
+    # `sub`, so the NEXT login resolves by sub rather than username.
     assert len(user_repo.created) == 1
     created = user_repo.created[0]
     assert created.username == "ops.zone4"
     assert created.org_id == "org-zone4-uuid"
     assert created.role == Role.OPERATOR
+    assert user_repo.created_oidc_subs == ["kc-sub-1"]
     assert session_repo.created_for == "u-new"
 
     # The token exchange went server-side with the verifier from the cookie.
@@ -332,14 +366,16 @@ async def test_callback_happy_path_jit_provisions_and_sets_session():
 
 async def test_callback_existing_user_uses_db_role_and_org_not_claims():
     """Postgres is authoritative for established accounts: an IdP claiming
-    admin for a user who is a viewer here must not elevate them."""
+    admin for a user who is a viewer here must not elevate them. The account
+    resolves by its bound `sub`, not the username the token happens to
+    carry."""
     idp = FakeIdP()
     oidc = _oidc(idp)
     state, state_cookie = await _start_login(oidc)
     idp.id_token = _id_token(nonce=state, roles=("admin",), org_path=None)
 
     existing = User(id="u1", username="ops.zone4", org_id="org-zone4-uuid", role=Role.VIEWER)
-    user_repo = FakeUserRepo(resolved=(existing, "argon2-hash"))
+    user_repo = FakeUserRepo(by_sub={"kc-sub-1": existing})
     session_repo = FakeSessionRepo()
     pool = FakePool(org_paths={"org-zone4-uuid": "gj.ahmedabad_city.zone_4"})
     request = _request(
@@ -355,6 +391,62 @@ async def test_callback_existing_user_uses_db_role_and_org_not_claims():
     assert session_repo.created_for == "u1"
 
 
+async def test_callback_sub_link_survives_a_realm_username_rename():
+    """`sub` is the stable key: a realm user renamed in Keycloak still lands
+    on their bound account — the local username is never re-derived from
+    `preferred_username`."""
+    idp = FakeIdP()
+    oidc = _oidc(idp)
+    state, state_cookie = await _start_login(oidc)
+    idp.id_token = _id_token(nonce=state, username="renamed.zone4", org_path=None)
+
+    existing = User(id="u1", username="ops.zone4", org_id="org-zone4-uuid", role=Role.VIEWER)
+    session_repo = FakeSessionRepo()
+    request = _request(
+        oidc=oidc,
+        cookies={STATE_COOKIE_NAME: state_cookie},
+        user_repo=FakeUserRepo(by_sub={"kc-sub-1": existing}),
+        session_repo=session_repo,
+        pool=FakePool(org_paths={"org-zone4-uuid": "gj.ahmedabad_city.zone_4"}),
+    )
+    response = await oidc_callback(request, "auth-code-1", state)
+    assert response.status_code == 302
+    assert session_repo.created_for == "u1"  # the bound account, not "renamed.zone4"
+
+
+async def test_callback_username_collision_is_denied_and_audited():
+    """The L4 finding: a realm user whose `sub` is not yet bound must not
+    silently claim a same-named builtin account — a Keycloak `admin` would
+    otherwise inherit the local admin. Collision → 403 + `oidc_link_denied`,
+    no session, no provisioning."""
+    idp = FakeIdP()
+    oidc = _oidc(idp)
+    state, state_cookie = await _start_login(oidc)
+    idp.id_token = _id_token(nonce=state, username="admin", sub="kc-attacker-1")
+
+    builtin_admin = User(id="u0", username="admin", org_id="org-root", role=Role.ADMIN)
+    user_repo = FakeUserRepo(resolved=(builtin_admin, "argon2-hash"))  # unlinked builtin
+    session_repo = FakeSessionRepo()
+    audit = FakeAudit()
+    request = _request(
+        oidc=oidc,
+        cookies={STATE_COOKIE_NAME: state_cookie},
+        user_repo=user_repo,
+        session_repo=session_repo,
+        pool=FakePool(org_ids={"gj.ahmedabad_city.zone_4": "org-zone4-uuid"}),
+        audit=audit,
+    )
+    with pytest.raises(HTTPException) as exc:
+        await oidc_callback(request, "auth-code-1", state)
+    assert exc.value.status_code == 403
+    assert session_repo.created_for is None  # no session minted
+    assert user_repo.created == []  # nothing provisioned
+    denied = [e for e in audit.entries if e["action"] == "oidc_link_denied"]
+    assert len(denied) == 1
+    assert denied[0]["actor"] == "oidc:kc-attacker-1"
+    assert denied[0]["resource"] == "user:admin"
+
+
 async def test_callback_existing_user_with_mismatched_org_path_claim_is_denied():
     idp = FakeIdP()
     oidc = _oidc(idp)
@@ -365,7 +457,7 @@ async def test_callback_existing_user_with_mismatched_org_path_claim_is_denied()
     request = _request(
         oidc=oidc,
         cookies={STATE_COOKIE_NAME: state_cookie},
-        user_repo=FakeUserRepo(resolved=(existing, "h")),
+        user_repo=FakeUserRepo(by_sub={"kc-sub-1": existing}),
         pool=FakePool(org_paths={"org-zone4-uuid": "gj.ahmedabad_city.zone_4"}),
     )
     with pytest.raises(HTTPException) as exc:
@@ -389,7 +481,7 @@ async def test_callback_disabled_existing_user_is_denied():
     request = _request(
         oidc=oidc,
         cookies={STATE_COOKIE_NAME: state_cookie},
-        user_repo=FakeUserRepo(resolved=(existing, "h")),
+        user_repo=FakeUserRepo(by_sub={"kc-sub-1": existing}),
     )
     with pytest.raises(HTTPException) as exc:
         await oidc_callback(request, "auth-code-1", state)
@@ -556,6 +648,97 @@ async def test_oidc_logout_of_a_builtin_session_returns_no_end_session_url():
     result = await oidc_logout(request, Response())
     assert result == {"status": "ok"}
     assert session_repo.revoked == ["sess-1"]
+
+
+# --- fail-closed auth events (M3) ------------------------------------------------
+
+
+async def test_callback_failed_auth_login_append_500s_and_mints_no_session():
+    """A session minted while the audit store is down is a live credential
+    the hash chain cannot name — the append failure must abort BEFORE
+    `session_repo.create`, never log-and-continue beside it."""
+    idp = FakeIdP()
+    oidc = _oidc(idp)
+    state, state_cookie = await _start_login(oidc)
+    idp.id_token = _id_token(nonce=state, org_path=None)
+
+    existing = User(id="u1", username="ops.zone4", org_id="org-zone4-uuid", role=Role.VIEWER)
+    session_repo = FakeSessionRepo()
+    request = _request(
+        oidc=oidc,
+        cookies={STATE_COOKIE_NAME: state_cookie},
+        user_repo=FakeUserRepo(by_sub={"kc-sub-1": existing}),
+        session_repo=session_repo,
+        pool=FakePool(org_paths={"org-zone4-uuid": "gj.ahmedabad_city.zone_4"}),
+        audit=FakeAudit(fail=True),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await oidc_callback(request, "auth-code-1", state)
+    assert exc.value.status_code == 500
+    assert session_repo.created_for is None
+
+
+async def test_callback_failed_provisioned_append_500s_and_creates_no_user():
+    """`auth_user_provisioned` is fail-closed the same way: a JIT account
+    with no audit row is an identity the log cannot name."""
+    idp = FakeIdP()
+    oidc = _oidc(idp)
+    state, state_cookie = await _start_login(oidc)
+    idp.id_token = _id_token(nonce=state)
+
+    user_repo = FakeUserRepo(resolved=None)
+    request = _request(
+        oidc=oidc,
+        cookies={STATE_COOKIE_NAME: state_cookie},
+        user_repo=user_repo,
+        pool=FakePool(org_ids={"gj.ahmedabad_city.zone_4": "org-zone4-uuid"}),
+        audit=FakeAudit(fail=True),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await oidc_callback(request, "auth-code-1", state)
+    assert exc.value.status_code == 500
+    assert user_repo.created == []
+
+
+async def test_callback_collision_denial_survives_a_broken_audit_log():
+    """The DENIAL row stays best-effort (`_audit_event`): a failed append on
+    `oidc_link_denied` must not turn the 403 into a 500 — the refusal is
+    the correct answer whether or not it gets recorded."""
+    idp = FakeIdP()
+    oidc = _oidc(idp)
+    state, state_cookie = await _start_login(oidc)
+    idp.id_token = _id_token(nonce=state, username="admin", sub="kc-attacker-1")
+
+    builtin_admin = User(id="u0", username="admin", org_id="org-root", role=Role.ADMIN)
+    request = _request(
+        oidc=oidc,
+        cookies={STATE_COOKIE_NAME: state_cookie},
+        user_repo=FakeUserRepo(resolved=(builtin_admin, "h")),
+        pool=FakePool(org_ids={"gj.ahmedabad_city.zone_4": "org-zone4-uuid"}),
+        audit=FakeAudit(fail=True),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await oidc_callback(request, "auth-code-1", state)
+    assert exc.value.status_code == 403  # still denied, not 500
+
+
+async def test_oidc_logout_with_a_failed_audit_append_500s_and_keeps_the_session():
+    """Revoking unaudited is the same hole as minting unaudited — the OIDC
+    logout path follows builtin logout's fail-closed ordering."""
+    idp = FakeIdP()
+    oidc = _oidc(idp)
+    user = User(id="u1", username="ops.zone4", org_id="org-z4", role=Role.OPERATOR)
+    session_repo = FakeSessionRepo({"sess-1": (user, "gj.ahmedabad_city.zone_4")})
+    request = _request(
+        oidc=oidc,
+        session_repo=session_repo,
+        cookies={"prahari_session": "sess-1", OIDC_MARKER_COOKIE_NAME: "1"},
+        audit=FakeAudit(fail=True),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await oidc_logout(request, Response())
+    assert exc.value.status_code == 500
+    assert session_repo.revoked == []
 
 
 # --- disabled -----------------------------------------------------------------
