@@ -139,14 +139,13 @@ neither falls through to the ticket check.
   which is an edge/DVR concern on the 80k estate, not a central one. The
   ticket already grants `playback`, so flipping the value is the only change
   the chain needs — nothing here moves.
-- **`VehicleDetection.evidence_ref`.** The proto field
-  (`events.proto:28`) exists and flows through correlation's route hops,
-  but nothing populates it — `prahari_inference`'s `to_protobuf`
-  (`detect/pipeline.py`) builds detections without it, and stamping it
-  (camera + `observed_at` → `prahari://evidence/<camera>/<ts>`) is a change
-  to the inference/correlation services, outside this branch's file set.
-  The request-level `evidence_ref` on `evidence_requests` is populated;
-  per-detection population is a separate, small piece of work.
+- **`VehicleDetection.evidence_ref` resolution.** The field
+  (`events.proto:28`) is now stamped at the producer — `to_protobuf`
+  writes `prahari://evidence/<camera>/<epoch>` per detection and it flows
+  through correlation's route hops unchanged. What remains is a resolver:
+  nothing yet turns that locator into an `evidence_requests` row or a
+  `dvr://` window — a hop's `evidence_ref` is currently a pointer for a
+  human, not a clickable path.
 - **Ticket revocation.** `ticket_jti` is recorded so a denylist *could* be
   checked at the auth callback later; none is implemented — the 300 s TTL
   is the containment, same posture as the 60 s preview ticket.

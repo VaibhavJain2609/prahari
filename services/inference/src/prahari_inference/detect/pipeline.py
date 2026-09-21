@@ -159,6 +159,12 @@ class DetectionPipeline:
                     vehicle_class=vehicle.vehicle_class,
                     vehicle_confidence=vehicle.confidence,
                     plate=_plate_reading(candidate) if candidate is not None else None,
+                    # Pointer to the edge-held footage, never the pixels —
+                    # the locator `docs/EVIDENCE.md` names so a detection can
+                    # be traced back to its clip: `prahari://evidence/<cam>/<epoch>`.
+                    evidence_ref=(
+                        f"prahari://evidence/{result.camera_id}/{observed_at.wall_clock.seconds}"
+                    ),
                 )
             )
         return detections

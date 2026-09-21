@@ -272,3 +272,18 @@ class TestProtobufConversion:
 
         assert wire.observed_at.pts_ms == 9999
         assert wire.observed_at.loop_epoch == 3
+
+    def test_evidence_ref_locates_the_edge_footage_not_the_pixels(self):
+        """`evidence_ref` is the locator `docs/EVIDENCE.md` names —
+        `prahari://evidence/<camera>/<epoch>` — so a route hop can point at
+        the clip it came from without a pixel ever leaving the edge."""
+        settings = _settings(motion_gate=False)
+        pipeline = DetectionPipeline(ScriptedVehicleDetector(), ScriptedPlateReader(), settings)
+        result = pipeline.process_batch([_frame("cam-7")])[0]
+        result.vehicles.append(VehicleBox(0, 0, 1, 1, "car", 0.9))
+
+        wire = pipeline.to_protobuf(result)[0]
+
+        epoch = wire.observed_at.wall_clock.seconds
+        assert epoch == 1_700_000_000
+        assert wire.evidence_ref == f"prahari://evidence/cam-7/{epoch}"
