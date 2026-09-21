@@ -191,9 +191,7 @@ async def test_create_stores_a_pending_request_with_dvr_ref():
     assert result.camera_id == "cam-7"
     assert result.org_path == "gj.ahmedabad_city.zone_4.ward_9"
     assert result.requested_by == "ops.zone4"
-    assert result.evidence_ref == (
-        f"dvr://cam-7/{int(START.timestamp())}-{int(END.timestamp())}"
-    )
+    assert result.evidence_ref == (f"dvr://cam-7/{int(START.timestamp())}-{int(END.timestamp())}")
     assert audit.actions() == ["evidence_requested"]
     assert audit.entries[0]["purpose_code"] == "incident-441"
 
@@ -221,9 +219,7 @@ async def test_failed_audit_append_means_no_row_is_stored():
         await create_evidence_request(
             _payload(),
             OPERATOR,
-            _request(
-                pool=pool, audit=audit, camera_orgs={"cam-7": "gj.ahmedabad_city.zone_4"}
-            ),
+            _request(pool=pool, audit=audit, camera_orgs={"cam-7": "gj.ahmedabad_city.zone_4"}),
         )
     assert exc.value.status_code == 500
     assert pool.rows == {}
@@ -271,14 +267,10 @@ async def test_window_beyond_the_configured_max_is_rejected():
 async def test_reversed_or_naive_windows_are_rejected():
     request = _request(camera_orgs={"cam-7": "gj.ahmedabad_city.zone_4"})
     with pytest.raises(HTTPException):
-        await create_evidence_request(
-            _payload(start_ts=END, end_ts=START), OPERATOR, request
-        )
+        await create_evidence_request(_payload(start_ts=END, end_ts=START), OPERATOR, request)
     naive = START.replace(tzinfo=None)
     with pytest.raises(HTTPException):
-        await create_evidence_request(
-            _payload(start_ts=naive, end_ts=END), OPERATOR, request
-        )
+        await create_evidence_request(_payload(start_ts=naive, end_ts=END), OPERATOR, request)
 
 
 # --- ticket mint -----------------------------------------------------------------
