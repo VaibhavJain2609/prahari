@@ -9,13 +9,15 @@ Design doc: docs/EVIDENCE.md. The short version:
   `pending` `evidence_requests` row carrying a `dvr://<camera>/<start>-<end>`
   locator.
 * `POST /api/v1/evidence/requests/{id}/ticket` — re-checks scope against the
-  org recorded on the request, writes `evidence_issued`, then mints an
-  Ed25519 MediaMTX ticket granting `read` + `playback` on `cam-<id>`. The
-  playback grant exists before any recording does, so enabling `record` on
-  the reconciled paths later changes nothing on this path.
+  camera's LIVE org (a request-time `org_path` would keep minting for a
+  camera since reassigned out of the caller's subtree), writes
+  `evidence_issued`, then mints an Ed25519 MediaMTX ticket granting `read`
+  + `playback` on `cam-<id>`. The playback grant exists before any
+  recording does, so enabling `record` on the reconciled paths later
+  changes nothing on this path.
 * `GET /api/v1/evidence/requests/{id}` — scoped read of one request's state
   (`pending` | `issued` | `expired`, the last derived from the ticket's
-  `exp`, never a stored transition).
+  `exp`, never a stored transition), live-org scoped the same way.
 * `GET /api/v1/evidence/requests` — admin-only scoped listing, audit-logged.
 
 What this module does NOT do is move bytes: MediaMTX recording is off
@@ -373,16 +375,22 @@ async def get_evidence_request(
     purpose_code: PurposeCodeDep,
     request: Request,
 ) -> EvidenceRequest:
-    """One request's state. Scoped to the org recorded on the row and
-    purpose-coded like every evidence-adjacent read — `evidence_read` on
-    success, `evidence_read_denied` across the subtree boundary."""
+    """One request's state. Purpose-coded like every evidence-adjacent read —
+    `evidence_read` on success, `evidence_read_denied` across the subtree
+    boundary. Scoped against the camera's LIVE org, not the request-time
+    `org_path` on the row: a camera since reassigned out of the caller's
+    subtree must not keep answering "here is the footage request you made"
+    to the scope it left. The stored path survives only for the admin list
+    view, where it records whose subtree the request was made in."""
     audit: AuditLog = request.app.state.audit
+    resolver: CameraScopeResolver = request.app.state.scope_resolver
     repo = EvidenceRepository(request.app.state.pool)
 
     evidence = await repo.get(request_id)
     if evidence is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no evidence request {request_id}")
-    if not in_scope(evidence.org_path, principal.org_path):
+    live_org_path = await resolver.org_path_for_camera(evidence.camera_id)
+    if live_org_path is None or not in_scope(live_org_path, principal.org_path):
         await _audit(
             audit,
             principal,
@@ -420,16 +428,27 @@ async def mint_evidence_ticket(
     `evidence_issued` is appended BEFORE the credential exists — fail-closed,
     same ordering as preview-ticket minting. Re-minting is allowed (every
     mint is its own audit row and `ticket_jti` tracks the latest grant).
+
+    Scope is checked against the camera's LIVE org, resolved root-scoped at
+    mint time exactly like `preview_ticket` — NOT the `org_path` the row
+    stored at request time. A camera reassigned out of the caller's subtree
+    between request and mint must stop minting tickets the moment it leaves:
+    the stored path is a historical record (whose subtree was asked), and
+    what a mint authorises is footage access NOW. An unresolvable camera
+    fails closed as a denial — the ticket is a bearer credential, and
+    "cannot confirm scope" is not "in scope".
     """
     settings: BFFSettings = request.app.state.settings
     audit: AuditLog = request.app.state.audit
     issuer: MediaTicketIssuer = request.app.state.media_issuer
+    resolver: CameraScopeResolver = request.app.state.scope_resolver
     repo = EvidenceRepository(request.app.state.pool)
 
     evidence = await repo.get(request_id)
     if evidence is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no evidence request {request_id}")
-    if not in_scope(evidence.org_path, principal.org_path):
+    live_org_path = await resolver.org_path_for_camera(evidence.camera_id)
+    if live_org_path is None or not in_scope(live_org_path, principal.org_path):
         await _audit(
             audit,
             principal,

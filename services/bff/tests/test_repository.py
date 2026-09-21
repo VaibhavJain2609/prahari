@@ -164,7 +164,34 @@ async def test_user_create_inserts_a_hash_never_the_plaintext():
     assert "INSERT INTO users" in query
     assert args[0] == "ops.zone4"
     assert args[1] != "long-enough-password"  # argon2 hash, not the plaintext
-    assert args[2:] == ("org-zone4", "operator")
+    assert args[2:] == ("org-zone4", "operator", None)  # builtin: no oidc_sub
+
+
+async def test_user_create_with_oidc_sub_binds_the_row():
+    """The OIDC JIT path's binding — `sub` lands in the insert, not on
+    `UserCreate` (an admin-facing payload must not carry it)."""
+    pool = ScriptedPool(row=_user_row())
+    repo = UserRepository(pool)
+    payload = UserCreate(
+        username="ops.zone4", password="long-enough-password", org_id="org-zone4", role="operator"
+    )
+    await repo.create(payload, oidc_sub="kc-sub-1")
+    _, query, args = pool.calls[0]
+    assert "oidc_sub" in query
+    assert args[-1] == "kc-sub-1"
+
+
+async def test_get_by_oidc_sub_resolves_the_bound_account():
+    pool = ScriptedPool(row=_user_row())
+    user = await UserRepository(pool).get_by_oidc_sub("kc-sub-1")
+    assert user is not None and user.username == "ops.zone4"
+    _, query, args = pool.calls[0]
+    assert "WHERE oidc_sub = $1" in query
+    assert args == ("kc-sub-1",)
+
+
+async def test_get_by_oidc_sub_missing_is_none():
+    assert await UserRepository(ScriptedPool()).get_by_oidc_sub("ghost") is None
 
 
 async def test_user_get_maps_the_row():

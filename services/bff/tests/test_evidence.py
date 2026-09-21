@@ -191,9 +191,7 @@ async def test_create_stores_a_pending_request_with_dvr_ref():
     assert result.camera_id == "cam-7"
     assert result.org_path == "gj.ahmedabad_city.zone_4.ward_9"
     assert result.requested_by == "ops.zone4"
-    assert result.evidence_ref == (
-        f"dvr://cam-7/{int(START.timestamp())}-{int(END.timestamp())}"
-    )
+    assert result.evidence_ref == (f"dvr://cam-7/{int(START.timestamp())}-{int(END.timestamp())}")
     assert audit.actions() == ["evidence_requested"]
     assert audit.entries[0]["purpose_code"] == "incident-441"
 
@@ -221,9 +219,7 @@ async def test_failed_audit_append_means_no_row_is_stored():
         await create_evidence_request(
             _payload(),
             OPERATOR,
-            _request(
-                pool=pool, audit=audit, camera_orgs={"cam-7": "gj.ahmedabad_city.zone_4"}
-            ),
+            _request(pool=pool, audit=audit, camera_orgs={"cam-7": "gj.ahmedabad_city.zone_4"}),
         )
     assert exc.value.status_code == 500
     assert pool.rows == {}
@@ -271,14 +267,10 @@ async def test_window_beyond_the_configured_max_is_rejected():
 async def test_reversed_or_naive_windows_are_rejected():
     request = _request(camera_orgs={"cam-7": "gj.ahmedabad_city.zone_4"})
     with pytest.raises(HTTPException):
-        await create_evidence_request(
-            _payload(start_ts=END, end_ts=START), OPERATOR, request
-        )
+        await create_evidence_request(_payload(start_ts=END, end_ts=START), OPERATOR, request)
     naive = START.replace(tzinfo=None)
     with pytest.raises(HTTPException):
-        await create_evidence_request(
-            _payload(start_ts=naive, end_ts=END), OPERATOR, request
-        )
+        await create_evidence_request(_payload(start_ts=naive, end_ts=END), OPERATOR, request)
 
 
 # --- ticket mint -----------------------------------------------------------------
@@ -305,7 +297,15 @@ async def test_ticket_carries_read_and_playback_on_the_camera_path():
     request_id = await _pending_request(pool)
 
     result = await mint_evidence_ticket(
-        request_id, OPERATOR, "incident-441", _request(pool=pool, audit=audit, issuer=issuer)
+        request_id,
+        OPERATOR,
+        "incident-441",
+        _request(
+            pool=pool,
+            audit=audit,
+            issuer=issuer,
+            camera_orgs={"cam-7": "gj.ahmedabad_city.zone_4"},
+        ),
     )
 
     payload = _decode_ticket(issuer, result.ticket)
@@ -334,7 +334,54 @@ async def test_ticket_mint_out_of_scope_is_denied_and_audited():
 
     with pytest.raises(HTTPException) as exc:
         await mint_evidence_ticket(
-            request_id, outsider, "incident-441", _request(pool=pool, audit=audit)
+            request_id,
+            outsider,
+            "incident-441",
+            _request(
+                pool=pool,
+                audit=audit,
+                camera_orgs={"cam-7": "gj.ahmedabad_city.zone_4"},
+            ),
+        )
+    assert exc.value.status_code == 403
+    assert audit.actions() == ["evidence_issue_denied"]
+    assert pool.rows[request_id]["status"] == "pending"
+
+
+async def test_ticket_mint_checks_the_cameras_live_org_not_the_stored_one():
+    """The security finding: scope frozen at request time. The request was
+    made while cam-7 sat inside zone_4 (the stored org_path proves it) — the
+    camera has since been reassigned to Surat, so the same caller must NOT
+    keep minting tickets. Live re-resolution turns this into a denial."""
+    pool, audit = FakeEvidencePool(), FakeAudit()
+    request_id = await _pending_request(pool)
+    assert pool.rows[request_id]["org_path"] == "gj.ahmedabad_city.zone_4"  # frozen at request
+
+    with pytest.raises(HTTPException) as exc:
+        await mint_evidence_ticket(
+            request_id,
+            OPERATOR,  # still scoped to zone_4 — the camera no longer is
+            "incident-441",
+            _request(pool=pool, audit=audit, camera_orgs={"cam-7": "gj.surat_city"}),
+        )
+    assert exc.value.status_code == 403
+    assert audit.actions() == ["evidence_issue_denied"]
+    assert pool.rows[request_id]["status"] == "pending"
+
+
+async def test_ticket_mint_for_an_unresolvable_camera_fails_closed():
+    """A camera the scope resolver can no longer place is denied, not
+    defaulted-in: the ticket is a bearer credential and 'cannot confirm
+    scope' is not 'in scope'."""
+    pool, audit = FakeEvidencePool(), FakeAudit()
+    request_id = await _pending_request(pool)
+
+    with pytest.raises(HTTPException) as exc:
+        await mint_evidence_ticket(
+            request_id,
+            OPERATOR,
+            "incident-441",
+            _request(pool=pool, audit=audit, camera_orgs={}),  # resolver miss
         )
     assert exc.value.status_code == 403
     assert audit.actions() == ["evidence_issue_denied"]
@@ -362,7 +409,10 @@ async def test_get_returns_state_and_audits_the_read():
     request_id = await _pending_request(pool)
 
     result = await get_evidence_request(
-        request_id, OPERATOR, "incident-441", _request(pool=pool, audit=audit)
+        request_id,
+        OPERATOR,
+        "incident-441",
+        _request(pool=pool, audit=audit, camera_orgs={"cam-7": "gj.ahmedabad_city.zone_4"}),
     )
     assert result.status == "pending"
     assert audit.actions() == ["evidence_read"]
@@ -377,7 +427,10 @@ async def test_get_reports_expired_once_the_ticket_ages_out():
     row["ticket_expires_at"] = NOW - timedelta(minutes=5)
 
     result = await get_evidence_request(
-        request_id, OPERATOR, "incident-441", _request(pool=pool, audit=audit)
+        request_id,
+        OPERATOR,
+        "incident-441",
+        _request(pool=pool, audit=audit, camera_orgs={"cam-7": "gj.ahmedabad_city.zone_4"}),
     )
     assert result.status == "expired"  # derived, never a stored transition
 
@@ -389,7 +442,28 @@ async def test_get_out_of_scope_is_denied_and_audited():
 
     with pytest.raises(HTTPException) as exc:
         await get_evidence_request(
-            request_id, outsider, "incident-441", _request(pool=pool, audit=audit)
+            request_id,
+            outsider,
+            "incident-441",
+            _request(pool=pool, audit=audit, camera_orgs={"cam-7": "gj.ahmedabad_city.zone_4"}),
+        )
+    assert exc.value.status_code == 403
+    assert audit.actions() == ["evidence_read_denied"]
+
+
+async def test_get_follows_the_cameras_live_org_after_a_reassignment():
+    """Same live-scope rule as mint: the request was stored while cam-7 was
+    in zone_4, but its read now resolves the camera's CURRENT org — a
+    reassignment away from the caller's subtree closes the read too."""
+    pool, audit = FakeEvidencePool(), FakeAudit()
+    request_id = await _pending_request(pool)
+
+    with pytest.raises(HTTPException) as exc:
+        await get_evidence_request(
+            request_id,
+            OPERATOR,
+            "incident-441",
+            _request(pool=pool, audit=audit, camera_orgs={"cam-7": "gj.surat_city"}),
         )
     assert exc.value.status_code == 403
     assert audit.actions() == ["evidence_read_denied"]
