@@ -82,6 +82,26 @@ async def test_tampering_a_row_is_detected_at_that_row(tmp_path):
     assert broken == second.id
 
 
+async def test_a_broken_prev_hash_link_is_detected_at_that_row(tmp_path):
+    """Tampering with the *link* rather than the payload: a row whose stored
+    `prev_hash` no longer names the row before it breaks the chain even if
+    every stored hash still recomputes — verify() names the broken link."""
+    log = _log(tmp_path)
+    await log.append(actor="a", org_path="gj", purpose_code="p", resource="r1", action="read")
+    second = await log.append(
+        actor="a", org_path="gj", purpose_code="p", resource="r2", action="read"
+    )
+
+    conn = sqlite3.connect(str(log._db_path))
+    conn.execute("UPDATE audit_log SET prev_hash = ? WHERE id = ?", ("f" * 64, second.id))
+    conn.commit()
+    conn.close()
+
+    ok, broken = await log.verify()
+    assert ok is False
+    assert broken == second.id
+
+
 async def test_denied_action_is_appended_like_any_other_entry(tmp_path):
     log = _log(tmp_path)
     entry = await log.append(

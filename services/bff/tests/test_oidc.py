@@ -10,6 +10,8 @@ split is exercised, not just asserted.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import time
 from datetime import UTC, datetime, timedelta
@@ -29,6 +31,7 @@ from prahari_bff.models import Role, User
 from prahari_bff.oidc import (
     OIDC_MARKER_COOKIE_NAME,
     STATE_COOKIE_NAME,
+    STATE_TTL_S,
     OidcClient,
     map_realm_role,
     safe_next,
@@ -71,6 +74,8 @@ def _id_token(
     roles=("operator",),
     org_path="gj.ahmedabad_city.zone_4",
     username="ops.zone4",
+    sub="kc-sub-1",
+    iat_delta=0,
     exp_delta=300,
     azp="prahari-bff",
 ) -> str:
@@ -78,42 +83,65 @@ def _id_token(
     claims = {
         "iss": iss,
         "aud": aud,
-        "sub": "kc-sub-1",
-        "iat": now,
+        "sub": sub,
+        "iat": now + iat_delta,
         "exp": now + exp_delta,
         "preferred_username": username,
         "realm_access": {"roles": list(roles)},
         "azp": azp,
     }
+    if username is None:
+        claims.pop("preferred_username")
     if nonce:
         claims["nonce"] = nonce
     if org_path is not None:
         claims["org_path"] = org_path
-    return pyjwt.encode(claims, key, algorithm="RS256", headers={"kid": kid})
+    headers = {} if kid is None else {"kid": kid}
+    return pyjwt.encode(claims, key, algorithm="RS256", headers=headers)
 
 
 class FakeIdP:
     """The token + JWKS endpoints, nothing else. `id_token` is set per test so
-    one transport serves both happy-path and adversarial tokens."""
+    one transport serves both happy-path and adversarial tokens. The status/
+    body overrides script the failure modes (IdP 500s, unreachable transport,
+    a JWKS document with a junk key in it)."""
 
-    def __init__(self, id_token: str = "") -> None:
+    def __init__(
+        self,
+        id_token: str = "",
+        *,
+        token_status: int = 200,
+        token_body: dict | None = None,
+        jwks_status: int = 200,
+        jwks_body: dict | None = None,
+        fail: bool = False,
+    ) -> None:
         self.id_token = id_token
         self.token_requests: list[dict] = []
+        self._token_status = token_status
+        self._token_body = token_body
+        self._jwks_status = jwks_status
+        self._jwks_body = jwks_body
+        self._fail = fail
 
     def handler(self, request: httpx.Request) -> httpx.Response:
+        if self._fail:
+            raise httpx.ConnectError("idp unreachable")
         if request.url.path == "/realms/prahari/protocol/openid-connect/token":
             form = {k: v[0] for k, v in parse_qs(request.content.decode()).items()}
             self.token_requests.append(form)
-            return httpx.Response(
-                200,
-                json={
-                    "id_token": self.id_token,
-                    "access_token": "at",
-                    "token_type": "Bearer",
-                },
-            )
+            if self._token_status != 200:
+                return httpx.Response(self._token_status, json={"error": "invalid_grant"})
+            body = self._token_body or {
+                "id_token": self.id_token,
+                "access_token": "at",
+                "token_type": "Bearer",
+            }
+            return httpx.Response(200, json=body)
         if request.url.path == "/realms/prahari/protocol/openid-connect/certs":
-            return httpx.Response(200, json=_jwks())
+            if self._jwks_status != 200:
+                return httpx.Response(self._jwks_status, json={"error": "boom"})
+            return httpx.Response(200, json=self._jwks_body or _jwks())
         return httpx.Response(404)
 
 
@@ -577,3 +605,360 @@ def test_safe_next_rejects_off_origin_values():
     assert safe_next("//evil.example") == "/"
     assert safe_next(None) == "/"
     assert safe_next("") == "/"
+
+
+def test_safe_next_rejects_control_characters():
+    """A `\n` or `\r` in `next` would land in the callback's Location header —
+    CR/LF injection territory, so it collapses to `/` like any other oddity."""
+    assert safe_next("/ok\r\nLocation: https://evil.example") == "/"
+    assert safe_next("/ok\tevil") == "/"
+
+
+# --- OidcClient construction --------------------------------------------------
+
+
+def test_oidc_client_requires_issuer_url():
+    with pytest.raises(RuntimeError, match="oidc_issuer_url"):
+        OidcClient(BFFSettings(oidc_enabled=True, oidc_redirect_base=REDIRECT_BASE))
+
+
+def test_oidc_client_requires_redirect_base():
+    with pytest.raises(RuntimeError, match="oidc_redirect_base"):
+        OidcClient(BFFSettings(oidc_enabled=True, oidc_issuer_url=ISSUER))
+
+
+def test_oidc_client_redirect_uri_and_internal_fallback():
+    client = OidcClient(
+        BFFSettings(
+            oidc_enabled=True,
+            oidc_issuer_url=ISSUER + "/",  # trailing slash is stripped
+            oidc_redirect_base=REDIRECT_BASE,
+        )
+    )
+    # No internal URL configured: server-to-server calls fall back to the
+    # public issuer.
+    assert client.redirect_uri == f"{REDIRECT_BASE}/api/bff/auth/oidc/callback"
+    assert client._internal == ISSUER
+
+
+# --- token exchange failures ----------------------------------------------------
+
+
+async def _callback_after_login(oidc: OidcClient, **request_kwargs):
+    """Run the login leg, then the callback — the shared preamble for every
+    exchange/validation failure test."""
+    state, state_cookie = await _start_login(oidc)
+    request = _request(oidc=oidc, cookies={STATE_COOKIE_NAME: state_cookie}, **request_kwargs)
+    return request, state
+
+
+async def test_callback_idp_unreachable_is_502():
+    oidc = _oidc(FakeIdP(fail=True))
+    request, state = await _callback_after_login(oidc)
+    with pytest.raises(HTTPException) as exc:
+        await oidc_callback(request, "auth-code", state)
+    assert exc.value.status_code == 502
+
+
+async def test_callback_token_exchange_rejection_is_401():
+    """Keycloak refusing the code (replayed, wrong verifier) is a 401 — the
+    IdP's own error body is never echoed into the response."""
+    oidc = _oidc(FakeIdP(token_status=400))
+    request, state = await _callback_after_login(oidc)
+    with pytest.raises(HTTPException) as exc:
+        await oidc_callback(request, "auth-code", state)
+    assert exc.value.status_code == 401
+
+
+async def test_callback_token_response_without_id_token_is_502():
+    oidc = _oidc(FakeIdP(token_body={"access_token": "at", "token_type": "Bearer"}))
+    request, state = await _callback_after_login(oidc)
+    with pytest.raises(HTTPException) as exc:
+        await oidc_callback(request, "auth-code", state)
+    assert exc.value.status_code == 502
+
+
+# --- id_token validation failures -----------------------------------------------
+
+
+async def test_callback_malformed_id_token_is_401():
+    idp = FakeIdP()
+    oidc = _oidc(idp)
+    request, state = await _callback_after_login(oidc)
+    # Not a JWT at all — the unverified-header parse fails before anything else.
+    idp.id_token = "not-a-jwt"
+    with pytest.raises(HTTPException) as exc:
+        await oidc_callback(request, "auth-code", state)
+    assert exc.value.status_code == 401
+
+
+async def test_callback_disallowed_algorithm_is_401():
+    """An HS256 token is rejected at the alg allowlist — before any JWKS
+    fetch, so a confused-deputy downgrade never gets that far."""
+    idp = FakeIdP()
+    oidc = _oidc(idp)
+    state, state_cookie = await _start_login(oidc)
+    hs_token = pyjwt.encode(
+        {
+            "iss": ISSUER,
+            "aud": "prahari-bff",
+            "sub": "x",
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 300,
+        },
+        "shared-secret",
+        algorithm="HS256",
+        headers={"kid": "test-key"},
+    )
+    idp.id_token = hs_token
+    request = _request(oidc=oidc, cookies={STATE_COOKIE_NAME: state_cookie})
+    with pytest.raises(HTTPException) as exc:
+        await oidc_callback(request, "auth-code", state)
+    assert exc.value.status_code == 401
+    assert "unexpected token algorithm" in str(exc.value.detail)
+
+
+async def test_callback_token_without_kid_is_401():
+    idp = FakeIdP()
+    oidc = _oidc(idp)
+    state, state_cookie = await _start_login(oidc)
+    idp.id_token = _id_token(nonce=state, kid=None)
+    request = _request(oidc=oidc, cookies={STATE_COOKIE_NAME: state_cookie})
+    with pytest.raises(HTTPException) as exc:
+        await oidc_callback(request, "auth-code", state)
+    assert exc.value.status_code == 401
+
+
+async def test_callback_unknown_kid_fails_closed_after_one_refetch():
+    """A kid the JWKS doesn't carry triggers exactly one forced refetch (key
+    rotation), then the login is denied — it is not retried forever."""
+    idp = FakeIdP()
+    oidc = _oidc(idp)
+    state, state_cookie = await _start_login(oidc)
+    idp.id_token = _id_token(nonce=state, kid="kid-that-does-not-exist")
+    request = _request(oidc=oidc, cookies={STATE_COOKIE_NAME: state_cookie})
+    with pytest.raises(HTTPException) as exc:
+        await oidc_callback(request, "auth-code", state)
+    assert exc.value.status_code == 401
+    assert "unknown signing key" in str(exc.value.detail)
+
+
+async def test_callback_jwks_fetch_failure_is_502():
+    idp = FakeIdP(jwks_status=500)
+    oidc = _oidc(idp)
+    state, state_cookie = await _start_login(oidc)
+    idp.id_token = _id_token(nonce=state)
+    request = _request(oidc=oidc, cookies={STATE_COOKIE_NAME: state_cookie})
+    with pytest.raises(HTTPException) as exc:
+        await oidc_callback(request, "auth-code", state)
+    assert exc.value.status_code == 502
+
+
+async def test_jwks_document_skips_unusable_keys():
+    """A non-signing or malformed key in the JWKS set is skipped, not fatal —
+    the valid key alongside it still resolves."""
+    good = _jwks()
+    junk = {"kty": "RSA", "alg": "BOGUS", "kid": "junk", "use": "sig", "n": "x", "e": "x"}
+    idp = FakeIdP(jwks_body={"keys": [junk, *good["keys"]]})
+    oidc = _oidc(idp)
+    state, state_cookie = await _start_login(oidc)
+    idp.id_token = _id_token(nonce=state)
+    request = _request(
+        oidc=oidc,
+        cookies={STATE_COOKIE_NAME: state_cookie},
+        pool=FakePool(org_ids={"gj.ahmedabad_city.zone_4": "org-z4"}),
+    )
+    response = await oidc_callback(request, "auth-code", state)
+    assert response.status_code == 302
+
+
+async def test_cached_jwks_key_is_reused_for_a_second_token():
+    idp = FakeIdP()
+    oidc = _oidc(idp)
+    first = _id_token()
+    assert (await oidc.validate_id_token(first, expected_nonce=""))["sub"] == "kc-sub-1"
+    # Second validation hits the kid cache — no refetch.
+    second = _id_token(username="other.user")
+    claims = await oidc.validate_id_token(second, expected_nonce="")
+    assert claims["preferred_username"] == "other.user"
+
+
+async def test_callback_future_iat_is_401():
+    """A token 'issued' 10 minutes from now is an authentication failure —
+    pyjwt's iat validation rejects it inside decode."""
+    idp = FakeIdP()
+    oidc = _oidc(idp)
+    state, state_cookie = await _start_login(oidc)
+    idp.id_token = _id_token(nonce=state, iat_delta=600)
+    request = _request(oidc=oidc, cookies={STATE_COOKIE_NAME: state_cookie})
+    with pytest.raises(HTTPException) as exc:
+        await oidc_callback(request, "auth-code", state)
+    assert exc.value.status_code == 401
+
+
+async def test_callback_azp_mismatch_is_401():
+    """`azp` names the client the token was minted for — a token cut for a
+    different client must not slide in on a matching `aud`."""
+    idp = FakeIdP()
+    oidc = _oidc(idp)
+    state, state_cookie = await _start_login(oidc)
+    idp.id_token = _id_token(nonce=state, azp="some-other-client")
+    request = _request(oidc=oidc, cookies={STATE_COOKIE_NAME: state_cookie})
+    with pytest.raises(HTTPException) as exc:
+        await oidc_callback(request, "auth-code", state)
+    assert exc.value.status_code == 401
+
+
+async def test_jwks_refresh_within_the_cache_ttl_is_a_noop():
+    idp = FakeIdP()
+    oidc = _oidc(idp)
+    await oidc._refresh_jwks(force=True)
+    fetched_at = oidc._jwks_fetched_at
+    await oidc._refresh_jwks()  # non-force, still inside TTL — no second fetch
+    assert oidc._jwks_fetched_at == fetched_at
+
+
+async def test_oidc_client_close():
+    oidc = _oidc(FakeIdP())
+    await oidc.aclose()
+
+
+# --- state cookie ----------------------------------------------------------------
+
+
+def _b64(data: bytes) -> str:
+    from base64 import urlsafe_b64encode
+
+    return urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _forged_state_cookie(payload: bytes, *, key: bytes = b"test-secret") -> str:
+    """A correctly-shaped state cookie signed by hand — lets a test carry an
+    arbitrary payload (expired iat, missing keys) past `seal_state`."""
+    sig = hmac.new(key, payload, hashlib.sha256).digest()
+    return f"{_b64(payload)}.{_b64(sig)}"
+
+
+def test_open_state_rejects_a_structurally_broken_cookie():
+    oidc = _oidc(FakeIdP())
+    for bad in ("", "no-dot-at-all", ".", "..", "not!b64.sig"):
+        with pytest.raises(HTTPException) as exc:
+            oidc.open_state(bad)
+        assert exc.value.status_code == 400
+
+
+def test_open_state_rejects_a_tampered_payload():
+    oidc = _oidc(FakeIdP())
+    sealed = oidc.seal_state(nonce="n", verifier="v", next_path="/")
+    payload_b64, sig_b64 = sealed.split(".", 1)
+    tampered = f"{payload_b64[:-1]}{'a' if payload_b64[-1] != 'a' else 'b'}.{sig_b64}"
+    with pytest.raises(HTTPException) as exc:
+        oidc.open_state(tampered)
+    assert exc.value.status_code == 400
+    assert "signature" in str(exc.value.detail)
+
+
+def test_open_state_rejects_a_well_signed_but_shapeless_payload():
+    """The signature is valid but the JSON isn't what a login leg wrote —
+    `iat` missing entirely."""
+    oidc = _oidc(FakeIdP())
+    cookie = _forged_state_cookie(b'{"n": "x"}')
+    with pytest.raises(HTTPException) as exc:
+        oidc.open_state(cookie)
+    assert exc.value.status_code == 400
+
+
+def test_open_state_rejects_an_expired_state():
+    oidc = _oidc(FakeIdP())
+    payload = json.dumps(
+        {"n": "x", "v": "y", "next": "/", "iat": int(time.time()) - STATE_TTL_S - 60}
+    ).encode()
+    with pytest.raises(HTTPException) as exc:
+        oidc.open_state(_forged_state_cookie(payload))
+    assert exc.value.status_code == 400
+    assert "expired" in str(exc.value.detail)
+
+
+def test_open_state_rejects_a_cookie_signed_under_another_key():
+    oidc = _oidc(FakeIdP())
+    payload = b'{"n": "x", "v": "y", "next": "/", "iat": 1}'
+    cookie = _forged_state_cookie(payload, key=b"the-wrong-secret")
+    with pytest.raises(HTTPException) as exc:
+        oidc.open_state(cookie)
+    assert exc.value.status_code == 400
+
+
+# --- app.py branches that belong to the OIDC surface ----------------------------
+
+
+async def test_oidc_login_constructs_the_client_lazily(monkeypatch):
+    """`app.state.oidc` unset → `_get_oidc` builds a real OidcClient on first
+    use and stashes it — the seam tests exploit by injecting their own."""
+    idp = FakeIdP()
+    request = _request(oidc=None)  # attribute absent-ish: _get_oidc builds one
+    # Build it over the fake transport so nothing tries a real network call.
+    real_client = OidcClient(
+        SETTINGS, http_client=httpx.AsyncClient(transport=httpx.MockTransport(idp.handler))
+    )
+    constructed = []
+
+    def _ctor(settings, **kwargs):
+        constructed.append(settings)
+        return real_client
+
+    monkeypatch.setattr("prahari_bff.app.OidcClient", _ctor)
+    response = await oidc_login(request, "/")
+    assert response.status_code == 302
+    assert constructed == [SETTINGS]
+    assert request.app.state.oidc is real_client
+
+
+async def test_callback_missing_code_or_state_is_400():
+    oidc = _oidc(FakeIdP())
+    request = _request(oidc=oidc)
+    for code, state in [("", "s"), ("c", ""), ("", "")]:
+        with pytest.raises(HTTPException) as exc:
+            await oidc_callback(request, code, state)
+        assert exc.value.status_code == 400
+
+
+async def test_callback_token_with_no_usable_subject_is_401():
+    """`preferred_username` absent and `sub` empty — there is no account to
+    attach the session to, so the login is denied outright."""
+    idp = FakeIdP()
+    oidc = _oidc(idp)
+    state, state_cookie = await _start_login(oidc)
+    idp.id_token = _id_token(nonce=state, username=None, sub="")
+    request = _request(oidc=oidc, cookies={STATE_COOKIE_NAME: state_cookie})
+    with pytest.raises(HTTPException) as exc:
+        await oidc_callback(request, "auth-code", state)
+    assert exc.value.status_code == 401
+
+
+async def test_oidc_logout_audits_a_resolved_session():
+    """A session that still resolves at logout writes `auth_logout` before
+    the revoke commits — same ordering as builtin logout."""
+    idp = FakeIdP()
+    oidc = _oidc(idp)
+    user = User(id="u1", username="ops.zone4", org_id="org-z4", role=Role.OPERATOR)
+    session_repo = FakeSessionRepo({"sess-1": (user, "gj.ahmedabad_city.zone_4")})
+
+    class FakeAudit:
+        def __init__(self):
+            self.entries = []
+
+        async def append(self, **kwargs):
+            self.entries.append(kwargs)
+
+    audit = FakeAudit()
+    request = _request(
+        oidc=oidc,
+        session_repo=session_repo,
+        cookies={"prahari_session": "sess-1", OIDC_MARKER_COOKIE_NAME: "1"},
+    )
+    request.app.state.audit = audit
+    result = await oidc_logout(request, Response())
+    assert result["status"] == "ok"
+    assert session_repo.revoked == ["sess-1"]
+    assert audit.entries[0]["action"] == "auth_logout"
+    assert audit.entries[0]["actor"] == "ops.zone4"

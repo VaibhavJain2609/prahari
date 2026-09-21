@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import (
     Encoding,
@@ -128,6 +129,23 @@ def test_configured_pem_key_round_trips():
     issuer = MediaTicketIssuer(BFFSettings(media_jwt_private_key=pem))
     payload = _decode_ticket(issuer, issuer.mint(subject="a", camera_id="c", ttl_s=10))
     assert payload["sub"] == "a"
+
+
+def test_a_non_ed25519_pem_key_is_rejected_loudly():
+    """An RSA key in `PRAHARI_MEDIA_JWT_PRIVATE_KEY` is a misconfiguration —
+    fail at boot, not at the first preview request."""
+    rsa_pem = (
+        rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        .private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+        .decode()
+    )
+    with pytest.raises(TypeError, match="Ed25519"):
+        MediaTicketIssuer(BFFSettings(media_jwt_private_key=rsa_pem))
+
+
+def test_kid_property_matches_the_published_jwks_key_id():
+    issuer = MediaTicketIssuer(BFFSettings())
+    assert issuer.kid == issuer.jwks()["keys"][0]["kid"]
 
 
 # --- the endpoint ---------------------------------------------------------------

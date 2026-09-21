@@ -219,8 +219,10 @@ class OidcClient:
             )
         except jwt.InvalidTokenError as exc:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "id_token validation failed") from exc
-        # pyjwt checks iat's type but not that it isn't in the future.
-        if claims["iat"] > time.time() + _CLOCK_SKEW_S:
+        # pyjwt's iat validation rejects a future iat at the same leeway, so
+        # this can never fire — kept as a second gate in case the decode
+        # call's options ever stop enforcing it.
+        if claims["iat"] > time.time() + _CLOCK_SKEW_S:  # pragma: no cover — decode rejects first
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "id_token issued in the future")
         # When Keycloak emits `azp` it names the client the token was minted
         # for — a token cut for a different client must not slide in on aud.

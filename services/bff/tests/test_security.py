@@ -94,6 +94,20 @@ def test_rate_limiter_frees_slots_as_the_window_slides():
     assert limiter.allow("u:alice") is True
 
 
+def test_rate_limiter_expires_only_the_aged_head_of_a_keys_window():
+    """A key whose oldest attempt has slid out of the window frees exactly
+    that slot — the newer attempts inside the window still count."""
+    now = [1000.0]
+    limiter = SlidingWindowRateLimiter(max_attempts=2, window_s=60.0, clock=lambda: now[0])
+    assert limiter.allow("u:alice") is True
+    now[0] += 30
+    assert limiter.allow("u:alice") is True  # deque is full: [t0, t0+30]
+    now[0] += 31  # t0+61 — the head has aged out, the tail has not
+    assert limiter.allow("u:alice") is True
+    # Still two live events now — the next call is back at the cap.
+    assert limiter.allow("u:alice") is False
+
+
 def test_rate_limiter_denied_attempts_do_not_extend_the_ban_forever():
     """Denied attempts are not recorded — otherwise a sustained spray would
     starve a legitimate user of that username indefinitely."""
