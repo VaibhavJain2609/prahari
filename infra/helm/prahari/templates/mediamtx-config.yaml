@@ -92,6 +92,17 @@ data:
       sourceOnDemandStartTimeout: 15s
       sourceOnDemandCloseAfter: 30s
       sourceProtocol: tcp
+      {{- if .Values.mediamtx.record.enabled }}
+      # Evidence recording (docs/EVIDENCE.md). Playback tickets already carry
+      # the `playback` grant — the registry's auth callback validates them —
+      # so enabling this is the only change the evidence chain needs.
+      record: yes
+      recordPath: {{ .Values.mediamtx.record.path }}
+      recordFormat: {{ .Values.mediamtx.record.format }}
+      recordPartDuration: {{ .Values.mediamtx.record.partDuration }}
+      recordSegmentDuration: {{ .Values.mediamtx.record.segmentDuration }}
+      recordDeleteAfter: {{ .Values.mediamtx.record.deleteAfter }}
+      {{- end }}
 
     paths:
       # Populated at runtime by the registry from GET /api/ingest.

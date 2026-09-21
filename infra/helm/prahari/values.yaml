@@ -93,15 +93,31 @@ mediamtx:
   # Host the registry puts into the fan-out URLs it hands to in-cluster
   # consumers — the inference workers' RTSP/HLS pull URLs (worker.py prefers
   # fanout_rtsp_url), which since the audited-video-access change carry an
-  # embedded `worker:<internal-token>` credential and are never shown to a
-  # browser. The cluster service name is therefore the right value in EVERY
-  # profile — browser reachability is `browserWhepBase` below, not this.
+  # embedded `worker:<worker-token>` credential (a dedicated secret, not the
+  # internal API token) and are never shown to a browser. The cluster service
+  # name is therefore the right value in EVERY profile — browser reachability
+  # is `browserWhepBase` below, not this.
   publicHost: prahari-mediamtx
   # The WHEP base URL the BFF embeds in preview-ticket responses — as the
   # BROWSER can reach it. `localhost:8889` works through k3d's port maps; the
   # gpu profile must set this to the public ingress URL (and that ingress
   # must pass the Authorization header or the `?jwt=` query through).
   browserWhepBase: "http://localhost:8889"
+  # Evidence recording. OFF by default: recording multiplies MediaMTX disk by
+  # every camera's bitrate — on the 80k estate this is an edge/DVR concern,
+  # not a central one. Enable it for the footage-backed evidence path
+  # (docs/EVIDENCE.md): `playback` tickets already grant the right action, so
+  # flipping this makes POST /evidence/requests/{id}/ticket serve real bytes.
+  record:
+    enabled: false
+    path: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+    format: fmp4
+    partDuration: 1s
+    segmentDuration: 60s
+    # How long clips are kept before MediaMTX deletes them — 24h covers the
+    # evidence-request workflow without growing the PVC unboundedly.
+    deleteAfter: 24h
+    storageSize: 50Gi
   resources:
     requests: { cpu: 100m, memory: 128Mi }
     limits:   { cpu: "1",  memory: 512Mi }

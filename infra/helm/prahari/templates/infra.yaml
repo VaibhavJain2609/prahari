@@ -280,6 +280,10 @@ spec:
             - name: config
               mountPath: /mediamtx.yml
               subPath: mediamtx.yml
+            {{- if .Values.mediamtx.record.enabled }}
+            - name: recordings
+              mountPath: /recordings
+            {{- end }}
           # TCP probes: the API answers HTTP but there is no guaranteed-200
           # health endpoint, so we probe what must be listening. Readiness on
           # the RTSP listener (the port consumers actually use), liveness on
@@ -298,6 +302,27 @@ spec:
         - name: config
           configMap:
             name: prahari-mediamtx
+        {{- if .Values.mediamtx.record.enabled }}
+        - name: recordings
+          persistentVolumeClaim:
+            claimName: prahari-mediamtx-recordings
+        {{- end }}
+{{- if .Values.mediamtx.record.enabled }}
+---
+# Recording storage. MediaMTX writes fmp4 segments here; `recordDeleteAfter`
+# bounds retention so this does not grow unboundedly.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prahari-mediamtx-recordings
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: {{ .Values.mediamtx.record.storageSize }}
+{{- end }}
 ---
 apiVersion: v1
 kind: Service

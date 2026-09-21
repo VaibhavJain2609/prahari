@@ -131,10 +131,14 @@ neither falls through to the ticket check.
 
 ## Deliberately deferred
 
-- **Real clip bytes.** `record: yes` (+ `recordPath`, `recordDeleteAfter`)
-  on the reconciled MediaMTX paths is the follow-on. The ticket already
-  grants `playback`, so the change is confined to `mediamtx.py` /
-  `infra/helm` values — nothing in this chain moves.
+- **Real clip bytes in the default profile.** The chart now ships the
+  switch: `mediamtx.record.enabled: true` renders `record: yes` (+ path,
+  format, part/segment durations, `recordDeleteAfter`) into pathDefaults and
+  mounts a `prahari-mediamtx-recordings` PVC. It is OFF in both shipped
+  profiles — recording multiplies MediaMTX disk by every camera's bitrate,
+  which is an edge/DVR concern on the 80k estate, not a central one. The
+  ticket already grants `playback`, so flipping the value is the only change
+  the chain needs — nothing here moves.
 - **`VehicleDetection.evidence_ref`.** The proto field
   (`events.proto:28`) exists and flows through correlation's route hops,
   but nothing populates it — `prahari_inference`'s `to_protobuf`
