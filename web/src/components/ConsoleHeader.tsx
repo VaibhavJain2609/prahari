@@ -25,10 +25,9 @@ export default function ConsoleHeader() {
   const links: { href: string; label: string; badge?: string; hidden?: boolean }[] = [
     { href: "/", label: "Console" },
     { href: "/cameras", label: "Cameras" },
-    // Live alerts are the rail on the console; history needs backend
-    // persistence that does not exist yet — keep the slot visible so the
-    // IA is honest about where it lands.
-    { href: "/alerts", label: "Alerts", badge: "soon" },
+    // Live alerts are the rail on the console; /alerts is the persisted
+    // history off the match engine's AlertStore.
+    { href: "/alerts", label: "Alerts" },
     { href: "/admin", label: "Admin", hidden: !can(principal, "admin") },
   ];
 
