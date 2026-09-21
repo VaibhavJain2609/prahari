@@ -361,6 +361,22 @@ export type EvidenceTicket = {
   expires_in: number;
 };
 
+// One catalogue-sync run, as the registry's `/sync/runs` serves it
+// (SyncResult): the pull's own bookkeeping — what changed in the registry,
+// not an inference verdict.
+export type SyncResult = {
+  source: string;
+  ok: boolean;
+  started_at: string;
+  finished_at: string | null;
+  cameras_seen: number;
+  cameras_added: number;
+  cameras_updated: number;
+  cameras_absent: number;
+  codec_mix: Record<string, number>;
+  error: string | null;
+};
+
 // One hash-chained audit row, as `GET /audit` serialises `AuditEntry`.
 export type AuditEntry = {
   id: number;
@@ -598,4 +614,12 @@ export const api = {
     request<{ reloaded: boolean; entries: number }>("watchlist/reload", {
       method: "POST",
     }),
+
+  // Catalogue sync: `triggerSync` is the audited mutation (one `sync_trigger`
+  // row); `syncRuns` is the registry's own run history — seen/added/updated/
+  // absent counts and codec mix per pull.
+  triggerSync: () => request<SyncResult>("sync", { method: "POST" }),
+  syncRuns: (limit = 10) =>
+    request<SyncResult[]>(`sync/runs?limit=${limit}`),
+
 };
