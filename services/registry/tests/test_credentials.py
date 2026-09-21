@@ -46,6 +46,20 @@ def test_malformed_key_raises_credential_key_error():
         encrypt_credential("s3cret!", "not-valid-base64-and-wrong-length")
 
 
+def test_undecodable_key_raises_credential_key_error():
+    """Bad base64 padding fails at decode time — a distinct failure from a
+    well-formed key of the wrong length, and reported as such."""
+    with pytest.raises(CredentialKeyError, match="not valid base64"):
+        encrypt_credential("s3cret!", "a")
+
+
+def test_well_formed_key_of_the_wrong_length_raises_credential_key_error():
+    """A 16-byte key is valid base64 and invalid AES-256 — the failure must
+    name the length, not the encoding."""
+    with pytest.raises(CredentialKeyError, match="must decode to 32 bytes"):
+        encrypt_credential("s3cret!", base64.urlsafe_b64encode(b"0123456789abcdef").decode())
+
+
 def test_with_credentials_percent_encodes_special_characters():
     url = _with_credentials("rtsp://10.0.0.5:554/ch1", "admin", "p@ss:w0rd/x")
     assert url == "rtsp://admin:p%40ss%3Aw0rd%2Fx@10.0.0.5:554/ch1"

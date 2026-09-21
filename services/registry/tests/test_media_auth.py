@@ -25,6 +25,7 @@ from prahari_registry.config import RegistrySettings
 from prahari_registry.media_auth import (
     MediaMTXAuthRequest,
     TicketVerifier,
+    _ticket_grants,
     authorize,
 )
 
@@ -293,3 +294,160 @@ def test_auth_endpoint_denies_bad_credentials(armed_client):
         json={"user": "worker", "password": "wrong", "action": "read", "path": "cam-1"},
     )
     assert resp.status_code == 401
+
+
+# --- _ticket_grants: MediaMTX's permission semantics, minimally ---------------------
+
+
+def test_ticket_grants_requires_a_permissions_list():
+    assert not _ticket_grants({"mediamtx_permissions": "read"}, action="read", path="cam-1")
+    assert not _ticket_grants({}, action="read", path="cam-1")
+
+
+def test_ticket_grants_skips_entries_that_are_not_grants():
+    """A malformed entry must not open anything — it is skipped, not trusted."""
+    payload = {"mediamtx_permissions": [42, "read", {"action": "read", "path": "cam-1"}]}
+    assert _ticket_grants(payload, action="read", path="cam-1")
+
+
+def test_ticket_grants_action_must_match_exactly():
+    payload = {"mediamtx_permissions": [{"action": "publish", "path": "cam-1"}]}
+    assert not _ticket_grants(payload, action="read", path="cam-1")
+
+
+def test_ticket_grants_empty_path_means_any_path():
+    payload = {"mediamtx_permissions": [{"action": "read", "path": ""}]}
+    assert _ticket_grants(payload, action="read", path="cam-anything")
+    payload = {"mediamtx_permissions": [{"action": "read"}]}
+    assert _ticket_grants(payload, action="read", path="cam-anything")
+
+
+async def test_authorize_correct_token_under_an_unknown_user_is_denied():
+    """The internal token buys exactly two identities (`internal` for the API,
+    `worker` for reads). Anyone else holding it gets nothing."""
+    settings = RegistrySettings(internal_token=TOKEN)
+    verifier = _verifier(settings, {"keys": []})
+    assert not await authorize(settings, verifier, _req(user="admin", password=TOKEN, action="api"))
+
+
+# --- the verifier's JWKS machinery ---------------------------------------------------
+
+
+def _counting_jwks_client(jwks_by_call: list) -> tuple[httpx.AsyncClient, list]:
+    """A MockTransport that pops a response (or raises) per call and counts."""
+
+    calls: list = []
+    responses = list(jwks_by_call)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        item = responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return httpx.Response(200, json=item)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler)), calls
+
+
+async def test_verifier_builds_and_closes_its_own_http_client():
+    """Production path: no client injected → one is created lazily and
+    released by aclose() at shutdown."""
+    verifier = TicketVerifier(RegistrySettings(internal_token=TOKEN))
+    assert verifier._client is None
+    assert await verifier._http() is not None
+    await verifier.aclose()
+    assert verifier._client is None
+
+
+async def test_jwks_undecodable_keys_are_skipped_not_trusted():
+    jwks = {
+        "keys": [
+            {"kty": "OKP", "crv": "Ed25519", "x": "!!!", "kid": "short"},
+            {"kty": "RSA", "crv": "nope", "x": "aaaa", "kid": "wrong-kty"},
+        ]
+    }
+    settings = RegistrySettings(internal_token=TOKEN)
+    verifier = _verifier(settings, jwks)
+    assert await verifier._refresh() == {}
+
+
+async def test_unknown_kid_forces_one_refresh_then_denies():
+    """A ticket naming a `kid` the cache does not hold forces exactly one
+    re-pull — the BFF may have rotated. Still unknown after that is a forged
+    or expired-issuer ticket: deny."""
+    settings = RegistrySettings(internal_token=TOKEN)
+    key = Ed25519PrivateKey.generate()
+    http, calls = _counting_jwks_client([_jwks_for(key), _jwks_for(key)])
+    verifier = TicketVerifier(settings, client=http)
+    ticket = _make_ticket(key, kid="k9", path="cam-abc")
+
+    assert not await verifier.allows(ticket, action="read", path="cam-abc")
+    assert len(calls) == 2  # one cache-fill refresh plus the forced re-check
+
+
+async def test_unknown_kid_with_an_unreachable_bff_denies():
+    """The forced re-pull failing means the ticket simply cannot be verified —
+    deny, never skip the check."""
+    settings = RegistrySettings(internal_token=TOKEN)
+    key = Ed25519PrivateKey.generate()
+    http, _ = _counting_jwks_client([_jwks_for(key), httpx.ConnectError("bff down")])
+    verifier = TicketVerifier(settings, client=http)
+    ticket = _make_ticket(key, kid="k9", path="cam-abc")
+
+    assert not await verifier.allows(ticket, action="read", path="cam-abc")
+
+
+async def test_a_jwks_fetch_failure_keeps_serving_the_last_good_set():
+    """If the BFF is down no new tickets can be minted anyway; the cached keys
+    keep verifying the seconds-lived outstanding ones."""
+    settings = RegistrySettings(internal_token=TOKEN, media_auth_jwks_ttl_s=0)
+    key = Ed25519PrivateKey.generate()
+    http, _ = _counting_jwks_client([_jwks_for(key), httpx.ConnectError("bff down")])
+    verifier = TicketVerifier(settings, client=http)
+    ticket = _make_ticket(key, path="cam-abc")
+
+    assert await verifier.allows(ticket, action="read", path="cam-abc")
+    # TTL=0 forces a refresh on the next lookup; it fails, and the cached key
+    # still answers — the ticket is still accepted.
+    assert await verifier.allows(ticket, action="read", path="cam-abc")
+
+
+async def test_malformed_and_foreign_alg_tokens_are_denied_without_a_fetch():
+    settings = RegistrySettings(internal_token=TOKEN)
+    http, calls = _counting_jwks_client([])
+    verifier = TicketVerifier(settings, client=http)
+
+    assert not await verifier.allows("not-a-jwt", action="read", path="cam-1")
+    assert not await verifier.allows("a.b", action="read", path="cam-1")
+
+    # A correctly shaped JWT with the wrong alg must not reach the verifier.
+    now = int(time.time())
+    header = {"alg": "RS256", "kid": "k1"}
+    payload = {"exp": now + 60, "mediamtx_permissions": [{"action": "read", "path": "cam-1"}]}
+    token = (
+        f"{_b64url(json.dumps(header).encode())}."
+        f"{_b64url(json.dumps(payload).encode())}.{_b64url(b'fakesig')}"
+    )
+    assert not await verifier.allows(token, action="read", path="cam-1")
+    assert calls == []  # nothing was fetched for tokens that fail locally
+
+
+async def test_a_ticket_without_exp_is_denied():
+    """`exp` absent or non-numeric is not 'never expires' — it is malformed."""
+    settings = RegistrySettings(internal_token=TOKEN)
+    key = Ed25519PrivateKey.generate()
+    verifier = _verifier(settings, _jwks_for(key))
+
+    now = int(time.time())
+    header = {"alg": "EdDSA", "kid": "k1"}
+    payload = {
+        "iss": "prahari-bff",
+        "iat": now,
+        "mediamtx_permissions": [{"action": "read", "path": "cam-1"}],
+    }
+    signing_input = (
+        f"{_b64url(json.dumps(header, separators=(',', ':')).encode())}."
+        f"{_b64url(json.dumps(payload, separators=(',', ':')).encode())}"
+    )
+    token = f"{signing_input}.{_b64url(key.sign(signing_input.encode()))}"
+    assert not await verifier.allows(token, action="read", path="cam-1")

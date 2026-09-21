@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 from prahari_common.catalogue import Catalogue, CatalogueClient
+from prahari_common.config import GatewaySettings
 
 from prahari_registry.config import RegistrySettings
 from prahari_registry.models import SyncResult
@@ -299,3 +300,209 @@ def test_snapshot_round_trip_needs_no_network(snapshot: Catalogue):
     assert len(snapshot.cameras) == 3
     assert len(snapshot.live_cameras) == 2
     assert snapshot.fetched_at == datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
+
+
+# --- the advisory lock and the fetch ------------------------------------------------
+
+
+class LockConn(FakeConn):
+    """Answers `pg_try_advisory_lock` with a scripted verdict and records the
+    unlock — the only thing `run_once_locked` adds over `run_once`."""
+
+    def __init__(self, acquired: bool) -> None:
+        self.acquired = acquired
+        self.unlocked = False
+
+    async def fetchval(self, sql, *args):
+        assert "pg_try_advisory_lock" in sql
+        return self.acquired
+
+    async def execute(self, sql, *args):
+        if "pg_advisory_unlock" in sql:
+            self.unlocked = True
+        return "OK"
+
+
+class LockPool(FakePool):
+    def __init__(self, conn: LockConn) -> None:
+        self.conn = conn
+
+    def acquire(self):
+        return self.conn
+
+
+def _gateway() -> GatewaySettings:
+    return GatewaySettings(host="gateway.example", password="pw")
+
+
+async def test_run_once_locked_skips_when_another_replica_holds_the_lock():
+    """Two replicas syncing at once would double the load on a shared
+    government gateway for no benefit — the loser skips, not queues."""
+    sync = make_sync(FakeRepo())
+    conn = LockConn(acquired=False)
+    sync._pool = LockPool(conn)
+
+    assert await sync.run_once_locked() is None
+    assert conn.unlocked is False  # never held, so never released
+
+
+async def test_run_once_locked_releases_the_lock_even_when_the_pass_fails():
+    repo = FakeRepo()
+    sync = make_sync(repo)
+    conn = LockConn(acquired=True)
+    sync._pool = LockPool(conn)
+
+    # No gateway configured → the pass fails; the lock must still be released.
+    result = await sync.run_once_locked()
+    assert result is not None and not result.ok
+    assert conn.unlocked is True
+
+
+async def test_fetch_pulls_the_catalogue_in_a_thread(snapshot, monkeypatch):
+    """CatalogueClient is synchronous httpx; the blocking call goes to a
+    thread rather than stalling the loop and every in-flight heartbeat."""
+
+    class FakeClient:
+        def __init__(self, gateway) -> None:
+            self.gateway = gateway
+
+        def fetch(self) -> Catalogue:
+            return snapshot
+
+    monkeypatch.setattr("prahari_registry.sync.CatalogueClient", FakeClient)
+    sync = CatalogueSync(
+        pool=FakePool(),
+        repo=FakeRepo(),
+        settings=RegistrySettings(catalogue_source="test-gateway"),
+        gateway=_gateway(),
+        mediamtx=FakeMediaMTX(),
+    )
+    result = await sync.run_once()  # no catalogue injected → goes through _fetch
+    assert result.ok and result.cameras_seen == 3
+
+
+async def test_synced_cameras_get_their_stream_urls_from_the_gateway_settings(
+    snapshot, monkeypatch
+):
+    """URLs come from the catalogue + gateway settings, never a hardcoded
+    template — the catalogue is the contract, the URL pattern is not."""
+
+    class FakeClient:
+        def __init__(self, gateway) -> None:
+            pass
+
+        def fetch(self) -> Catalogue:
+            return snapshot
+
+    monkeypatch.setattr("prahari_registry.sync.CatalogueClient", FakeClient)
+    repo = FakeRepo()
+    sync = CatalogueSync(
+        pool=FakePool(),
+        repo=repo,
+        settings=RegistrySettings(catalogue_source="test-gateway"),
+        gateway=_gateway(),
+        mediamtx=FakeMediaMTX(),
+    )
+    await sync.run_once()
+    by_id = {u["external_id"]: u for u in repo.upserts}
+    assert by_id["101"]["rtsp_url"].startswith("rtsp://")
+    assert "gateway.example" in by_id["101"]["rtsp_url"]
+
+
+async def test_cancelled_bookkeeping_does_not_swallow_the_cancellation(snapshot):
+    """`finish_sync_run` failing must not mask the result — but a
+    CancelledError is not a failure, it is a shutdown, and must propagate."""
+
+    class CancellingRepo(FakeRepo):
+        async def finish_sync_run(self, run_id: int, result: SyncResult) -> None:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await make_sync(CancellingRepo()).run_once(snapshot)
+
+
+# --- start/stop and the loop's first sleep --------------------------------------------
+
+
+async def test_start_is_a_noop_when_sync_is_disabled():
+    sync = make_sync(FakeRepo())
+    sync._s = RegistrySettings(sync_enabled=False)
+    sync.start()
+    assert sync._task is None
+
+
+async def test_start_is_a_noop_without_gateway_credentials():
+    """Manual registration still works — the absence is loudly logged, not fatal."""
+    sync = make_sync(FakeRepo())
+    sync._s = RegistrySettings(sync_enabled=True)
+    sync.start()  # gateway=None → warn and return
+    assert sync._task is None
+
+
+async def test_start_spawns_the_loop_and_stop_tears_it_down():
+    sync = make_sync(FakeRepo())
+    sync._s = RegistrySettings(
+        catalogue_source="test-gateway", sync_enabled=True, sync_interval_s=60
+    )
+    sync._gateway = _gateway()
+
+    async def _pass():
+        return None
+
+    sync.run_once_locked = _pass  # type: ignore[method-assign]
+    sync.start()
+    assert sync._task is not None
+    await asyncio.sleep(0.05)  # let the first (startup) pass run
+    await sync.stop()
+    assert sync._task is None
+
+
+async def test_stop_with_nothing_running_still_closes_the_mediamtx_client():
+    mediamtx = FakeMediaMTX()
+    mediamtx.closed = False
+
+    async def _aclose():
+        mediamtx.closed = True
+
+    mediamtx.aclose = _aclose  # type: ignore[method-assign]
+    sync = make_sync(FakeRepo(), mediamtx)
+    await sync.stop()
+    assert mediamtx.closed
+
+
+async def test_loop_sleeps_once_up_front_when_startup_sync_is_off():
+    """`sync_on_startup=false` skips the immediate pass, not the schedule —
+    the loop shifts into the timer with one sleep first."""
+    sync = make_sync(FakeRepo())
+    sync._s = RegistrySettings(
+        catalogue_source="test-gateway",
+        sync_on_startup=False,
+        sync_interval_s=0.01,
+    )
+    calls = 0
+
+    async def _pass():
+        nonlocal calls
+        calls += 1
+        return None
+
+    sync.run_once_locked = _pass  # type: ignore[method-assign]
+    task = asyncio.create_task(sync._loop())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert calls >= 1
+
+
+async def test_loop_propagates_a_cancellation_raised_inside_a_pass():
+    """The keep-going guard catches Exception — CancelledError is not one, it
+    is shutdown, and must unwind the loop rather than be retried."""
+    sync = make_sync(FakeRepo())
+
+    async def _cancelled():
+        raise asyncio.CancelledError
+
+    sync.run_once_locked = _cancelled  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await sync._loop()
