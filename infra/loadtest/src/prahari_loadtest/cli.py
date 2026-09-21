@@ -61,7 +61,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--internal-token",
         default=None,
-        help="X-Internal-Token for internal APIs / gRPC metadata (env: PRAHARI_INTERNAL_TOKEN)",
+        help="X-Internal-Token for internal APIs / gRPC metadata — the "
+        "inference caller token (env: PRAHARI_INFERENCE_TOKEN, falling back "
+        "to PRAHARI_INTERNAL_TOKEN for shared-mode deployments)",
     )
     p.add_argument(
         "--runs-dir",

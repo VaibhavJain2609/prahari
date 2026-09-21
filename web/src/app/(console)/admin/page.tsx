@@ -4,6 +4,7 @@ import OrgSection from "@/components/admin/OrgSection";
 import UsersSection from "@/components/admin/UsersSection";
 import ApiKeysSection from "@/components/admin/ApiKeysSection";
 import AuditViewer from "@/components/admin/AuditViewer";
+import WatchlistSection from "@/components/admin/WatchlistSection";
 import PanelErrorBoundary from "@/components/PanelErrorBoundary";
 import { usePrincipal } from "@/lib/principal";
 import { can } from "@/lib/rbac";
@@ -43,6 +44,9 @@ export default function AdminPage() {
       </PanelErrorBoundary>
       <PanelErrorBoundary title="Audit log">
         <AuditViewer />
+      </PanelErrorBoundary>
+      <PanelErrorBoundary title="Watchlist">
+        <WatchlistSection />
       </PanelErrorBoundary>
     </div>
   );

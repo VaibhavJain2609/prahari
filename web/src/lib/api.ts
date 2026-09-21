@@ -549,4 +549,23 @@ export const api = {
   // of the first entry whose hash doesn't chain, if any.
   verifyAudit: () =>
     request<{ ok: boolean; first_broken_entry: string | null }>("audit/verify"),
+
+  // The match engine's one snapshot: entry count, skeleton buckets, bloom
+  // stats — the reload-readiness readout the admin page needs. Admin-only
+  // on the BFF.
+  watchlistSummary: () =>
+    request<{
+      entries: number;
+      skeleton_buckets: number;
+      bloom_size_bits: number;
+      bloom_hash_count: number;
+      bloom_false_positive_rate: number;
+    }>("watchlist/summary"),
+
+  // Audited (`watchlist_reload` under the admin purpose) — re-reads the
+  // mounted watchlist file into the match engine's store + bloom filter.
+  reloadWatchlist: () =>
+    request<{ reloaded: boolean; entries: number }>("watchlist/reload", {
+      method: "POST",
+    }),
 };

@@ -44,9 +44,13 @@ class Endpoints:
     correlation_url: str = "http://localhost:8002"
     internal_token: str = ""
     """Sent as `X-Internal-Token` on every internal call and as
-    `x-internal-token` gRPC metadata — the same credential the services gate
-    on when the chart arms it (`prahari-internal` Secret). Empty matches the
-    services' empty-means-open default."""
+    `x-internal-token` gRPC metadata. The harness impersonates the worker
+    fleet — worker register/heartbeat on the registry and detections on the
+    match engine — so its identity is `inference`: set the
+    `inference-token` key's value, not the legacy `internal-token`. The
+    envs resolve `PRAHARI_INFERENCE_TOKEN` first, then
+    `PRAHARI_INTERNAL_TOKEN` as the shared-mode fallback for deployments
+    that have not minted per-service keys."""
 
     mediamtx_publish_url: str = "rtsp://localhost:8554"
     """Where ffmpeg publishers push in `live` mode."""
@@ -65,7 +69,8 @@ class Endpoints:
             match_grpc=os.environ.get("PRAHARI_MATCH_GRPC", cls.match_grpc),
             match_http=os.environ.get("PRAHARI_MATCH_HTTP", cls.match_http),
             correlation_url=os.environ.get("PRAHARI_CORRELATION_URL", cls.correlation_url),
-            internal_token=os.environ.get("PRAHARI_INTERNAL_TOKEN", ""),
+            internal_token=os.environ.get("PRAHARI_INFERENCE_TOKEN")
+            or os.environ.get("PRAHARI_INTERNAL_TOKEN", ""),
             mediamtx_publish_url=os.environ.get(
                 "PRAHARI_MEDIAMTX_PUBLISH_URL", cls.mediamtx_publish_url
             ),

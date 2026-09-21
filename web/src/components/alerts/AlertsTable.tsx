@@ -357,6 +357,17 @@ function AlertRow({
         ) : (
           <span className="text-slate-400">—</span>
         )}
+        {(observed ?? matched) && (
+          // The alert's one-click path onto the mandatory use case:
+          // /?trace=<plate> pre-fills and auto-runs the route trace.
+          <Link
+            href={`/?trace=${encodeURIComponent(observed ?? matched ?? "")}`}
+            className="ml-1.5 text-[10px] text-sky-600 hover:underline focus:outline-none focus:ring-2 focus:ring-slate-400 dark:text-sky-400"
+            title="Trace this plate's route"
+          >
+            trace
+          </Link>
+        )}
       </td>
       <td className="px-2 py-1 whitespace-nowrap">
         <AckCell row={row} onAcked={onAcked} />

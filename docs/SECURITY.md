@@ -133,11 +133,15 @@ Real gaps, tracked against `docs/NEXT-PHASE-PLAN.md` §5/E:
   pod's compromise is that service's compromise (and `GET
   /api/v1/assignments` `worker_id`s are still bound to the service token,
   not a per-pod credential). SPIFFE/SPIRE or per-pod minted identities are
-  the fix; the `internal` shared-token compat caller also remains until the
-  last shared-credential caller (loadtest, ad-hoc ops) is retired.
+  the fix; the `internal` shared-token compat caller also remains — the
+  loadtest now presents the `inference` identity
+  (`PRAHARI_INFERENCE_TOKEN`), so `internal` survives only for ad-hoc ops
+  tooling that has not minted a named key.
 - **Evidence pull** — a signed capability `(camera, range, purpose)` redeemed
-  for a clip. Preview is solved (audited tickets); nothing stores or serves
-  edge video segments yet, and `evidence_ref` is still unpopulated.
+  for a clip. Preview is solved (audited tickets); the request/ticket chain
+  exists and `mediamtx.record` renders recording + a PVC, but recording is
+  off in both profiles, nothing fetches the `dvr://` locator, and
+  `evidence_ref` is stamped but not auto-resolved into a clip fetch.
 - **WORM anchoring** — exporting signed audit checkpoints so tail truncation
   and DB-level tampering are detectable outside the system.
 - **Redis TLS** — requirepass shipped; `rediss://` deferred.
