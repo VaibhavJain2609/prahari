@@ -63,7 +63,11 @@ function OpsConsole() {
     [mutateParams],
   );
   const closeCamera = useCallback(
-    () => mutateParams((qs) => qs.delete("camera")),
+    () =>
+      mutateParams((qs) => {
+        qs.delete("camera");
+        qs.delete("clip");
+      }),
     [mutateParams],
   );
   const consumeTrace = useCallback(

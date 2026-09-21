@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { api, ApiError, Camera } from "@/lib/api";
 import { useBFF } from "@/lib/use-bff";
 import { usePrincipal } from "@/lib/principal";
@@ -222,6 +222,9 @@ export default function CameraDrawer({
                     can be minted once issued — real bytes land when MediaMTX
                     recording does. */}
                 <EvidenceRequestPanel
+                  // Remount on a new clip target: a different sighting resets
+                  // the window and any prior request/ticket state.
+                  key={clipEpoch ?? "manual"}
                   cameraId={camera.id}
                   purposeCode={code}
                   clipEpoch={clipEpoch}
@@ -492,12 +495,6 @@ function EvidenceRequestPanel({
   // sighting; the operator can still edit it before the audited POST.
   const [start, setStart] = useState(clipEpoch != null ? _localInputValue(clipEpoch - 120) : "");
   const [end, setEnd] = useState(clipEpoch != null ? _localInputValue(clipEpoch + 120) : "");
-  useEffect(() => {
-    if (clipEpoch != null) {
-      setStart(_localInputValue(clipEpoch - 120));
-      setEnd(_localInputValue(clipEpoch + 120));
-    }
-  }, [clipEpoch]);
   const [busy, setBusy] = useState(false);
   const [created, setCreated] = useState<import("@/lib/api").EvidenceRequest | null>(null);
   const [ticket, setTicket] = useState<import("@/lib/api").EvidenceTicket | null>(null);

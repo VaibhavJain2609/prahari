@@ -142,10 +142,12 @@ neither falls through to the ticket check.
 - **`VehicleDetection.evidence_ref` resolution.** The field
   (`events.proto:28`) is now stamped at the producer — `to_protobuf`
   writes `prahari://evidence/<camera>/<epoch>` per detection and it flows
-  through correlation's route hops unchanged. What remains is a resolver:
-  nothing yet turns that locator into an `evidence_requests` row or a
-  `dvr://` window — a hop's `evidence_ref` is currently a pointer for a
-  human, not a clickable path.
+  through correlation's route hops unchanged. The console resolves it one
+  step: a hop's `clip` button opens the camera drawer with the request
+  window pre-filled to ±2 min around the sighting (`?clip=<epoch>`); the
+  audited POST is still the operator's explicit act. What remains
+  unimplemented is deriving a `dvr://` window automatically and any
+  clip-fetch transport.
 - **Ticket revocation.** `ticket_jti` is recorded so a denylist *could* be
   checked at the auth callback later; none is implemented — the 300 s TTL
   is the containment, same posture as the 60 s preview ticket.
