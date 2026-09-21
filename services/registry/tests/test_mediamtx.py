@@ -179,6 +179,25 @@ async def test_a_single_failing_path_does_not_abort_the_rest():
     assert (result.added, result.failed) == (1, 1)
 
 
+async def test_a_failed_delete_counts_as_failed_not_fatal():
+    """A delete the control API refuses is logged and counted — the rest of
+    the reconcile still completes; the stale path is fixed on the next pass."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/v3/config/paths/list":
+            return httpx.Response(
+                200, json={"items": [{"name": "cam-stale", "source": "rtsp://gw/old"}]}
+            )
+        if path.endswith("/cam-stale"):
+            return httpx.Response(500, json={"error": "path in use"})
+        return httpx.Response(200, json={})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://mtx")
+    result = await MediaMTXClient(SETTINGS, client=http).reconcile({})
+    assert (result.removed, result.failed) == (0, 1)
+
+
 @pytest.mark.parametrize("disabled", [True])
 async def test_reconcile_can_be_switched_off(disabled: bool):
     """`profile=local` may run without a restreamer at all; the switch must not

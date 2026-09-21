@@ -18,6 +18,7 @@ from prahari_registry.models import (
     PROTO_HEALTH_STATE,
     CameraHealth,
     CameraType,
+    DistrictCoverage,
     HealthState,
 )
 
@@ -52,3 +53,30 @@ def test_fps_drift_is_absent_when_either_rate_is():
     unknown, and the console must be able to tell the difference."""
     assert CameraHealth(observed_fps=8.0).fps_drift is None
     assert CameraHealth(declared_fps=25.0).fps_drift is None
+
+
+def test_district_working_ratio_is_healthy_over_registered():
+    coverage = DistrictCoverage(
+        district="Ahmedabad",
+        registered=10,
+        healthy=7,
+        degraded=1,
+        unreachable=1,
+        tampered=0,
+        unknown=1,
+        absent=0,
+    )
+    assert coverage.working_ratio == 0.7
+    assert (
+        DistrictCoverage(
+            district=None,
+            registered=0,
+            healthy=0,
+            degraded=0,
+            unreachable=0,
+            tampered=0,
+            unknown=0,
+            absent=0,
+        ).working_ratio
+        == 0.0
+    )

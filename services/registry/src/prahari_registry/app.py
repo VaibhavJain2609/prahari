@@ -16,7 +16,7 @@ from typing import Annotated
 
 import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from prahari_common.config import GatewaySettings
 from pydantic import ValidationError
 
@@ -27,6 +27,7 @@ from .db import apply_migrations, create_pool, timescale_available
 from .health import HealthPolicy, derive_state
 from .media_auth import MediaMTXAuthRequest, TicketVerifier, authorize
 from .mediamtx import MediaMTXClient
+from .metrics import HEARTBEATS_RECEIVED, METRICS, refresh_gauges
 from .models import (
     Camera,
     CameraCreate,
@@ -190,6 +191,8 @@ async def require_internal_token(request: Request, call_next):
 
     `/healthz` and `/readyz` are exempt — a liveness/readiness probe carries
     no data and must not depend on a secret being wired correctly to answer.
+    `/metrics` is exempt for the same reason: a Prometheus scrape cannot hold
+    the credential.
     `/api/v1/mediamtx/auth` is exempt too: it IS the credential check
     MediaMTX defers to (`authMethod: http`), and the restreamer cannot send
     this header — gating it would deadlock the video plane. Everything else
@@ -200,6 +203,7 @@ async def require_internal_token(request: Request, call_next):
     if settings.internal_token and request.url.path not in (
         "/healthz",
         "/readyz",
+        "/metrics",
         "/api/v1/mediamtx/auth",
     ):
         provided = request.headers.get("x-internal-token")
@@ -346,6 +350,17 @@ async def readyz(pool: PoolDep, response: Response) -> dict:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return {"status": "unavailable", "database": "error"}
     return {"status": "ready", "database": "ok"}
+
+
+@app.get("/metrics", tags=["ops"], response_class=PlainTextResponse)
+async def metrics(request: Request) -> str:
+    """Prometheus text exposition — heartbeats accepted, live ingest workers,
+    cameras by effective health state, desired MediaMTX paths. Exempt from
+    the token gate for the same reason `/healthz` is: a scrape cannot hold a
+    credential. DB-backed gauges are refreshed here at scrape time; a failed
+    refresh serves the last-known values rather than answering 500."""
+    await refresh_gauges(request.app.state)
+    return METRICS.render()
 
 
 # --- orgs ----------------------------------------------------------------
@@ -553,6 +568,7 @@ async def post_heartbeat(
         policy=policy,
     )
     await repo.record_heartbeat(camera_id, heartbeat, verdict)
+    METRICS.inc(HEARTBEATS_RECEIVED)
     return HeartbeatAck(
         camera_id=camera_id,
         state=verdict.state,
