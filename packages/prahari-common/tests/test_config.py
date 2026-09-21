@@ -30,9 +30,7 @@ class TestHostValidation:
 
     def test_a_trailing_slash_is_stripped(self) -> None:
         assert _settings(host="cdn.example.test/").host == "cdn.example.test"
-        assert (
-            _settings(direct_host="203.0.113.5/").direct_host == "203.0.113.5"
-        )
+        assert _settings(direct_host="203.0.113.5/").direct_host == "203.0.113.5"
 
     def test_direct_host_may_be_absent(self) -> None:
         assert _settings().direct_host is None

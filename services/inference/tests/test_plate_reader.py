@@ -62,6 +62,7 @@ def _install_fake_paddleocr(monkeypatch, result):
     """A `paddleocr` module whose PaddleOCR.ocr() returns a canned result —
     the documented nested per-image/per-line shape
     `[[ [box, (text, confidence)], ... ]]`."""
+
     class FakePaddleOCR:
         def __init__(self, **_kwargs) -> None:
             pass

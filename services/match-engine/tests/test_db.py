@@ -19,13 +19,12 @@ import prahari_match.db as db_module
 from prahari_match.config import MatchSettings
 from prahari_match.db import (
     _MIGRATION_LOCK_ID,
-    apply_migrations,
-    create_pool,
     _init_connection,
     _migration_files,
     _resolve_migrations_dir,
+    apply_migrations,
+    create_pool,
 )
-
 
 # --- fakes -------------------------------------------------------------------
 
@@ -130,7 +129,7 @@ def test_migration_files_returns_sorted_sql_only(tmp_path) -> None:
 async def test_init_connection_registers_the_jsonb_codec() -> None:
     conn = _FakeConn()
     await _init_connection(conn)  # type: ignore[arg-type] -- fake conn
-    (name, encoder, decoder, schema), = conn.codecs
+    ((name, encoder, decoder, schema),) = conn.codecs
     assert name == "jsonb" and schema == "pg_catalog"
     # asyncpg returns jsonb as a str otherwise; the codec must actually be
     # json.loads/json.dumps, not a passthrough.
@@ -147,9 +146,7 @@ async def test_create_pool_passes_settings_and_the_codec_init(monkeypatch) -> No
         return "POOL"
 
     monkeypatch.setattr(db_module.asyncpg, "create_pool", _fake_create_pool)
-    settings = MatchSettings(
-        database_url="postgresql://x/db", db_pool_min=2, db_pool_max=7
-    )
+    settings = MatchSettings(database_url="postgresql://x/db", db_pool_min=2, db_pool_max=7)
 
     assert await create_pool(settings) == "POOL"
     assert captured["url"] == "postgresql://x/db"
