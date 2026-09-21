@@ -195,6 +195,64 @@ class TestInternalToken:
             assert client.get("/healthz").status_code == 200
 
 
+class TestIsolatedInternalTokens:
+    """Isolated mode on the HTTP surface: `internal_tokens` configured means
+    a presented token must resolve to an accepted caller (`inference`,
+    `bff`) — a VALID token belonging to another caller is denied. The gRPC
+    surface's twin check is covered in test_grpc_server.py."""
+
+    def _isolated_client(self, monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path) -> TestClient:
+        monkeypatch.setenv("PRAHARI_MATCH_INTERNAL_TOKEN", "tok-shared")
+        monkeypatch.setenv("PRAHARI_MATCH_CALLER_TOKEN_INFERENCE", "tok-inf")
+        monkeypatch.setenv("PRAHARI_MATCH_CALLER_TOKEN_BFF", "tok-bff")
+        # A third caller in the map — valid somewhere, not accepted here —
+        # makes "wrong caller" exercisable rather than just "unknown token".
+        monkeypatch.setenv("PRAHARI_MATCH_INTERNAL_TOKENS", '{"correlation": "tok-cor"}')
+        return _client(monkeypatch, watchlist_dir)
+
+    def test_allowlisted_callers_are_accepted(
+        self, monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path
+    ) -> None:
+        with self._isolated_client(monkeypatch, watchlist_dir) as client:
+            for token in ("tok-inf", "tok-bff"):
+                response = client.get("/api/v1/alerts", headers={"x-internal-token": token})
+                assert response.status_code == 200, token
+
+    def test_a_known_but_unaccepted_caller_is_denied(
+        self, monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path
+    ) -> None:
+        # correlation's token resolves to a real identity — just not one this
+        # service accepts. That is the entire point of per-service
+        # credentials: a leaked token from one service opens nothing else.
+        with self._isolated_client(monkeypatch, watchlist_dir) as client:
+            response = client.get("/api/v1/alerts", headers={"x-internal-token": "tok-cor"})
+        assert response.status_code == 401
+
+    def test_unknown_and_missing_tokens_are_denied(
+        self, monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path
+    ) -> None:
+        with self._isolated_client(monkeypatch, watchlist_dir) as client:
+            assert (
+                client.get("/api/v1/alerts", headers={"x-internal-token": "nope"}).status_code
+                == 401
+            )
+            assert client.get("/api/v1/alerts").status_code == 401
+
+    def test_shared_token_passes_as_internal_compat(
+        self, monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path
+    ) -> None:
+        with self._isolated_client(monkeypatch, watchlist_dir) as client:
+            response = client.get("/api/v1/alerts", headers={"x-internal-token": "tok-shared"})
+        assert response.status_code == 200
+
+    def test_readyz_reports_the_isolated_posture(
+        self, monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path
+    ) -> None:
+        with self._isolated_client(monkeypatch, watchlist_dir) as client:
+            body = client.get("/readyz").json()
+        assert body["internal_auth"] == "isolated"
+
+
 class TestAlerts:
     def test_list_alerts_starts_empty(
         self, monkeypatch: pytest.MonkeyPatch, watchlist_dir: Path

@@ -103,12 +103,14 @@ class IngestSettings(BaseSettings):
     same camera would otherwise disagree about whether it is up."""
 
     internal_token: str = ""
-    """Sent as `X-Internal-Token` on every registry call and as
-    `x-internal-token` gRPC metadata to the match engine, once those services
-    arm their `internal_token` gates. Must match `RegistrySettings.internal_token`
-    and `MatchSettings.internal_token` on the other ends — the chart hands every
-    internal caller and callee the same shared value. Empty sends no credential,
-    matching the receivers' empty-means-open semantics."""
+    """This worker's caller identity, sent as `X-Internal-Token` on every
+    registry call and as `x-internal-token` gRPC metadata to the match
+    engine. On receivers running in isolated mode it resolves to the
+    `inference` caller — the chart wires it to the `inference-token` key of
+    `prahari-internal`; pre-isolation deployments may instead carry the
+    shared `internal-token` value, which resolves to the `internal` compat
+    caller. Empty sends no credential, matching the receivers'
+    empty-means-open semantics."""
 
     heartbeat_interval_s: float = 10.0
 

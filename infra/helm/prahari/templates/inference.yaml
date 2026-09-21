@@ -110,9 +110,13 @@ spec:
             # fanout_rtsp_url), so the old PRAHARI_MEDIAMTX_RTSP/_HLS fallbacks
             # here were dead env — deleted, not re-pointed.
             #
-            # One token authenticates the worker to BOTH gated peers —
+            # One identity authenticates the worker to BOTH gated peers —
             # X-Internal-Token on registry heartbeats/assignments and
             # x-internal-token metadata on the match-engine gRPC stream.
+            # Its OWN `inference` caller token now: both receivers run
+            # isolated gates that resolve it to `inference`, so a leaked
+            # worker token reaches only the surfaces inference may call —
+            # not correlation, and nothing under a different identity.
             # optional is security.internalSecretRequired-driven: false for
             # local dev (empty token = enforcement off, warned at startup),
             # true in real profiles so a missing prahari-internal Secret
@@ -121,7 +125,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: prahari-internal
-                  key: internal-token
+                  key: inference-token
                   optional: {{ not .Values.security.internalSecretRequired }}
             # Model device — selected here, never sniffed at runtime. The gpu
             # profile sets cuda; local stays cpu.

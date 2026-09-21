@@ -73,6 +73,16 @@ async def test_registry_client_default_client_carries_the_internal_token():
     await client.aclose()
 
 
+async def test_registry_client_falls_back_to_the_service_identity_token():
+    # One caller identity per service: with no registry-specific override
+    # the BFF's own `internal_token` is what the registry sees — under
+    # per-service credentials that is the `bff` identity (bff-token key).
+    settings = BFFSettings(registry_internal_token="", internal_token="bff-self")
+    client = RegistryClient(settings)
+    assert client._client.headers["x-internal-token"] == "bff-self"
+    await client.aclose()
+
+
 # --- MatchEngineClient ----------------------------------------------------------
 
 

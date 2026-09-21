@@ -21,16 +21,16 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Container, Iterator, Mapping
 from concurrent import futures
 from datetime import UTC
 
 import grpc
 from prahari.v1 import adapter_pb2, adapter_pb2_grpc
-from prahari_common.internal_auth import expected_token_ok, provided_token
+from prahari_common.internal_auth import caller_accepted, provided_token
 
 from .alerts import AlertBuilder, AlertPublisher
-from .config import MatchSettings
+from .config import ACCEPTED_CALLERS, MatchSettings
 from .dedup import Deduper
 from .detections import DetectionPublisher, NullDetectionPublisher
 from .matcher import WatchlistStore, match
@@ -49,26 +49,41 @@ log = logging.getLogger(__name__)
 
 
 class InternalTokenInterceptor(grpc.ServerInterceptor):
-    """Rejects calls that do not carry the shared `x-internal-token` metadata.
+    """Rejects calls that do not carry an accepted `x-internal-token` metadata.
 
     The gRPC twin of `app.py`'s `require_internal_token` middleware: an open
     `MetadataIngestService` lets anything that can reach the pod inject
     detections — and therefore alerts — straight into the evidence trail, so
     it is gated by the same credential as the HTTP surface.
 
-    `serve()` installs it only when `MatchSettings.internal_token` is set;
-    empty means the gate is off (`expected_token_ok`), so the interceptor is
-    simply never built rather than passing everything through a disabled
-    check on every call.
+    `serve()` installs it only when `MatchSettings.internal_token` or
+    `internal_tokens` is set; neither configured means the gate is off, so
+    the interceptor is simply never built rather than passing everything
+    through a disabled check on every call. With `caller_tokens` configured
+    the gate runs isolated — metadata must resolve to an accepted caller
+    (`inference`, `bff`), not merely match a shared value.
     """
 
-    def __init__(self, expected_token: str) -> None:
-        self._expected = expected_token
+    def __init__(
+        self,
+        internal_token: str,
+        *,
+        caller_tokens: Mapping[str, str] | None = None,
+        accepted_callers: Container[str] = (),
+    ) -> None:
+        self._internal_token = internal_token
+        self._caller_tokens = dict(caller_tokens or {})
+        self._accepted_callers = accepted_callers
 
     def intercept_service(self, continuation, handler_call_details):  # noqa: ANN001, ANN202 - grpc's own signature
         handler = continuation(handler_call_details)
         provided = provided_token(dict(handler_call_details.invocation_metadata or ()))
-        if handler is None or expected_token_ok(provided, self._expected):
+        if handler is None or caller_accepted(
+            provided,
+            internal_token=self._internal_token,
+            caller_tokens=self._caller_tokens,
+            accepted_callers=self._accepted_callers,
+        ):
             return handler
 
         def reject(_request_or_iterator, context):  # noqa: ANN001, ANN202
@@ -235,7 +250,15 @@ def serve(
     # the thread count on purpose -- an open-but-idle stream is cheap, and it
     # is in-flight *messages* that occupy handler threads.
     interceptors = (
-        (InternalTokenInterceptor(settings.internal_token),) if settings.internal_token else ()
+        (
+            InternalTokenInterceptor(
+                settings.internal_token,
+                caller_tokens=settings.internal_tokens,
+                accepted_callers=ACCEPTED_CALLERS,
+            ),
+        )
+        if settings.internal_token or settings.internal_tokens
+        else ()
     )
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=settings.grpc_max_workers),

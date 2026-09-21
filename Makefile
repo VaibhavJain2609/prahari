@@ -98,30 +98,70 @@ bff-bootstrap: ## Create the prahari-bff-bootstrap Secret (first-login admin) fr
 	fi
 
 .PHONY: internal-secret
-internal-secret: ## Create the prahari-internal Secret (service token + media token + credential key)
-	# Three keys every real deployment needs:
-	#   internal-token  — required as X-Internal-Token on the registry's /api/*;
-	#                     must match on every internal caller (BFF, correlation).
-	#   worker-token    — the MediaMTX reader credential embedded in worker
-	#                     fan-out URLs as `worker:<token>` userinfo. SEPARATE
-	#                     from internal-token on purpose: it lives inside URLs
-	#                     on every inference pod, so it must not also unlock
-	#                     the internal API, and it rotates independently.
-	#   credential-key  — 32-byte AES-256 key, urlsafe-base64, encrypting
-	#                     cameras.stream_secret (registry crypto.py).
-	# Production should supply real values via INTERNAL_TOKEN, WORKER_MEDIA_TOKEN
-	# and CREDENTIAL_KEY in .env (or a secrets manager); the generated fallbacks
-	# exist so a local cluster works out of the box. This is create-if-absent
-	# on purpose: re-running with generated values would rotate the key that
-	# stored camera credentials were encrypted under.
-	@if kubectl get secret prahari-internal --namespace $(NAMESPACE) >/dev/null 2>&1; then \
-	  echo "prahari-internal already exists — leaving it alone (delete it first to rotate)"; \
+internal-secret: ## Create or top-up the prahari-internal Secret (per-service tokens + media token + credential key)
+	# The keys every real deployment needs:
+	#   internal-token    — the legacy shared credential. Arms every internal
+	#                       gate in "shared" mode, and on an isolated gate
+	#                       resolves to the `internal` compat caller accepted
+	#                       everywhere (loadtest, not-yet-migrated callers).
+	#   bff-token         — the BFF's caller identity; registry, match-engine
+	#                       and correlation all accept `bff`.
+	#   correlation-token — correlation's caller identity (registry accepts
+	#                       `correlation` for camera-location lookups).
+	#   inference-token   — the ingest workers' caller identity (registry +
+	#                       match-engine gRPC accept `inference`).
+	#   worker-token      — the MediaMTX reader credential embedded in worker
+	#                       fan-out URLs as `worker:<token>` userinfo. SEPARATE
+	#                       from internal-token on purpose: it lives inside URLs
+	#                       on every inference pod, so it must not also unlock
+	#                       the internal API, and it rotates independently.
+	#   credential-key    — 32-byte AES-256 key, urlsafe-base64, encrypting
+	#                       cameras.stream_secret (registry crypto.py).
+	# Production should supply real values via INTERNAL_TOKEN, BFF_TOKEN,
+	# CORRELATION_TOKEN, INFERENCE_TOKEN, WORKER_MEDIA_TOKEN and CREDENTIAL_KEY
+	# in .env (or a secrets manager); the generated fallbacks exist so a local
+	# cluster works out of the box.
+	#
+	# An existing Secret is TOPPED UP, never rewritten: only keys it is
+	# missing are merged in, so re-running can never rotate credential-key
+	# out from under cameras.stream_secret or churn a live token. Upgrading a
+	# deployment that predates per-service tokens therefore needs no Secret
+	# surgery — just re-run this target.
+	@test ! -f .env || { set -a; . ./.env; set +a; }; \
+	tok() { \
+	  case "$$1" in \
+	    internal-token)    printf %s "$${INTERNAL_TOKEN:-$$(openssl rand -hex 32)}" ;; \
+	    worker-token)      printf %s "$${WORKER_MEDIA_TOKEN:-$$(openssl rand -hex 32)}" ;; \
+	    credential-key)    printf %s "$${CREDENTIAL_KEY:-$$(python3 -c 'import secrets,base64;print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())')}" ;; \
+	    bff-token)         printf %s "$${BFF_TOKEN:-$$(openssl rand -hex 32)}" ;; \
+	    correlation-token) printf %s "$${CORRELATION_TOKEN:-$$(openssl rand -hex 32)}" ;; \
+	    inference-token)   printf %s "$${INFERENCE_TOKEN:-$$(openssl rand -hex 32)}" ;; \
+	  esac; \
+	}; \
+	KEYS="internal-token worker-token credential-key bff-token correlation-token inference-token"; \
+	if kubectl get secret prahari-internal --namespace $(NAMESPACE) >/dev/null 2>&1; then \
+	  patch=""; \
+	  for key in $$KEYS; do \
+	    if ! kubectl get secret prahari-internal --namespace $(NAMESPACE) \
+	        -o "jsonpath={.data.$$key}" | grep -q .; then \
+	      patch="$$patch\"$$key\":\"$$(tok $$key | base64 | tr -d '\n')\","; \
+	    fi; \
+	  done; \
+	  if [ -z "$$patch" ]; then \
+	    echo "prahari-internal already exists with all keys — leaving it alone"; \
+	  else \
+	    kubectl patch secret prahari-internal --namespace $(NAMESPACE) \
+	      --type merge -p "{\"data\":{$${patch%,}}}" >/dev/null && \
+	    echo "topped up prahari-internal — added only the missing keys (existing values untouched)"; \
+	  fi; \
 	else \
-	  test ! -f .env || { set -a; . ./.env; set +a; }; \
 	  kubectl create secret generic prahari-internal --namespace $(NAMESPACE) \
-	    --from-literal=internal-token="$${INTERNAL_TOKEN:-$$(openssl rand -hex 32)}" \
-	    --from-literal=worker-token="$${WORKER_MEDIA_TOKEN:-$$(openssl rand -hex 32)}" \
-	    --from-literal=credential-key="$${CREDENTIAL_KEY:-$$(python3 -c 'import secrets,base64;print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())')}" \
+	    --from-literal=internal-token="$$(tok internal-token)" \
+	    --from-literal=worker-token="$$(tok worker-token)" \
+	    --from-literal=credential-key="$$(tok credential-key)" \
+	    --from-literal=bff-token="$$(tok bff-token)" \
+	    --from-literal=correlation-token="$$(tok correlation-token)" \
+	    --from-literal=inference-token="$$(tok inference-token)" \
 	    --dry-run=client -o yaml | kubectl apply -f -; \
 	fi
 

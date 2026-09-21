@@ -30,9 +30,9 @@ inference workers ──HTTP──▶ registry (assignments, heartbeats)
 | Browser → BFF | `auth.kind`: `builtin` (argon2id login → `prahari_session` cookie, HttpOnly/SameSite=Lax/Secure-by-default) or `keycloak` (OIDC code+PKCE, server-side exchange mints the same cookie; docs/KEYCLOAK.md). `pk_…` API keys stored sha256 | **Implemented.** `session_cookie_secure` is `false` only in the local profile — the chart sets it. Login is throttled (per-username + per-source sliding window) and timing-equalised; login/logout/denials are audit entries. |
 | web → BFF | single `/api/bff/*` proxy; cookie + `X-Purpose-Code` + `Origin`/`X-Forwarded-Host` forwarded; decoded `.`/`..`/`%`/`\` segments rejected | **Implemented.** Browser never sees another origin; the proxy cannot be used to smuggle paths off `/api/v1/`. |
 | Caller → scoped data | BFF forces `org_scope` from the principal (`_scoped_params`); registry predicates on `ltree path <@ scope`; denials audited | **Implemented** — and the registry surface is no longer ambiently readable (next row). |
-| Internal callers → registry | `X-Internal-Token`, `hmac.compare_digest`, constant-time; every service sends it; chart injects from `prahari-internal` Secret | **Implemented and armed by the chart** (key `internal-token`; `security.internalSecretRequired: true` in real profiles makes a missing Secret a pod-start failure rather than a silent disarm — `optional` stays true only locally, where enforcement-off is the documented default). **Residual:** one shared token — a compromised worker can impersonate any internal caller. Per-service identities are deferred (§5). |
-| Workers → match-engine | gRPC `MetadataIngestService` + `x-internal-token` metadata interceptor | **Implemented.** Still plaintext TCP — mTLS deferred (§5). |
-| BFF → correlation / match-engine | `X-Internal-Token` on both HTTP surfaces | **Implemented.** |
+| Internal callers → registry | `X-Internal-Token`, `hmac.compare_digest`, constant-time; each caller sends its own identity and the gate resolves it to a caller name checked against an allowlist (`bff`, `correlation`, `inference`); chart injects per-service keys from `prahari-internal` | **Implemented and armed by the chart** (per-caller `PRAHARI_CALLER_TOKEN_*` envs from keys `bff-token`/`correlation-token`/`inference-token` assemble the `internal_tokens` map; `security.internalSecretRequired: true` in real profiles makes a missing Secret a pod-start failure rather than a silent disarm). **Posture:** isolated per-service identities when `internal_tokens` is configured; shared-token fallback (`internal-token`, the `internal` caller) for compatibility — a Secret that predates the per-service keys keeps working in the old posture until `make internal-secret` tops it up. `/readyz` reports `internal_auth: isolated|shared|open`. |
+| Workers → match-engine | gRPC `MetadataIngestService` + `x-internal-token` metadata interceptor resolving to caller identity; allowlist `inference`, `bff` | **Implemented.** A leaked worker token now opens only what `inference` may call. Still plaintext TCP — mTLS deferred (§5). |
+| BFF → correlation / match-engine | `X-Internal-Token` on both HTTP surfaces, carrying the BFF's own `bff` identity (`bff-token` key) | **Implemented.** Correlation accepts `bff` only; match-engine accepts `bff` + `inference`. |
 | Services → Postgres | password auth, out-of-band Secret | **Implemented** — `prahari-postgres` is generated once with `helm.sh/resource-policy: keep`; it no longer re-rolls on upgrade. |
 | Services → Redis | `requirepass` via generated `prahari-redis-auth` Secret; all first-party consumers + the KEDA scaler carry the credential | **Implemented.** No TLS inside the cluster — deferred (§5). |
 | Browser → MediaMTX | `POST /api/v1/media/preview-ticket` (auth + `X-Purpose-Code` + org scope) → `video_preview` audit entry → scoped Ed25519 JWT (`mediamtx_permissions: read cam-<id>`, short TTL) | **Implemented** — the audit-before-mint ordering is fail-closed: a failed audit write means no ticket. |
@@ -98,7 +98,7 @@ happen; upstream failures are recorded as `*_failed` actions.
 | Secret | Held by | How it gets there |
 |---|---|---|
 | Gateway host/password (`PRAHARI_GATEWAY_*`) | registry only | `make gateway-secret` → `kubectl create secret generic prahari-gateway --from-env-file=.env`. All `GatewaySettings` fields map — DIRECT_HOST, RTSP/WHEP ports, VERIFY_TLS included. Never in values.yaml/tfvars/commits. |
-| `credential-key` + `internal-token` + `worker-token` | `prahari-internal` Secret → registry, BFF, workers, correlation, match-engine | `make internal-secret` (idempotent; create-if-absent so a re-run can't rotate the key encrypted credentials depend on). `worker-token` is the MediaMTX reader credential in fan-out URLs — deliberately a different secret from `internal-token`, since it lives inside URLs on every worker pod and rotates independently. |
+| `credential-key` + `internal-token` + `worker-token` + per-service `bff-token`/`correlation-token`/`inference-token` | `prahari-internal` Secret → registry, BFF, workers, correlation, match-engine | `make internal-secret` (idempotent; tops an existing Secret up with only the keys it is missing, so a re-run can neither rotate `credential-key` out from under stored credentials nor churn live tokens). `worker-token` is the MediaMTX reader credential in fan-out URLs — deliberately a different secret from `internal-token`, since it lives inside URLs on every worker pod and rotates independently. Each `<service>-token` is that service's caller identity: it is mounted only into the service that presents it and into the receivers that accept it as a `PRAHARI_*_CALLER_TOKEN_*` env; `internal-token` remains as the shared `internal` compat caller. |
 | `prahari-redis-auth` | Redis + every consumer + KEDA trigger | Generated by the chart (`resource-policy: keep`). |
 | `prahari-oidc` (`client-secret`) | BFF only | Operator-created when `auth.kind=keycloak`. |
 | `prahari-bff-bootstrap` | BFF | `make bff-bootstrap` — seeds the first admin only when the users table is empty; refuses to generate a password silently. |
@@ -125,13 +125,16 @@ Real gaps, tracked against `docs/NEXT-PHASE-PLAN.md` §5/E:
 
 - **mTLS** on internal links — token-in-metadata shipped; a mesh is
   disproportionate at this scale.
-- **Per-service internal credentials** — one shared `internal-token` means a
-  compromised worker impersonates any internal caller. Service-scoped tokens
-  or SPIFFE identities are the fix. The same applies one level down:
-  `GET /api/v1/assignments` now only serves a registered, still-alive
-  `worker_id` (no auto-registration on fetch), but that id is still bound to
-  the shared token rather than a per-pod credential — binding worker
-  identity to per-pod credentials remains deferred with this item.
+- **Per-pod caller identity** — per-SERVICE internal credentials shipped:
+  `internal_tokens` maps caller names to distinct tokens and each receiver
+  enforces an allowlist, so a compromised worker can no longer impersonate
+  the BFF or correlation. What is still shared is the granularity *within* a
+  service: every inference replica holds the same `inference-token`, so one
+  pod's compromise is that service's compromise (and `GET
+  /api/v1/assignments` `worker_id`s are still bound to the service token,
+  not a per-pod credential). SPIFFE/SPIRE or per-pod minted identities are
+  the fix; the `internal` shared-token compat caller also remains until the
+  last shared-credential caller (loadtest, ad-hoc ops) is retired.
 - **Evidence pull** — a signed capability `(camera, range, purpose)` redeemed
   for a clip. Preview is solved (audited tickets); nothing stores or serves
   edge video segments yet, and `evidence_ref` is still unpopulated.

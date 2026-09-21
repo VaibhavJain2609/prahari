@@ -102,12 +102,26 @@ dead env, which the chart↔settings parity test now fails on.
 
 {{/*
 Out-of-band Secret shared by the internal-token callers. Created once, by hand
-or Terraform, never from values.yaml:
+or Terraform, never from values.yaml (`make internal-secret` generates — and
+tops up, without rewriting existing keys — exactly this shape):
 
   kubectl create secret generic prahari-internal \
     --from-literal=internal-token=$(openssl rand -hex 32) \
+    --from-literal=bff-token=$(openssl rand -hex 32) \
+    --from-literal=correlation-token=$(openssl rand -hex 32) \
+    --from-literal=inference-token=$(openssl rand -hex 32) \
     --from-literal=worker-token=$(openssl rand -hex 32) \
     --from-literal=credential-key=$(openssl rand -base64 32)
+
+Key semantics: each SENDING service mounts its own `<service>-token` key as
+its caller identity. Each RECEIVING service mounts the matching keys as
+PRAHARI_*_CALLER_TOKEN_<NAME>, which the settings model merges into the
+`internal_tokens` caller map — a presented token resolves to a caller name
+and must be on that service's allowlist. `internal-token` is the legacy
+shared credential: it keeps arming the gates directly on a Secret that
+predates the per-service keys, and on an isolated gate it resolves to the
+`internal` caller, accepted everywhere (the compat path for the loadtest
+driver and not-yet-migrated callers).
 
 `security.internalSecretRequired` drives `optional:` on every reference to
 this Secret. False (local default) lets pods boot without it — the registry
@@ -168,6 +182,33 @@ because a missing credential must not take down camera health as well as sync.
     secretKeyRef:
       name: prahari-internal
       key: internal-token
+      optional: {{ not .Values.security.internalSecretRequired }}
+# Per-caller tokens -> RegistrySettings.caller_token_* -> internal_tokens.
+# One env per accepted caller because Kubernetes env expansion cannot
+# assemble a JSON map from several secretKeyRefs. With all three present the
+# gate runs "isolated": a token resolves to a caller name (bff/correlation/
+# inference) that must be on the registry's allowlist; internal-token keeps
+# working as the "internal" compat caller. On a Secret that lacks these keys
+# the map is empty and the gate stays in shared mode — the pre-isolation
+# behaviour, so an un-upgraded Secret degrades to the old posture rather
+# than locking every caller out.
+- name: PRAHARI_CALLER_TOKEN_BFF
+  valueFrom:
+    secretKeyRef:
+      name: prahari-internal
+      key: bff-token
+      optional: {{ not .Values.security.internalSecretRequired }}
+- name: PRAHARI_CALLER_TOKEN_CORRELATION
+  valueFrom:
+    secretKeyRef:
+      name: prahari-internal
+      key: correlation-token
+      optional: {{ not .Values.security.internalSecretRequired }}
+- name: PRAHARI_CALLER_TOKEN_INFERENCE
+  valueFrom:
+    secretKeyRef:
+      name: prahari-internal
+      key: inference-token
       optional: {{ not .Values.security.internalSecretRequired }}
 - name: PRAHARI_CREDENTIAL_KEY
   valueFrom:
@@ -271,9 +312,10 @@ deliberately-internal allowlist (M3 found the reverse direction matters:
 the shared Redis bus in any deployed profile).
 
 PRAHARI_MATCH_INTERNAL_TOKEN gates the HTTP admin surface AND the
-MetadataIngestService gRPC port (the InternalTokenInterceptor). Same shared
-Secret key as the registry's gate — every service reads the same value so a
-rotation is one Secret update, not five.
+MetadataIngestService gRPC port (the InternalTokenInterceptor) — as the
+`internal` compat caller now that PRAHARI_MATCH_CALLER_TOKEN_* arms the
+isolated gate: a presented token must resolve to `inference` or `bff`, the
+only callers this service accepts.
 
 Note what else is absent: no gateway credential. The match engine sees plate
 strings, never pixels and never the feed, so it has no business holding the
@@ -325,6 +367,22 @@ password.
       name: prahari-internal
       key: internal-token
       optional: {{ not .Values.security.internalSecretRequired }}
+# Per-caller tokens -> MatchSettings.caller_token_* -> internal_tokens (see
+# registryEnv for why these are per-key envs and not one JSON var). With
+# these present both gates run "isolated": x-internal-token must resolve to
+# `inference` (the worker gRPC link) or `bff` (the HTTP admin surface).
+- name: PRAHARI_MATCH_CALLER_TOKEN_INFERENCE
+  valueFrom:
+    secretKeyRef:
+      name: prahari-internal
+      key: inference-token
+      optional: {{ not .Values.security.internalSecretRequired }}
+- name: PRAHARI_MATCH_CALLER_TOKEN_BFF
+  valueFrom:
+    secretKeyRef:
+      name: prahari-internal
+      key: bff-token
+      optional: {{ not .Values.security.internalSecretRequired }}
 {{- end -}}
 
 {{/*
@@ -336,10 +394,13 @@ publishes `prahari:detections` on. database_url unset means "sightings are
 memory-only" and /readyz reports `persistence: in-memory` — so it is also set
 here, pointed at the same Postgres database the registry uses.
 
-Two token fields, same Secret key: INTERNAL_TOKEN gates this service's own
-/api/* (route reconstruction is surveillance capability — it must not be
-callable by any pod that can reach the Service), and REGISTRY_INTERNAL_TOKEN
-is what it sends to a gated registry for camera-location lookups.
+Three token fields, distinct Secret keys: INTERNAL_TOKEN gates this
+service's own /api/* as the `internal` compat caller (route reconstruction
+is surveillance capability — it must not be callable by any pod that can
+reach the Service), CALLER_TOKEN_BFF arms the isolated gate (the BFF is the
+only accepted caller), and REGISTRY_INTERNAL_TOKEN is the identity it sends
+to a gated registry for camera-location lookups — its own `correlation`
+caller token, not the shared value.
 */}}
 {{- define "prahari.correlationEnv" -}}
 - name: PRAHARI_CORRELATION_HTTP_PORT
@@ -372,11 +433,20 @@ is what it sends to a gated registry for camera-location lookups.
       name: prahari-internal
       key: internal-token
       optional: {{ not .Values.security.internalSecretRequired }}
+# -> CorrelationSettings.caller_token_bff -> internal_tokens: the isolated
+# gate accepts exactly one caller — the BFF. Per-key env, not a JSON map;
+# see registryEnv for why.
+- name: PRAHARI_CORRELATION_CALLER_TOKEN_BFF
+  valueFrom:
+    secretKeyRef:
+      name: prahari-internal
+      key: bff-token
+      optional: {{ not .Values.security.internalSecretRequired }}
 - name: PRAHARI_CORRELATION_REGISTRY_INTERNAL_TOKEN
   valueFrom:
     secretKeyRef:
       name: prahari-internal
-      key: internal-token
+      key: correlation-token
       optional: {{ not .Values.security.internalSecretRequired }}
 {{- end -}}
 
@@ -393,21 +463,23 @@ registry, relays alerts off Redis Streams, and owns the hash-chained audit log
   value: "http://prahari-registry:{{ .Values.services.registry.port }}"
 - name: PRAHARI_CORRELATION_BASE_URL
   value: "http://prahari-correlation:{{ .Values.services.correlation.port }}"
-# X-Internal-Token the BFF sends the registry; must match PRAHARI_INTERNAL_TOKEN
-# there. Same Secret, same key, same optional-local rule.
+# X-Internal-Token the BFF sends the registry — its own `bff` caller
+# identity now, which the registry's isolated gate resolves from the
+# bff-token key (PRAHARI_CALLER_TOKEN_BFF there). Same optional-local rule.
 - name: PRAHARI_REGISTRY_INTERNAL_TOKEN
   valueFrom:
     secretKeyRef:
       name: prahari-internal
-      key: internal-token
+      key: bff-token
       optional: {{ not .Values.security.internalSecretRequired }}
-# The match engine's HTTP admin + gRPC are gated by PRAHARI_MATCH_INTERNAL_TOKEN
-# on its side; the BFF sends the same shared value (BFFSettings.internal_token).
+# The BFF's own caller identity on match-engine and correlation calls —
+# both resolve it to `bff` under their isolated gates. Same Secret, same
+# key as above: one service, one identity.
 - name: PRAHARI_INTERNAL_TOKEN
   valueFrom:
     secretKeyRef:
       name: prahari-internal
-      key: internal-token
+      key: bff-token
       optional: {{ not .Values.security.internalSecretRequired }}
 # Watchlist summary/reload + alert history proxy targets.
 - name: PRAHARI_MATCH_ENGINE_BASE_URL

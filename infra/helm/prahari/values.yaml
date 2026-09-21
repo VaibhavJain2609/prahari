@@ -283,6 +283,14 @@ security:
   # X-Internal-Token gate, the match-engine gRPC interceptor, and the
   # MediaMTX auth callback all silently disarm at once.
   #
+  # The Secret carries per-service caller keys (bff-token, correlation-token,
+  # inference-token) plus the legacy shared internal-token. With all of them
+  # present the internal gates run "isolated" — a token resolves to a caller
+  # identity checked against a per-service allowlist. A Secret missing the
+  # per-service keys degrades each gate to the shared-token check, the
+  # pre-isolation posture; `make internal-secret` tops an existing Secret up
+  # without rewriting existing keys.
+  #
   # False here because the local profile is the documented enforcement-off
   # dev mode; every real profile sets it true. The media-JWT key is exempt
   # (see bffEnv) — its absence degrades to an ephemeral keypair, which is a

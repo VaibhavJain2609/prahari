@@ -8,7 +8,6 @@ low-rate and human-facing, and JSON keeps the console and `curl` on equal terms.
 from __future__ import annotations
 
 import asyncio
-import hmac
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -18,10 +17,11 @@ import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse, PlainTextResponse
 from prahari_common.config import GatewaySettings
+from prahari_common.internal_auth import caller_accepted, gate_posture, provided_token
 from pydantic import ValidationError
 
 from . import gaps
-from .config import RegistrySettings, registry_settings
+from .config import ACCEPTED_CALLERS, RegistrySettings, registry_settings
 from .crypto import CredentialKeyError
 from .db import apply_migrations, create_pool, timescale_available
 from .health import HealthPolicy, derive_state
@@ -122,13 +122,17 @@ async def _retention_loop(
 async def lifespan(app: FastAPI):
     settings: RegistrySettings = registry_settings()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    if not settings.internal_token:
+    posture = gate_posture(settings.internal_token, settings.internal_tokens)
+    if posture == "open":
         log.warning(
-            "internal API unauthenticated (PRAHARI_INTERNAL_TOKEN unset) — "
-            "every /api/* request is accepted without an X-Internal-Token "
-            "header. Acceptable only where nothing off-cluster can reach this "
-            "service; every real profile must set a shared token."
+            "internal API unauthenticated (neither PRAHARI_INTERNAL_TOKEN nor "
+            "a caller-token map set) — every /api/* request is accepted "
+            "without an X-Internal-Token header. Acceptable only where "
+            "nothing off-cluster can reach this service; every real profile "
+            "must arm the gate."
         )
+    else:
+        log.info("internal auth posture: %s", posture)
 
     pool = await create_pool(settings)
     applied = await apply_migrations(pool)
@@ -197,13 +201,19 @@ async def require_internal_token(request: Request, call_next):
 
     Semantics are deliberately asymmetric:
 
-    * **Token configured → fail closed.** Any request other than `/healthz`
-      `/readyz` without a byte-identical `X-Internal-Token` gets a 401. The
-      comparison is `hmac.compare_digest` — a `!=` string compare leaks the
-      token a byte at a time through response timing.
-    * **Token empty → enforcement is OFF.** Requests pass with no check.
-      This is the local/dev default and is logged loudly at startup; it is
-      NOT fail-closed, which is why every real profile must set a token.
+    * **Armed → fail closed.** Any request other than the exempt paths below
+      gets a 401 unless its `X-Internal-Token` resolves to an accepted
+      caller. Two armed postures (`caller_accepted`): *shared* — a
+      byte-identical match on `internal_token`, the pre-isolation check —
+      and *isolated* — `internal_tokens` configured, so the token must
+      resolve to a caller in `ACCEPTED_CALLERS` (`bff`, `correlation`,
+      `inference`, plus the `internal` compat identity `internal_token`
+      resolves to). Comparisons are `hmac.compare_digest` throughout — a
+      `!=` string compare leaks the token a byte at a time through response
+      timing.
+    * **Nothing configured → enforcement is OFF.** Requests pass with no
+      check. This is the local/dev default and is logged loudly at startup;
+      it is NOT fail-closed, which is why every real profile must arm it.
 
     `/healthz` and `/readyz` are exempt — a liveness/readiness probe carries
     no data and must not depend on a secret being wired correctly to answer.
@@ -213,18 +223,21 @@ async def require_internal_token(request: Request, call_next):
     MediaMTX defers to (`authMethod: http`), and the restreamer cannot send
     this header — gating it would deadlock the video plane. Everything else
     under `/api/*` (and, deliberately, everything not yet under `/api/*`)
-    requires the header when a token is configured.
+    requires an accepted credential when the gate is armed.
     """
     settings: RegistrySettings = request.app.state.settings
-    if settings.internal_token and request.url.path not in (
+    armed = bool(settings.internal_token or settings.internal_tokens)
+    if armed and request.url.path not in (
         "/healthz",
         "/readyz",
         "/metrics",
         "/api/v1/mediamtx/auth",
     ):
-        provided = request.headers.get("x-internal-token")
-        if provided is None or not hmac.compare_digest(
-            provided.encode(), settings.internal_token.encode()
+        if not caller_accepted(
+            provided_token(request.headers),
+            internal_token=settings.internal_token,
+            caller_tokens=settings.internal_tokens,
+            accepted_callers=ACCEPTED_CALLERS,
         ):
             return Response(
                 status_code=status.HTTP_401_UNAUTHORIZED, content="internal token required"
@@ -356,7 +369,8 @@ async def healthz(request: Request) -> dict:
 
 
 @app.get("/readyz", tags=["ops"])
-async def readyz(pool: PoolDep, response: Response) -> dict:
+async def readyz(pool: PoolDep, settings: SettingsDep, response: Response) -> dict:
+    posture = gate_posture(settings.internal_token, settings.internal_tokens)
     try:
         await pool.fetchval("SELECT 1")
     except (asyncpg.PostgresError, OSError) as exc:
@@ -364,8 +378,8 @@ async def readyz(pool: PoolDep, response: Response) -> dict:
         # this endpoint answers unauthenticated callers, so log it, don't leak it.
         log.warning("readyz: database check failed: %s", exc)
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return {"status": "unavailable", "database": "error"}
-    return {"status": "ready", "database": "ok"}
+        return {"status": "unavailable", "database": "error", "internal_auth": posture}
+    return {"status": "ready", "database": "ok", "internal_auth": posture}
 
 
 @app.get("/metrics", tags=["ops"], response_class=PlainTextResponse)

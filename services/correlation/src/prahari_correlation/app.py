@@ -12,9 +12,9 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, Request, Response, status
 from fastapi.responses import PlainTextResponse
-from prahari_common.internal_auth import expected_token_ok, provided_token
+from prahari_common.internal_auth import caller_accepted, gate_posture, provided_token
 
-from .config import CorrelationSettings, correlation_settings
+from .config import ACCEPTED_CALLERS, CorrelationSettings, correlation_settings
 from .consumer import DetectionConsumer
 from .db import PostgresSightings, apply_migrations, create_pool
 from .metrics import Metrics
@@ -71,18 +71,24 @@ async def lifespan(app: FastAPI):
     # unbounded by the LRU), the in-memory store otherwise.
     sightings: SightingSource = db if db is not None else store
 
-    if not settings.internal_token:
+    posture = gate_posture(settings.internal_token, settings.internal_tokens)
+    if posture == "open":
         log.warning(
-            "internal auth disabled: PRAHARI_CORRELATION_INTERNAL_TOKEN is unset, "
-            "so /api/* is reachable by anything that can reach this pod"
+            "internal auth disabled: neither PRAHARI_CORRELATION_INTERNAL_TOKEN "
+            "nor a caller-token map is set, so /api/* is reachable by anything "
+            "that can reach this pod"
         )
+    else:
+        log.info("internal auth posture: %s", posture)
 
     registry = RegistryClient(
         settings.registry_base_url,
         settings.registry_timeout_s,
         settings.camera_location_cache_ttl_s,
         metrics=metrics,
-        internal_token=settings.registry_internal_token,
+        # This service's own identity token; the shared `internal_token` is
+        # the fallback for deployments that predate per-service credentials.
+        internal_token=settings.registry_internal_token or settings.internal_token,
     )
 
     metrics.gauge("store_plates", store.tracked_plate_count)
@@ -126,14 +132,21 @@ async def require_internal_token(request: Request, call_next):
     depend on a secret being wired correctly to answer. `/metrics` is exempt
     too: a Prometheus pod scrape cannot carry a credential (the observability
     NetworkPolicy restricts the port to the monitoring namespace on an
-    enforcing CNI). Empty `internal_token` disables the gate entirely
-    (`expected_token_ok`)."""
+    enforcing CNI). With neither `internal_token` nor `internal_tokens`
+    configured the gate is off entirely (`caller_accepted`); with
+    `internal_tokens` set it runs isolated — a token must resolve to an
+    accepted caller (just `bff` here), not merely match a shared value."""
     # Tests that build the app without lifespan never set app.state.settings —
     # an absent settings object means an absent token, which is gate-off anyway.
     settings: CorrelationSettings | None = getattr(request.app.state, "settings", None)
-    token = settings.internal_token if settings else ""
-    if token and request.url.path not in ("/healthz", "/readyz", "/metrics"):
-        if not expected_token_ok(provided_token(request.headers), token):
+    armed = bool(settings and (settings.internal_token or settings.internal_tokens))
+    if armed and request.url.path not in ("/healthz", "/readyz", "/metrics"):
+        if not caller_accepted(
+            provided_token(request.headers),
+            internal_token=settings.internal_token,
+            caller_tokens=settings.internal_tokens,
+            accepted_callers=ACCEPTED_CALLERS,
+        ):
             return Response(
                 status_code=status.HTTP_401_UNAUTHORIZED, content="internal token required"
             )
@@ -196,7 +209,9 @@ async def healthz() -> dict:
 
 
 @app.get("/readyz", tags=["ops"])
-async def readyz(consumer: ConsumerDep, db: DbDep, response: Response) -> dict:
+async def readyz(
+    consumer: ConsumerDep, db: DbDep, settings: SettingsDep, response: Response
+) -> dict:
     """Ready means: consuming, and persistence is what it claims to be.
 
     The consumer check is unchanged — a service that cannot consume returns
@@ -205,10 +220,17 @@ async def readyz(consumer: ConsumerDep, db: DbDep, response: Response) -> dict:
     configured-but-down database means the consumer can only build pending
     backlog, which is not ready) or `in-memory` (no `database_url`: still
     serving, but a restart loses all route history — said out loud rather
-    than implied)."""
+    than implied). `internal_auth` reports the token gate's posture —
+    `isolated` | `shared` | `open` — so the credential model a pod is
+    enforcing is visible without reading its env."""
+    posture = gate_posture(settings.internal_token, settings.internal_tokens)
     if not consumer.is_connected():
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        return {"status": "unavailable", "reason": "detection consumer not connected to redis"}
+        return {
+            "status": "unavailable",
+            "reason": "detection consumer not connected to redis",
+            "internal_auth": posture,
+        }
     if db is not None:
         try:
             if not await db.ping():
@@ -219,9 +241,10 @@ async def readyz(consumer: ConsumerDep, db: DbDep, response: Response) -> dict:
                 "status": "unavailable",
                 "reason": "postgres unreachable",
                 "persistence": "postgres",
+                "internal_auth": posture,
             }
-        return {"status": "ready", "persistence": "postgres"}
-    return {"status": "ready", "persistence": "in-memory"}
+        return {"status": "ready", "persistence": "postgres", "internal_auth": posture}
+    return {"status": "ready", "persistence": "in-memory", "internal_auth": posture}
 
 
 # --- metrics -----------------------------------------------------------------

@@ -8,8 +8,18 @@ supplied as a Kubernetes Secret.
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Annotated
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from prahari_common.internal_auth import parse_caller_tokens
+from pydantic import field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+# Caller names the registry accepts in isolated mode — the BFF (camera/org
+# reads and writes), correlation (camera-location lookups) and the ingest
+# workers (register/heartbeat/assignments). "internal" — the shared
+# `internal_token` identity — is additionally accepted on every service as
+# the backward-compat path; see prahari_common.internal_auth.caller_accepted.
+ACCEPTED_CALLERS = frozenset({"bff", "correlation", "inference"})
 
 
 class RegistrySettings(BaseSettings):
@@ -115,7 +125,51 @@ class RegistrySettings(BaseSettings):
     real profile's NetworkPolicy does. Every real profile's chart sets a real
     shared value; leaving it empty in the cloud profile would be the same
     silent-no-op failure `CLAUDE.md`'s hard invariant on `PRAHARI_*` env
-    already warns about."""
+    already warns about.
+
+    When `internal_tokens` is configured this value keeps working as the
+    `"internal"` caller identity — the backward-compat credential accepted
+    on every service for anything still holding the shared token."""
+
+    internal_tokens: Annotated[dict[str, str], NoDecode] = {}
+    """Caller-name → token map for per-service isolation
+    (`PRAHARI_INTERNAL_TOKENS`, JSON `{"bff": "..."}` or the comma form
+    `bff:tok,correlation:tok2`). When non-empty the gate runs "isolated": a
+    presented token must resolve to a caller in `ACCEPTED_CALLERS` rather
+    than merely match the shared value — so a leaked worker token no longer
+    unlocks every service. Empty (plus `caller_token_*` unset) means the
+    legacy shared-token check on `internal_token`, which is what keeps
+    pre-isolation deployments working unchanged.
+
+    `NoDecode` keeps pydantic-settings from JSON-decoding the env value
+    itself, so the field validator sees the raw string and can accept the
+    comma form as well as JSON."""
+
+    caller_token_bff: str = ""
+    caller_token_correlation: str = ""
+    caller_token_inference: str = ""
+    """The chart's delivery mechanism for `internal_tokens` — Kubernetes env
+    expansion cannot assemble a JSON map from several `secretKeyRef`s into
+    one var, so the chart emits one `PRAHARI_CALLER_TOKEN_<NAME>` per caller
+    (`prahari-internal` keys `bff-token`, `correlation-token`,
+    `inference-token`) and the model validator below merges them into
+    `internal_tokens`. A `caller_token_*` entry wins over the same name in
+    `internal_tokens` — the specific env beats the aggregate one."""
+
+    @field_validator("internal_tokens", mode="before")
+    @classmethod
+    def _parse_internal_tokens(cls, value: object) -> dict[str, str]:
+        return parse_caller_tokens(value)
+
+    @model_validator(mode="after")
+    def _merge_caller_tokens(self) -> RegistrySettings:
+        merged = dict(self.internal_tokens)
+        for name in ("bff", "correlation", "inference"):
+            token = getattr(self, f"caller_token_{name}")
+            if token:
+                merged[name] = token
+        self.internal_tokens = merged
+        return self
 
     worker_media_token: str = ""
     """The MediaMTX reader credential embedded in fan-out URLs as
