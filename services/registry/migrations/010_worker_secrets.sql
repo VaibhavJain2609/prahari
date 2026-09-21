@@ -1,0 +1,24 @@
+-- Per-worker credential binding: workers.secret_hash holds the SHA-256 hex
+-- digest of a registry-minted secret that every subsequent register /
+-- assignments / heartbeat call from that worker_id must present as
+-- X-Worker-Secret.
+--
+-- The per-service caller tokens (X-Internal-Token resolving to `inference`)
+-- answer *which service* may call, but every inference replica holds the same
+-- token — so a stolen inference-token could claim ANY worker_id: steal a live
+-- worker's lease and shard, or spoof heartbeats under its name. Binding a
+-- minted secret to the worker_id closes that: the shared token still
+-- authorizes the call, the per-worker secret proves WHICH worker it is.
+--
+-- Only the digest is stored, never the secret itself — a database dump then
+-- yields no live worker credentials. The digest needs no password-stretching
+-- KDF: the secret is a 256-bit `secrets.token_urlsafe` mint, so there is no
+-- dictionary to attack.
+--
+-- Nullable on purpose: NULL is an unbound worker — exactly the pre-binding
+-- behaviour — so un-upgraded workers keep registering and heartbeating until
+-- they opt in (a mint request on register). An operator clears the column to
+-- rebind a worker whose secret was lost; the row itself is still reaped at
+-- 3x the lease as before.
+
+ALTER TABLE workers ADD COLUMN secret_hash text;

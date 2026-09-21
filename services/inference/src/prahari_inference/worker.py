@@ -30,6 +30,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 
 import httpx
 from prahari_common import internal_auth
@@ -57,6 +58,13 @@ log = logging.getLogger(__name__)
 # the probe reads as a dead pod — so an unreachable registry must degrade to
 # "no cameras yet", not to a crashloop.
 _BOOT_FETCH_ATTEMPTS = 5
+
+WORKER_SECRET_HEADER = "x-worker-secret"
+"""The per-worker credential's name on the wire — a second header layered on
+`X-Internal-Token`, not a replacement for it. The registry mints the secret
+at registration, stores only its SHA-256 digest (`workers.secret_hash`), and
+refuses any call on a bound worker_id that cannot present it. Byte-identical
+to the constant in `prahari_registry.app`."""
 
 
 def worker_id(settings: IngestSettings | None = None) -> str:
@@ -152,6 +160,70 @@ class RegistryClient:
             # client, not per request. Set on an injected client too — the
             # credential is this client's contract, not a construction detail.
             self._http.headers[internal_auth.HEADER_NAME] = settings.internal_token
+        # The second credential (migration 010): minted by the registry on the
+        # register that asked for it, presented on every worker-facing call
+        # once held. Loaded from `worker_secret_path` so a restart on a stable
+        # worker_id does not orphan the binding the registry still holds.
+        self._worker_secret = self._load_worker_secret()
+
+    # --- the per-worker secret (X-Worker-Secret) --------------------------------
+
+    def _secret_headers(self) -> dict[str, str]:
+        """The bound worker's credential headers — empty until the registry
+        has minted us a secret, which is exactly how an unbound worker_id
+        must look on the wire."""
+        if self._worker_secret is None:
+            return {}
+        return {WORKER_SECRET_HEADER: self._worker_secret}
+
+    def _load_worker_secret(self) -> str | None:
+        """Re-read the secret a previous boot persisted, when a path is set.
+
+        A missing file is the normal first-boot case, not an error; anything
+        else unreadable is logged and treated the same way — the worker then
+        re-registers for a mint, which succeeds only if the registry row is
+        unbound (a bound one 403s, logged in `register`).
+        """
+        path = self._s.worker_secret_path
+        if not path:
+            return None
+        try:
+            text = Path(path).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not text:
+            return None
+        log.info("worker secret reloaded from %s", path)
+        return text
+
+    def _persist_worker_secret(self) -> None:
+        """Write the minted secret to `worker_secret_path`, if configured.
+
+        Temp-file-then-rename so a crash mid-write cannot leave a truncated
+        credential that would fail every future call; 0600 because it IS a
+        credential. A write failure is a warning, not a raise: the secret
+        still works in memory — the cost is only that a restart on a stable
+        worker_id orphans the binding (the documented trade-off of running
+        without persistence).
+        """
+        path = self._s.worker_secret_path
+        if not path or self._worker_secret is None:
+            return
+        try:
+            target = Path(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(target.name + ".tmp")
+            tmp.write_text(self._worker_secret + "\n", encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            tmp.replace(target)
+        except OSError as exc:
+            log.warning(
+                "could not persist worker secret to %s: %s — held in memory only; "
+                "a restart on this worker_id will 403 until the row is reaped "
+                "or workers.secret_hash is cleared",
+                path,
+                exc,
+            )
 
     def register(self) -> dict | None:
         """Join or refresh the sharding pool. Returns the registration, or
@@ -162,31 +234,58 @@ class RegistryClient:
         what makes this worker count toward `shard_count`. Any non-404 failure
         propagates — the caller treats it as a registry outage and keeps the
         camera set it already has.
+
+        Secret binding: while this worker holds no secret it sends
+        `rotate_secret` — on an unbound worker_id that is the opt-in mint
+        (the response's `worker_secret`, adopted and persisted below); on a
+        bound one it is refused, because re-keying requires the CURRENT
+        secret and we just said we do not have one. A 403 here is therefore
+        the orphaned-binding case and is logged as such: it cannot be
+        retried away — the operator clears `workers.secret_hash` (or the 3x
+        lease reaper removes the row) before this id can be claimed again.
         """
-        response = self._http.post("/api/v1/workers/register", json={"worker_id": self.worker_id})
+        body: dict[str, object] = {"worker_id": self.worker_id}
+        if self._worker_secret is None:
+            body["rotate_secret"] = True
+        response = self._http.post(
+            "/api/v1/workers/register", json=body, headers=self._secret_headers()
+        )
         if response.status_code == 404:
             return None
+        if response.status_code == 403:
+            log.error(
+                "register refused: worker_id=%s is bound to a worker secret this "
+                "pod does not hold. A bound id cannot be re-claimed without its "
+                "secret — restore it via worker_secret_path, or have an operator "
+                "clear the row's workers.secret_hash (or wait for the 3x-lease "
+                "reap) to rebind",
+                self.worker_id,
+            )
         response.raise_for_status()
-        body = response.json()
-        if not isinstance(body, dict) or "shard_count" not in body:
+        payload = response.json()
+        if not isinstance(payload, dict) or "shard_count" not in payload:
             # Endpoint exists but answered nonsense — treat like the 404: the
             # unsharded fetch still yields a usable camera set, which beats
             # raising a non-HTTP error the reconcile loop does not catch.
             self._mark_unsharded("register returned a malformed body")
             return None
-        shard = (body.get("shard_index"), body.get("shard_count"))
+        minted = payload.get("worker_secret")
+        if minted:
+            self._worker_secret = minted
+            self._persist_worker_secret()
+        shard = (payload.get("shard_index"), payload.get("shard_count"))
         if shard != self._last_shard:
             # The reshard line an operator grep for when a camera seems to be
             # pulled twice — every membership change lands here.
             log.info(
                 "worker=%s registered: shard %s/%s (lease %ss)",
                 self.worker_id,
-                body.get("shard_index"),
-                body.get("shard_count"),
-                body.get("lease_s"),
+                payload.get("shard_index"),
+                payload.get("shard_count"),
+                payload.get("lease_s"),
             )
             self._last_shard = shard
-        return body
+        return payload
 
     def assignments(self) -> list[CameraAssignment]:
         """Ask the registry what to pull — this worker's shard when the
@@ -228,7 +327,9 @@ class RegistryClient:
                 self._mark_unsharded("POST /api/v1/workers/register -> 404")
             else:
                 response = self._http.get(
-                    "/api/v1/assignments", params={"worker_id": self.worker_id}
+                    "/api/v1/assignments",
+                    params={"worker_id": self.worker_id},
+                    headers=self._secret_headers(),
                 )
                 if response.status_code == 404:
                     self._mark_unsharded("GET /api/v1/assignments -> 404")
@@ -267,7 +368,11 @@ class RegistryClient:
         return response.json()
 
     def heartbeat(self, camera_id: str, payload: dict) -> None:
-        response = self._http.post(f"/api/v1/cameras/{camera_id}/heartbeat", json=payload)
+        response = self._http.post(
+            f"/api/v1/cameras/{camera_id}/heartbeat",
+            json=payload,
+            headers=self._secret_headers(),
+        )
         response.raise_for_status()
         ack = response.json()
         if ack.get("state") != "healthy":

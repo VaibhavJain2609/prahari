@@ -168,6 +168,13 @@ because a missing credential must not take down camera health as well as sync.
 # lease would eject live pods from the pool and leave their slice unpulled.
 - name: PRAHARI_ASSIGNMENT_LEASE_S
   value: {{ .Values.registry.assignment.leaseSeconds | quote }}
+# Per-worker credential binding (migration 010): refuse a register call that
+# would leave the worker_id unbound — i.e. one that does not ask for a
+# secret. Off by default so un-upgraded workers keep registering; arm it once
+# every worker requests a secret, after which the shared inference-token
+# authorizes only NEW ids and can never claim an already-bound one.
+- name: PRAHARI_WORKER_SECRET_REQUIRED
+  value: {{ .Values.registry.workerSecretRequired | quote }}
 # Internal API gate (X-Internal-Token), the AES-256 key for stored camera
 # stream credentials, and the MediaMTX reader token embedded in worker
 # fan-out URLs — all real RegistrySettings fields. `worker-token` is a

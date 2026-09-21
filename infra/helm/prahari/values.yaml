@@ -152,6 +152,13 @@ registry:
     # Keep it comfortably above inference.assignmentRefreshSeconds.
     leaseSeconds: 60
 
+  # Per-worker credential binding (→ PRAHARI_WORKER_SECRET_REQUIRED, migration
+  # 010): refuse registrations that would leave a worker_id unbound. Off so
+  # un-upgraded workers keep registering while the fleet upgrades — arm it
+  # once every worker requests a secret, after which the shared
+  # inference-token authorizes only NEW ids, never an already-bound one.
+  workerSecretRequired: false
+
   # Name of the Secret holding the gateway credentials. Created out of band:
   #   kubectl create secret generic prahari-gateway --from-env-file=.env
   # NEVER in this file, never in tfvars, never in a commit. Mounted into the

@@ -8,7 +8,10 @@ service most worth being able to read.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
+import secrets
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -840,6 +843,25 @@ class CameraRepository:
         return paths
 
 
+def hash_worker_secret(secret: str) -> str:
+    """The digest stored in `workers.secret_hash` for a presented secret.
+
+    Plain SHA-256 hex, no stretching KDF: the secret is a 256-bit
+    `secrets.token_urlsafe` mint, so there is no dictionary to attack and
+    brute force is already the whole keyspace. Storing the digest rather
+    than the secret is what keeps a database dump from handing out live
+    worker credentials — the same rule sessions and API keys already follow.
+    """
+    return hashlib.sha256(secret.encode()).hexdigest()
+
+
+class WorkerSecretError(Exception):
+    """A register call failed the worker-secret contract — the endpoint maps
+    this to 403. Covers a missing or wrong `X-Worker-Secret` on a bound
+    worker_id, and a registration that would leave a worker unbound while
+    `worker_secret_required` is armed."""
+
+
 def shard_membership(worker_id: str, alive_worker_ids: Sequence[str]) -> tuple[int, int]:
     """A worker's modulo-shard coordinates inside the alive fleet.
 
@@ -885,7 +907,25 @@ class WorkerRepository:
         self._pool = pool
         self._s = settings
 
-    async def register(self, worker_id: str) -> WorkerRegistration:
+    async def bound_secret_hash(self, worker_id: str) -> str | None:
+        """The stored secret digest for `worker_id`, or None.
+
+        None covers both "no such worker" and "registered but never bound" —
+        the callers (`/api/v1/assignments`, the heartbeat endpoint) only need
+        to know whether a credential must be presented, and a worker that has
+        not registered yet has nothing to verify against anyway.
+        """
+        return await self._pool.fetchval(
+            "SELECT secret_hash FROM workers WHERE worker_id = $1", worker_id
+        )
+
+    async def register(
+        self,
+        worker_id: str,
+        *,
+        presented_secret: str | None = None,
+        rotate: bool = False,
+    ) -> WorkerRegistration:
         """Upsert the worker's lease and compute its current shard coordinates.
 
         One round trip of writes plus the membership read, all inside a
@@ -893,15 +933,61 @@ class WorkerRepository:
         the upsert and the count. The computed coordinates are persisted back
         onto the row — `workers.shard_index`/`shard_count` then answer "what
         was this pod last told" for debugging without replaying the query.
+
+        Credential binding (migration 010): `workers.secret_hash` NULL means
+        unbound — a caller holding only the shared inference-token can still
+        claim the id, which is the pre-binding behaviour un-upgraded workers
+        rely on. `presented_secret` is the caller's `X-Worker-Secret` header;
+        `rotate` is the body flag, dual-purpose:
+
+        * UNBOUND row + `rotate` → the opt-in bind: mint a secret, store its
+          digest, return the plaintext once. This is deliberately the ONLY
+          mint path — an un-upgraded worker never sends the flag, so it is
+          never handed a credential it could not present on its next call.
+        * BOUND row → the presented secret must hash to the stored digest or
+          the call is refused (raises `WorkerSecretError`): the whole point
+          is that a stolen inference-token alone can no longer refresh a
+          worker's lease. `rotate` here mints a replacement — still gated on
+          the CURRENT secret, so a stolen one cannot re-key the identity.
+        * UNBOUND row without `rotate` stays unbound — unless
+          `worker_secret_required` is armed, which refuses it outright (the
+          switch to flip once every worker has been upgraded to ask for a
+          secret).
         """
+        minted: str | None = None
         async with self._pool.acquire() as conn, conn.transaction():
+            stored = await conn.fetchval(
+                "SELECT secret_hash FROM workers WHERE worker_id = $1", worker_id
+            )
+            if stored is not None:
+                if presented_secret is None or not hmac.compare_digest(
+                    hash_worker_secret(presented_secret), stored
+                ):
+                    raise WorkerSecretError(
+                        f"worker {worker_id} is bound to a worker secret; present the "
+                        "current one as X-Worker-Secret (an operator clears "
+                        "workers.secret_hash to rebind a lost secret)"
+                    )
+                if rotate:
+                    minted = secrets.token_urlsafe(32)
+            elif rotate:
+                minted = secrets.token_urlsafe(32)
+            elif self._s.worker_secret_required:
+                raise WorkerSecretError(
+                    f"worker {worker_id} is not bound to a worker secret and "
+                    "worker_secret_required is set; register with "
+                    "rotate_secret=true to mint one"
+                )
             await conn.execute(
                 """
-                INSERT INTO workers (worker_id, registered_at, last_seen)
-                VALUES ($1, now(), now())
-                ON CONFLICT (worker_id) DO UPDATE SET last_seen = now()
+                INSERT INTO workers (worker_id, registered_at, last_seen, secret_hash)
+                VALUES ($1, now(), now(), $2)
+                ON CONFLICT (worker_id) DO UPDATE SET
+                    last_seen = now(),
+                    secret_hash = COALESCE($2, workers.secret_hash)
                 """,
                 worker_id,
+                hash_worker_secret(minted) if minted is not None else None,
             )
             alive = await self.alive_worker_ids(conn)
             index, count = shard_membership(worker_id, alive)
@@ -916,6 +1002,7 @@ class WorkerRepository:
             shard_index=index,
             shard_count=count,
             lease_s=self._s.assignment_lease_s,
+            worker_secret=minted,
         )
 
     async def alive_worker_ids(self, conn: asyncpg.Connection | None = None) -> list[str]:

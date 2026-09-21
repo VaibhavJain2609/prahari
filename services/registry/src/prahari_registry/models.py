@@ -402,6 +402,19 @@ class WorkerRegister(BaseModel):
     """
 
     worker_id: str = Field(min_length=1, max_length=253)
+    rotate_secret: bool = False
+    """Ask the registry for a worker secret now. Dual-purpose:
+
+    * On an UNBOUND worker_id (`workers.secret_hash` NULL) it is the opt-in
+      bind — the registry mints a secret, stores its digest, and returns the
+      plaintext once. Workers that never send the flag stay unbound, which is
+      what keeps pre-binding callers working: a secret a worker never asked
+      for is a credential it cannot present on its next call.
+    * On a BOUND worker_id it is rotation — a fresh secret replaces the
+      stored digest — and the CURRENT secret must be presented as
+      `X-Worker-Secret`, so a stolen secret cannot be used to re-key the
+      identity it opens.
+    """
 
 
 class WorkerRegistration(BaseModel):
@@ -420,6 +433,14 @@ class WorkerRegistration(BaseModel):
     shard_index: int = Field(ge=0)
     shard_count: int = Field(ge=1)
     lease_s: int = Field(ge=1)
+
+    worker_secret: str | None = None
+    """The minted per-worker secret — populated ONLY on the response that
+    created the binding (the opt-in mint) or rotated it, never on a plain
+    keep-alive: the plaintext crosses the wire exactly once and only its
+    SHA-256 digest is stored. The worker presents it as `X-Worker-Secret`
+    on every subsequent worker-facing call (re-register, assignments,
+    heartbeats); a bound worker_id without it is refused."""
 
 
 class WorkerAssignment(WorkerRegistration):

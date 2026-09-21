@@ -127,6 +127,21 @@ spec:
                   name: prahari-internal
                   key: inference-token
                   optional: {{ not .Values.security.internalSecretRequired }}
+            # Per-worker registry credential (migration 010): where the
+            # worker persists the secret the registry mints at register —
+            # presented as X-Worker-Secret, layered on the internal token
+            # above. Empty = memory only, which is honest while worker_id is
+            # the pod name (a rescheduled pod registers as a NEW id anyway)
+            # but lossy on a STABLE id (explicit PRAHARI_INGEST_WORKER_ID, or
+            # a container restart inside one pod): the secret is gone while
+            # the registry still holds its hash, so calls 403 until the row
+            # is reaped or cleared. Point at a per-pod volume for stable-id
+            # deployments — deliberately never a SHARED one: the credential's
+            # whole value is that it is per-worker, and a shared mount would
+            # hand every replica the same identity, recreating the
+            # shared-token problem this exists to close.
+            - name: PRAHARI_INGEST_WORKER_SECRET_PATH
+              value: {{ .Values.inference.workerSecretPath | default "" | quote }}
             # Model device — selected here, never sniffed at runtime. The gpu
             # profile sets cuda; local stays cpu.
             - name: PRAHARI_DETECT_DEVICE

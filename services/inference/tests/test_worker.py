@@ -960,7 +960,7 @@ def test_worker_registers_with_its_configured_worker_id():
     http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
     RegistryClient(settings, client=http).assignments()
 
-    assert posted == [{"worker_id": "inference-6f9c4d7b5-x2abc"}]
+    assert posted == [{"worker_id": "inference-6f9c4d7b5-x2abc", "rotate_secret": True}]
 
 
 def test_worker_id_defaults_to_the_pod_hostname():
@@ -1087,3 +1087,136 @@ def test_a_registry_error_still_propagates_as_an_outage():
     with pytest.raises(httpx.HTTPStatusError):
         client.assignments()
     assert not client._unsharded
+
+
+# --- the per-worker secret (X-Worker-Secret, migration 010) --------------------
+#
+# The registry mints a secret on the register that asks for one (the
+# `rotate_secret` flag on an unbound worker_id), returns the plaintext once,
+# and then refuses any call on the bound id that cannot present it. The
+# worker's half: ask when we hold none, adopt + persist the mint, send the
+# header on every worker-facing call once held.
+
+
+def _binding_handler(seen: list | None = None):
+    """A mock registry that speaks the bound-worker contract: the first
+    register carrying `rotate_secret` mints "minted-secret-1"; subsequent
+    worker-facing calls are answered normally. `seen` records
+    (path, worker-secret-header, body) for assertions."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        secret = request.headers.get("x-worker-secret")
+        try:
+            body = json.loads(request.content) if request.content else {}
+        except json.JSONDecodeError:
+            body = {}
+        if seen is not None:
+            seen.append((request.url.path, secret, body))
+        if request.url.path == "/api/v1/workers/register":
+            payload = {
+                "worker_id": body.get("worker_id", "w"),
+                "shard_index": 0,
+                "shard_count": 1,
+                "lease_s": 60,
+            }
+            if body.get("rotate_secret"):
+                payload["worker_secret"] = "minted-secret-1"
+            return httpx.Response(200, json=payload)
+        if request.method == "POST":
+            return httpx.Response(200, json={"camera_id": "x", "state": "healthy", "reason": "ok"})
+        return httpx.Response(
+            200,
+            json={
+                "worker_id": request.url.params.get("worker_id", "w"),
+                "shard_index": 0,
+                "shard_count": 1,
+                "lease_s": 60,
+                "cameras": [],
+            },
+        )
+
+    return handler
+
+
+def _client(handler, settings: IngestSettings | None = None) -> RegistryClient:
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://registry")
+    return RegistryClient(settings or SETTINGS, client=http)
+
+
+def test_register_asks_for_a_secret_only_while_none_is_held():
+    """`rotate_secret` on the register body is the bind request — sent while
+    the worker holds nothing, never again once it does (a routine refresh
+    must not re-mint)."""
+    seen: list = []
+    client = _client(_binding_handler(seen))
+
+    client.register()
+    assert seen[0][2] == {"worker_id": client.worker_id, "rotate_secret": True}
+    assert client._worker_secret == "minted-secret-1"
+
+    client.register()
+    assert seen[1][2] == {"worker_id": client.worker_id}  # no flag, no re-mint
+
+
+def test_the_secret_is_sent_on_every_worker_facing_call_once_held():
+    """The header rides register, assignments AND heartbeats — it is what
+    proves WHICH worker the shared internal token is acting as."""
+    seen: list = []
+    client = _client(_binding_handler(seen))
+
+    client.assignments()  # register + assignments GET
+    client.heartbeat("cam-1", {"worker_id": "w"})
+
+    secrets = [s for _, s, _ in seen]
+    assert secrets == [None, "minted-secret-1", "minted-secret-1"]
+
+
+def test_worker_secret_is_persisted_and_reloaded(tmp_path):
+    """A restart on a stable worker_id must not orphan the binding: the mint
+    lands in `worker_secret_path` (0600, via rename) and the next client
+    reloads it instead of asking for another."""
+    secret_file = tmp_path / "worker-secret"
+    settings = IngestSettings(worker_secret_path=str(secret_file))
+
+    client = _client(_binding_handler(), settings)
+    client.register()
+    assert secret_file.read_text().strip() == "minted-secret-1"
+    assert oct(secret_file.stat().st_mode & 0o777) == "0o600"
+
+    # A second client — the "next boot" — reloads the file and presents the
+    # secret immediately rather than sending a fresh mint request.
+    seen: list = []
+    rebooted = _client(_binding_handler(seen), settings)
+    rebooted.register()
+    assert seen[0][1] == "minted-secret-1"
+    assert "rotate_secret" not in seen[0][2]
+
+
+def test_no_secret_path_means_memory_only():
+    """The honest default: nothing is written anywhere, the secret lives for
+    the process lifetime — documented as lossy on stable worker_ids."""
+    client = _client(_binding_handler())
+    client.register()
+    assert client._worker_secret == "minted-secret-1"
+    # A new client on the same settings holds nothing and must re-mint.
+    seen: list = []
+    fresh = _client(_binding_handler(seen))
+    fresh.register()
+    assert seen[0][2].get("rotate_secret") is True
+
+
+def test_a_register_403_is_logged_as_an_orphaned_binding(caplog):
+    """A 403 means the registry holds a hash for this worker_id and we do not
+    hold the secret — the failure mode `worker_secret_path` exists to prevent.
+    It must be logged as unrecoverable-by-retry, not retried away."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/workers/register":
+            return httpx.Response(403, json={"detail": "worker w1 is bound"})
+        return httpx.Response(500)
+
+    client = _client(handler)
+    with caplog.at_level(logging.ERROR, logger="prahari_inference.worker"):
+        with pytest.raises(httpx.HTTPStatusError):
+            client.register()
+    assert "bound" in caplog.text and "workers.secret_hash" in caplog.text
