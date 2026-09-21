@@ -160,11 +160,10 @@ superseded note at the top of that section.
       SSE to the browser.
 - [x] `web/` — Next.js 16 + MapLibre console: auth-gated board, camera health
       map, alert console on SSE, plate trace, onboarding + admin panels.
-      **WHEP live preview did not ship** — it remains open below; nothing in
-      the console pulls video today.
-- [ ] `web/` WHEP live preview — one camera at a time, from
-      `StreamEndpoints.whep_url`. Preview only — never an inference source.
-      Carve-out of the line above, not yet built.
+- [x] `web/` WHEP live preview — shipped as the *audited* path, not the raw
+      `StreamEndpoints.whep_url` originally sketched: `endpoints` never reach
+      the browser; the drawer mints a scoped, expiring ticket after the
+      `video_preview` audit row (`docs/SECURITY.md`, `docs/EVIDENCE.md`).
 - [x] **CSV/PDF report export.** Literally required: detected vehicles/plates
       with corresponding timestamps. `bff/export.py` behind
       `GET /api/v1/routes/{plate}/export?format=csv|pdf`, purpose-coded and
@@ -190,14 +189,12 @@ superseded note at the top of that section.
 - [ ] Stage 4e/5e — on-prem ONVIF discovery agent. Only the `onvif` enum labels
       exist; no agent code. Highest-risk item in the design, severable by
       design.
-- [ ] Stage 6 — Helm wiring for the new services. `services.yaml` renders
-      Deployments for `correlation`/`bff`/`web`, but there are no env blocks
-      (`bffEnv`/`correlationEnv`), no `PRAHARI_INTERNAL_TOKEN` /
-      `PRAHARI_CREDENTIAL_KEY` in the chart, no audit `audit.db` PVC, and no
-      Dockerfiles for the three services. Enumerated in
-      `docs/NEXT-PHASE-PLAN.md` §1.3–1.6.
-- [ ] `tests/test_org_tiers_gate.py` — specified in ORG-TIERS-DESIGN §6, not yet
-      in the tree (being added separately).
+- [x] Stage 6 — Helm wiring for the new services: `bffEnv`/`correlationEnv`
+      blocks, `PRAHARI_INTERNAL_TOKEN` + `PRAHARI_CREDENTIAL_KEY` from the
+      out-of-band `prahari-internal` Secret (per-service tokens and a
+      dedicated `worker-token` on top), audit `audit.db` PVC, Dockerfiles for
+      all six services, NetworkPolicies per flow.
+- [x] `tests/test_org_tiers_gate.py` — in the tree.
 
 ## Day 4 — 5 Sep · cloud cutover
 
@@ -213,16 +210,19 @@ superseded note at the top of that section.
 ## Day 5 — 6 Sep · scale + documents
 
 - [ ] Load test to 200–500 virtual cameras; **film KEDA scaling 2 → 20 pods.**
-- [ ] `docs/SCALE-80K.md` — every number traced to a recorded run.
-- [ ] `docs/COST-MODEL.md`. (`docs/SECURITY.md` and `docs/HLD.md` now exist —
-      written on `docs/truthfulness`, honestly labelled implemented-vs-planned.)
+- [ ] `docs/SCALE-80K.md` — every number traced to a recorded run. (Exists,
+      honestly labelled; loadtest runs still pending a cluster.)
+- [x] `docs/COST-MODEL.md`, `docs/SECURITY.md`, `docs/HLD.md`,
+      `docs/DEMO-SCRIPT.md`, `docs/OPERATIONS.md`, `docs/EVIDENCE.md`,
+      `docs/OBSERVABILITY.md`, `docs/KEYCLOAK.md` — all in the tree.
 - [ ] PPT.
 
 ## Day 6 — 7 Sep · submit
 
 - [ ] Record both videos (own-feed 2–3 min; government-feed live).
 - [ ] **Dry-run "here's a plate, trace it" at least five times.**
-- [ ] `docs/DEMO-SCRIPT.md`.
+- [x] `docs/DEMO-SCRIPT.md` — written: six beats, each with click-path →
+      what it proves → the invariant it demonstrates.
 - [ ] Submit well before the deadline. Not at it.
 
 ---
