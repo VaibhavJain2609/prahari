@@ -82,6 +82,14 @@ async def test_a_miss_is_cached_too():
     assert len(registry.calls) == 1
 
 
+async def test_camera_row_without_an_org_id_resolves_to_none():
+    """A 200 that carries no org_id is a miss, not a crash — the registry
+    answered but there is no org to scope against."""
+    registry = FakeRegistry({"cam-1": {"id": "cam-1"}})
+    resolver = _resolver(registry, FakePool({}))
+    assert await resolver.org_path_for_camera("cam-1") is None
+
+
 async def test_registry_error_resolves_to_none_rather_than_raising():
     class FailingRegistry:
         async def get(self, path, params=None):
