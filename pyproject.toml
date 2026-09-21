@@ -86,8 +86,8 @@ omit = [
 # live bus get a documented exclusion rather than a hollow fake.
 show_missing = true
 # Ratchet, not aspiration: this is the CURRENT measured floor and only moves
-# UP. Target is 90 — raise this as coverage lands; never lower it.
-fail_under = 84
+# UP. Never lower it.
+fail_under = 90
 exclude_also = [
     "if TYPE_CHECKING:",
     "raise NotImplementedError",
