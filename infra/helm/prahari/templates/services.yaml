@@ -24,7 +24,8 @@ spec:
       {{- if and $.Values.observability.enabled $.Values.observability.prometheusScrape $cfg.metricsPort }}
       # prometheus.io/* scrape contract (observability.prometheusScrape) —
       # emitted only for services with a metricsPort, i.e. ones that actually
-      # serve /metrics (match-engine, correlation; registry/bff/web do not).
+      # serve /metrics (registry, match-engine, correlation, bff; web does
+      # not — a Next.js server has no exposition endpoint).
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "{{ $cfg.metricsPort }}"

@@ -30,7 +30,12 @@ import asyncpg
 import httpx
 import redis as redis_lib
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from google.protobuf.json_format import MessageToDict
 from prahari.v1 import events_pb2
 from prahari_common.bus import RedisStreamConsumer
@@ -43,6 +48,7 @@ from .db import create_pool
 from .export import route_to_csv, route_to_pdf
 from .match_engine_client import MatchEngineClient
 from .media import MediaTicketIssuer
+from .metrics import METRICS, count_response, refresh_gauges
 from .models import (
     ApiKey,
     ApiKeyCreate,
@@ -290,13 +296,17 @@ async def origin_and_security_headers(request: Request, call_next):
         # match, which a browser's fetch cannot do.
         expected_host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
         if urlparse(origin).netloc != expected_host:
-            return _with_security_headers(
+            denied = _with_security_headers(
                 JSONResponse(
                     {"detail": "origin does not match request host"},
                     status_code=status.HTTP_403_FORBIDDEN,
                 )
             )
-    return _with_security_headers(await call_next(request))
+            count_response(denied.status_code)
+            return denied
+    response = _with_security_headers(await call_next(request))
+    count_response(response.status_code)
+    return response
 
 
 # --- audit helper -------------------------------------------------------------
@@ -526,6 +536,17 @@ async def readyz(request: Request, response: Response) -> dict:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return {"status": "unavailable", "database": "error"}
     return {"status": "ready", "database": "ok"}
+
+
+@app.get("/metrics", tags=["ops"])
+async def metrics(request: Request) -> PlainTextResponse:
+    """Prometheus exposition on the BFF's own port. Unauthenticated like
+    match-engine's and the registry's — a scraper cannot hold a session, and
+    the payload is operational counters only (request status classes, live
+    SSE connections, audit row count): no routes, actors or query strings.
+    """
+    await refresh_gauges(request.app.state)
+    return PlainTextResponse(METRICS.render())
 
 
 # --- auth ------------------------------------------------------------------

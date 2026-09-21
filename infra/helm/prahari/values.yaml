@@ -170,6 +170,10 @@ services:
     enabled: true
     replicas: 1
     port: 8000
+    # /metrics rides the main HTTP port (prahari_registry/metrics.py) — same
+    # convention as matchEngine: metricsPort repeats `port` so the scrape
+    # annotation follows it.
+    metricsPort: 8000
     resources:
       requests: { cpu: 100m, memory: 256Mi }
       limits:   { cpu: "1",  memory: 1Gi }
@@ -203,6 +207,9 @@ services:
     enabled: false
     replicas: 1
     port: 8080
+    # /metrics rides the main HTTP port (prahari_bff/metrics.py) — same
+    # convention as matchEngine/correlation: metricsPort repeats `port`.
+    metricsPort: 8080
     resources:
       requests: { cpu: 100m, memory: 256Mi }
       limits:   { cpu: "1",  memory: 1Gi }
