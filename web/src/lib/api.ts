@@ -215,6 +215,55 @@ export type DarkZoneInfo = {
   nearest_healthy_m: number | null;
 };
 
+// A persisted alert row from GET /api/v1/alerts: the full Alert proto as
+// MessageToDict (preserving_proto_field_name — snake_case keys) plus the
+// store's lifecycle columns on top (`id`, `occurred_at`, `acknowledged_at`,
+// `acknowledged_by`). Typed loosely-but-honestly: the payload is forwarded
+// verbatim and a schema addition must never break the list, so every field
+// is optional and the nested proto objects are structural subsets.
+// Live SSE alerts are the same shape minus the lifecycle columns, which is
+// why `occurred_at`/`acknowledged_*` are nullable — see alert-history.ts.
+export type StoredAlert = {
+  id?: number | null;
+  alert_id?: string;
+  dedup_key?: string;
+  raised_at?: string;
+  occurred_at?: string | null;
+  acknowledged_at?: string | null;
+  acknowledged_by?: string | null;
+  priority?: string;
+  band?: string;
+  detection?: {
+    camera_id?: string;
+    plate?: { raw_text?: string; normalised_text?: string };
+    observed_at?: { wall_clock?: string };
+  };
+  matched_entry?: {
+    plate?: string;
+    reason?: string;
+    case_reference?: string;
+  };
+  explanation?: {
+    observed_plate?: string;
+    matched_plate?: string;
+    edits?: { position?: number; observed?: string; matched?: string }[];
+    final_score?: number;
+    format_plausibility?: number;
+  };
+};
+
+// GET /api/v1/alerts — the filters the BFF proxies to the match engine's
+// AlertStore. `plate` is exact-match upstream (observed or matched
+// watchlist plate), not a substring search — callers wanting substring
+// semantics filter the returned window themselves (see lib/alert-history).
+export type AlertListParams = {
+  since?: string;
+  camera_id?: string;
+  plate?: string;
+  acknowledged?: boolean;
+  limit?: number;
+};
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -419,6 +468,26 @@ export const api = {
     }
     return res.blob();
   },
+
+  // Persisted alert history, newest first — the match engine's AlertStore
+  // (Postgres when configured) behind the BFF's org-scope filter.
+  listAlerts: (params: AlertListParams = {}, init: ApiInit = {}) => {
+    const qs = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+      if (value != null && value !== "") qs.set(key, String(value));
+    }
+    const query = qs.toString();
+    return request<StoredAlert[]>(`alerts${query ? `?${query}` : ""}`, init);
+  },
+
+  // The only lifecycle transition (UX spec: acknowledge, no assignment
+  // workflow). No purpose code — the BFF org-scopes the alert's camera and
+  // writes the `alert_ack` audit entry itself under the internal `admin`
+  // purpose. First-write-wins server-side; the response is the updated row.
+  ackAlert: (alertId: string) =>
+    request<StoredAlert>(`alerts/${encodeURIComponent(alertId)}/ack`, {
+      method: "POST",
+    }),
 
   // Response keys mirror the BFF's verify_audit handler: `ok` plus the id
   // of the first entry whose hash doesn't chain, if any.
