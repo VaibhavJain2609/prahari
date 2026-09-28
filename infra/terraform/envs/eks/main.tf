@@ -444,10 +444,13 @@ data "aws_iam_policy_document" "gha_trust" {
       values   = ["sts.amazonaws.com"]
     }
 
+    # StringLike repo-scoped rather than StringEquals ref-scoped: sub formats
+    # differ per event (ref/environment/pull_request), and matching the exact
+    # string is brittle. Any ref on THIS repo may assume; nothing else can.
     condition {
-      test     = "StringEquals"
+      test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:ref:refs/heads/main"]
+      values   = ["repo:${var.github_repo}:*"]
     }
   }
 }
