@@ -444,13 +444,17 @@ data "aws_iam_policy_document" "gha_trust" {
       values   = ["sts.amazonaws.com"]
     }
 
-    # StringLike repo-scoped rather than StringEquals ref-scoped: sub formats
-    # differ per event (ref/environment/pull_request), and matching the exact
-    # string is brittle. Any ref on THIS repo may assume; nothing else can.
+    # GitHub mints the sub in two shapes: the classic repo:owner/name:... and
+    # the rename-proof repo:owner@<owner-id>/name@<repo-id>:... — this repo's
+    # tokens carry the ID form. Accept both; either way only this repo
+    # (any ref/environment) can assume the role.
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:*"]
+      values = [
+        "repo:${var.github_repo}:*",
+        "repo:VaibhavJain2609@31837909/prahari@1354760024:*",
+      ]
     }
   }
 }

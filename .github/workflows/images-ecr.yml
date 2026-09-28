@@ -52,16 +52,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # Temporary: decode the OIDC JWT claims to debug AssumeRoleWithWebIdentity
-      # denials. Claims are not secrets — sub/aud/iss only.
-      - name: Debug OIDC claims
-        run: |
-          T="$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            -H 'Accept: application/json; api-version=2.0' \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r .value)"
-          P="$(echo "$T" | cut -d. -f2)"; P="$P$(printf '=%.0s' $(seq $(( (4 - ${#P} % 4) % 4 ))))"
-          echo "$P" | tr '_-' '/+' | base64 -d | jq '{iss,aud,sub,ref,repository,repository_owner,actor}'
-
       - name: Assume the ECR push role
         uses: aws-actions/configure-aws-credentials@v6
         with:
