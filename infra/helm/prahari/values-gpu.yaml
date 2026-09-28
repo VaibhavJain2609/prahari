@@ -19,8 +19,8 @@ profile: gpu
 #     enabled: false
 
 # global.imageRegistry must be set to a registry the cloud cluster can pull
-# from (a real ECR/GAR/etc. endpoint) — localhost:5555 is the k3d registry and
-# does not exist off the laptop.
+# from (a real ECR/GAR/etc. endpoint) — the default prahari-registry:5000 is
+# the k3d registry's in-cluster name and does not exist off the laptop.
 # global:
 #   imageRegistry: <your cloud registry>
 

@@ -57,10 +57,14 @@ data:
 
     # RTSP: TCP only. UDP transport drops silently under load and produces
     # corrupt frames that look like detections.
+    # Key names are the 1.9.x schema (`protocols`/`encryption`, singular
+    # `rtspTransport` on paths) — the pre-1.9 `rtspTransports`/`rtspEncryption`/
+    # `sourceProtocol` forms make the server refuse to start on
+    # `unknown field`.
     rtsp: yes
     rtspAddress: :{{ .Values.mediamtx.rtspPort }}
-    rtspTransports: [tcp]
-    rtspEncryption: "no"
+    protocols: [tcp]
+    encryption: "no"
 
     # HLS: the fallback when port 8554 is blocked on a venue network. Not
     # optional — it must be tested, not assumed.
@@ -91,7 +95,10 @@ data:
       sourceOnDemand: yes
       sourceOnDemandStartTimeout: 15s
       sourceOnDemandCloseAfter: 30s
-      sourceProtocol: tcp
+      # Same name the registry writes into per-path bodies
+      # (mediamtx.py) — TCP-only upstream pulls, matching the global
+      # `protocols` list above.
+      rtspTransport: tcp
       {{- if .Values.mediamtx.record.enabled }}
       # Evidence recording (docs/EVIDENCE.md). Playback tickets already carry
       # the `playback` grant — the registry's auth callback validates them —

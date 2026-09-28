@@ -9,7 +9,11 @@
 profile: local
 
 global:
-  imageRegistry: localhost:5555
+  # The registry AS THE CLUSTER SEES IT, not as the host does. `make images`
+  # and Tilt push to localhost:5555 (the k3d registry's host port); pods pull
+  # through the containerd mirror at prahari-registry:5000. localhost:5555
+  # here means every pod resolves "localhost" to itself and ImagePullBackOffs.
+  imageRegistry: prahari-registry:5000
   imageTag: dev
   pullPolicy: IfNotPresent
 

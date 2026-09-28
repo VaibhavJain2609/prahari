@@ -93,6 +93,14 @@ done
 [ "$(env_val "$TMP/local.yaml" PRAHARI_MATCH_WATCHLIST_DIR)" = "$(env_val "$TMP/gpu.yaml" PRAHARI_MATCH_WATCHLIST_DIR)" ] \
     || fail "PRAHARI_MATCH_WATCHLIST_DIR differs across profiles"
 
+# Image refs are the CLUSTER's view of the registry. `localhost:5555` is the
+# host-side push address — a pod that tries to pull it resolves localhost to
+# itself and ImagePullBackOffs. Found by the first real `make up`.
+hasnt "$TMP/local.yaml" 'image: localhost:' \
+    "local: an image ref uses the host-side registry view — pods can't pull it"
+hasnt "$TMP/gpu.yaml" 'image: localhost:' \
+    "gpu: an image ref uses the host-side registry view — pods can't pull it"
+
 # The renders must actually differ — a switch that changes nothing is off.
 cmp -s "$TMP/local.yaml" "$TMP/gpu.yaml" \
     && fail "local and gpu render identically — the profile switch does nothing"
