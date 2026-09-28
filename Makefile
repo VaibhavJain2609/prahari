@@ -234,9 +234,9 @@ test: proto ## Run the test suite across the workspace
 	uv run pytest -q
 
 .PHONY: verify
-verify: ## Render the chart under both profiles and diff-check the switch
-	@echo "--> rendering profile=local"
-	@helm template prahari $(CHART) --values $(CHART)/values-local.yaml >/dev/null
-	@echo "--> rendering profile=gpu"
-	@helm template prahari $(CHART) --values $(CHART)/values-gpu.yaml >/dev/null
-	@echo "both profiles render cleanly"
+verify: ## Render the chart under both profiles and assert the switch switches
+	# Render-only proves the templates parse, not that `profile` changes
+	# anything. scripts/verify-profiles.sh asserts the gpu machinery appears
+	# under profile=gpu, stays out of profile=local, and that the shared
+	# substrate is identical in both renders.
+	CHART=$(CHART) ./scripts/verify-profiles.sh

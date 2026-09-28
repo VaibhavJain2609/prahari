@@ -1,6 +1,9 @@
 import { NextRequest } from "next/server";
 
-const BFF_URL = process.env.PRAHARI_BFF_URL ?? "http://localhost:8001";
+// Default is the BFF's port (8080), not match-engine's 8001 — the chart
+// always sets PRAHARI_BFF_URL; this fallback only serves `next dev` outside
+// the cluster, where the BFF is reached through the k3d port map.
+const BFF_URL = process.env.PRAHARI_BFF_URL ?? "http://localhost:8080";
 
 // The one place the browser's fetches leave this Next.js server. Every BFF
 // call — auth, cameras, orgs, routes, audit, the SSE alert stream — goes

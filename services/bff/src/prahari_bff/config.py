@@ -67,7 +67,7 @@ class BFFSettings(BaseSettings):
 
     # --- match engine --------------------------------------------------------
 
-    match_engine_base_url: str = "http://localhost:8001"
+    match_engine_base_url: str = "http://prahari-match-engine:8001"
 
     match_engine_timeout_s: float = 5.0
 
