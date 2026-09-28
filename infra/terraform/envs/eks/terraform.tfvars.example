@@ -5,6 +5,13 @@
 # the district module's ssh_cidr.
 operator_cidr = "203.0.113.10/32"
 
+# DNS/TLS — set to a SUBDOMAIN you control (e.g. "eks.yourdomain.com"). A
+# Route53 zone + wildcard ACM cert get created; then create ONE set of NS
+# records at your registrar for that subdomain pointing at
+# `terraform output hosted_zone_name_servers`. Leave empty for plain-HTTP
+# auto-generated LB hostnames.
+# domain_name = "eks.example.com"
+
 # Defaults shown for completeness — uncomment to override.
 # region              = "ap-south-1"
 # cluster_name        = "prahari-central"

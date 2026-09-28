@@ -202,6 +202,9 @@ EKS_CLUSTER  ?= prahari-central
 # chart, CI and the node pull policy can never disagree on it. Empty falls
 # through to the values-eks.yaml placeholder, which loudly ImagePullBackOffs.
 EKS_ECR  := $(shell terraform -chdir=$(TF_EKS) output -raw ecr_registry 2>/dev/null)
+# DNS/TLS discovery — empty when domain_name is unset in tfvars, in which case
+# eks-deploy.sh takes the plain-HTTP path (LB hostname + insecure cookies).
+EKS_DOMAIN := $(shell terraform -chdir=$(TF_EKS) output -raw domain_name 2>/dev/null)
 
 .PHONY: eks-kubeconfig
 eks-kubeconfig: ## Point kubectl at the EKS cluster
@@ -216,25 +219,16 @@ eks-secrets: ## Create all out-of-band Secrets on EKS (gateway + internal + boot
 .PHONY: eks-up
 eks-up: ## Install/upgrade the platform on EKS (profile=eks)
 	@test -n "$(EKS_ECR)" || { echo "no ecr_registry output — run terraform apply in $(TF_EKS) first"; exit 1; }
-	# browserWhepBase is the BROWSER's view of WHEP — the mediamtx-public LB
-	# hostname, which only exists after the first install. Looked up live and
-	# injected when present: first run brings the stack up with previews
-	# broken-but-loud, re-running this target once the LB lands repairs them.
-	@WHEP_HOST=$$(kubectl -n $(NAMESPACE) get svc prahari-mediamtx-public \
-	  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null); \
-	SETS="--set profile=eks --set global.imageRegistry=$(EKS_ECR)"; \
-	if [ -n "$$WHEP_HOST" ]; then \
-	  SETS="$$SETS --set mediamtx.browserWhepBase=http://$$WHEP_HOST:8889"; \
-	else echo "note: prahari-mediamtx-public has no hostname yet — WHEP base not set this run"; fi; \
-	helm upgrade --install prahari $(CHART) \
-	  --namespace $(NAMESPACE) --create-namespace \
-	  --values $(CHART)/values-eks.yaml \
-	  $$SETS \
-	  --wait --timeout 5m
-	@echo "--- public endpoints ---"
-	@kubectl -n $(NAMESPACE) get svc prahari-web prahari-mediamtx-public \
-	  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.loadBalancer.ingress[0].hostname}{"\n"}{end}'
-	@echo "Re-run 'make eks-up' once prahari-mediamtx-public has a hostname so browserWhepBase lands."
+	# The deploy logic lives in scripts/eks-deploy.sh — the same script the
+	# images-ecr deploy job runs, so local and CI deploys cannot diverge.
+	IMAGE_REGISTRY=$(EKS_ECR) PRAHARI_DOMAIN=$(EKS_DOMAIN) \
+	  NAMESPACE=$(NAMESPACE) CHART=$(CHART) ./scripts/eks-deploy.sh
+
+.PHONY: eks-dns
+eks-dns: ## Upsert console/streams CNAMEs to the live LB hostnames (boto3)
+	@test -n "$(EKS_DOMAIN)" || { echo "no domain_name in terraform output — set it in $(TF_EKS)/terraform.tfvars and apply"; exit 1; }
+	uv run --no-project --with boto3 scripts/eks_dns_sync.py \
+	  --domain "$(EKS_DOMAIN)" --namespace $(NAMESPACE)
 
 .PHONY: eks-down
 eks-down: ## Uninstall the platform from EKS (leaves the cluster + ECR intact)

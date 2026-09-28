@@ -32,6 +32,20 @@ storageClass:
   # installs. Local stays false (k3d's local-path provisioner already exists).
   create: false
 
+# --- TLS at the load balancer ---------------------------------------------------
+
+# eks-only today: ACM cert ARN + the public hostnames. When enabled, the web
+# and mediamtx-public NLB services get a 443 listener that terminates TLS
+# (plain ports stay open alongside — RTSP cannot wrap in TLS anyway), and
+# deploy tooling flips sessionCookieSecure to true. The cert is provisioned
+# by infra/terraform/envs/eks (aws_acm_certificate); ARN/hosts arrive via
+# deploy tooling (--set), not by editing this file.
+tls:
+  enabled: false
+  acmArn: ""
+  consoleHost: ""
+  streamsHost: ""
+
 # --- the metadata plane ------------------------------------------------------
 
 # The bus is Redis Streams in every profile. There is no `bus.kind` switch:

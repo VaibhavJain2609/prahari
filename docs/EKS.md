@@ -19,25 +19,54 @@ is a tfvars line, not new code.
 | EKS values profile | Helm | `infra/helm/prahari/values-eks.yaml` |
 | gp3 StorageClass + storageClassName wiring | Helm | `templates/storageclass.yaml`, PVCs |
 | Media-only public LB (8554/8888/8889 — never 9997/9998) | Helm | `mediamtx.publicLb` → `prahari-mediamtx-public` Service |
-| Image build+push | GitHub Actions | `.github/workflows/images-ecr.yml` |
-| Deploy/secret targets | Make | `eks-kubeconfig`, `eks-secrets`, `eks-up`, `eks-images`, `eks-down` |
+| Image build+push+deploy | GitHub Actions | `.github/workflows/images-ecr.yml` (push → deploy job) |
+| Shared deploy path | shell | `scripts/eks-deploy.sh` — used by Make AND the CD job |
+| DNS sync | boto3 | `scripts/eks_dns_sync.py` — CNAME upserts to live LB hostnames |
+| Route53 zone + ACM cert | Terraform | `domain_name` var in `infra/terraform/envs/eks/` |
+| Deploy/secret targets | Make | `eks-kubeconfig`, `eks-secrets`, `eks-up`, `eks-dns`, `eks-images`, `eks-down` |
 
 ## Bring-up
 
 1. `aws login` (SSO) — the API endpoint is scoped to `operator_cidr`, set it
-   in `infra/terraform/envs/eks/terraform.tfvars`.
+   in `infra/terraform/envs/eks/terraform.tfvars`. Optionally set
+   `domain_name` to a subdomain you control (see DNS below).
 2. `terraform -chdir=infra/terraform/envs/eks init && apply` — ~15 min for EKS.
-3. Set GitHub repo variables `AWS_ECR_PUSH_ROLE_ARN` (terraform output
-   `github_actions_role_arn`) and `AWS_REGION=ap-south-1`.
-4. Merge to main → the `images-ecr` workflow pushes all images to ECR
-   (`:latest` + `:sha-<commit>`).
-5. `make eks-kubeconfig` — kubectl context now points at EKS.
-6. `make eks-secrets` — gateway, `prahari-internal`, bootstrap admin.
-7. `make eks-up` — helm install profile=eks, ECR registry injected from
-   terraform output. Re-run once `prahari-mediamtx-public` has an LB hostname
-   so `browserWhepBase` lands.
+3. Set GitHub repo variables from terraform outputs:
+   `AWS_ECR_PUSH_ROLE_ARN`, `AWS_EKS_DEPLOY_ROLE_ARN`, `AWS_REGION` —
+   plus `PRAHARI_DOMAIN` if a domain is configured.
+4. Merge to main → the `images-ecr` workflow builds, pushes to ECR, and
+   deploys: the `deploy` job assumes a second OIDC role (`gha-deploy`,
+   scoped to this cluster), runs `scripts/eks-deploy.sh` — the same script
+   `make eks-up` runs locally — and deploys the `sha-<commit>` tag built in
+   that run.
+5. `make eks-kubeconfig && make eks-secrets` — one-time, on the first deploy
+   (the Secrets are out-of-band by design; CI cannot mint them).
 
-Console: `http://<prahari-web NLB hostname>:3000`. WHEP previews:
+## DNS (optional, Namecheap or any registrar)
+
+Terraform only creates a Route53 zone for a **subdomain** you delegate —
+e.g. `domain_name = "eks.example.com"`. The one manual change at the
+registrar:
+
+```
+eks  NS  <the 4 name servers from `terraform output hosted_zone_name_servers`>
+```
+
+After delegation, everything is automatic: the ACM wildcard cert
+(`*.eks.example.com`) validates via records Terraform already wrote into the
+zone, and each deploy runs `scripts/eks_dns_sync.py` (boto3) which upserts:
+
+- `console.<domain>` CNAME → prahari-web NLB
+- `streams.<domain>` CNAME → prahari-mediamtx-public NLB
+
+Once the cert shows ISSUED, `eks-deploy.sh` annotates both NLB Services with
+`aws-load-balancer-ssl-cert` + a 443 listener: console on
+`https://console.<domain>`, WHEP on `https://streams.<domain>`, and cookies
+flip back to Secure. Until then it deploys plain HTTP and says so. If you do
+not want delegation, the alternative is hand-managed CNAMEs at Namecheap —
+but then ACM validation records must also be created by hand, every renew.
+
+Console without DNS: `http://<prahari-web NLB hostname>:3000`. WHEP previews:
 `http://<prahari-mediamtx-public hostname>:8889`.
 
 ## Cost shape (ap-south-1, on-demand)
@@ -52,9 +81,9 @@ Console: `http://<prahari-web NLB hostname>:3000`. WHEP previews:
 
 ## Follow-ups (deliberately not built)
 
-- **TLS/domain.** Everything is plain HTTP behind NLBs — `sessionCookieSecure`
-  is explicitly `"false"` in values-eks. ACM + ingress (or CloudFront) and a
-  real hostname removes that.
+- **HTTP→HTTPS.** Plain listeners stay open alongside :443 — NLB is L4, it
+  cannot redirect. Tighten by removing the plain web/WHEP ports once TLS is
+  live, or leave them for in-VPC consumers.
 - **GPU node group.** `g6.xlarge` + `runtimeClassName: nvidia` + the
   values-gpu.yaml layering (`-f values-eks.yaml -f values-gpu.yaml`). Costs
   ~$500/mo per node — add it for measurement runs, not the daily plane.

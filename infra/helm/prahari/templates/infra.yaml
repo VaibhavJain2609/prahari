@@ -373,9 +373,19 @@ metadata:
   labels:
     {{- include "prahari.labels" . | nindent 4 }}
     app.kubernetes.io/name: mediamtx
-  {{- if .Values.mediamtx.publicLb.annotations }}
+  {{- if or .Values.mediamtx.publicLb.annotations (and .Values.tls.enabled .Values.tls.acmArn) }}
   annotations:
+    {{- if .Values.mediamtx.publicLb.annotations }}
     {{- toYaml .Values.mediamtx.publicLb.annotations | nindent 4 }}
+    {{- end }}
+    {{- if and .Values.tls.enabled .Values.tls.acmArn }}
+    # TLS terminates at the NLB (ACM cert). Only 443 is TLS-terminated — WHEP
+    # over https://<streamsHost>. RTSP 8554 stays raw TCP by necessity (RTSPS
+    # is a different protocol path the chart does not implement), and the
+    # plain WHEP/HLS ports remain for in-VPC consumers.
+    service.beta.kubernetes.io/aws-load-balancer-ssl-cert: {{ .Values.tls.acmArn | quote }}
+    service.beta.kubernetes.io/aws-load-balancer-ssl-ports: "443"
+    {{- end }}
   {{- end }}
 spec:
   type: LoadBalancer
@@ -392,5 +402,10 @@ spec:
     - name: whep
       port: {{ .Values.mediamtx.whepPort }}
       targetPort: {{ .Values.mediamtx.whepPort }}
+    {{- if and .Values.tls.enabled .Values.tls.acmArn }}
+    - name: wheps
+      port: 443
+      targetPort: {{ .Values.mediamtx.whepPort }}
+    {{- end }}
 {{- end }}
 {{- end }}

@@ -103,6 +103,21 @@ variable "admin_principal_arns" {
   default     = []
 }
 
+variable "domain_name" {
+  description = <<-EOT
+    Route53 hosted zone to create for the console/WHEP endpoints — a
+    SUBDOMAIN you then delegate at your registrar (e.g. "eks.prahari.in" →
+    NS records for `eks` pointing at this zone's name servers). Empty
+    disables all DNS/TLS resources and the cluster runs on auto-generated
+    LB hostnames over plain HTTP.
+
+    One manual step remains yours: the NS records at the registrar —
+    Terraform cannot touch a domain it does not host.
+  EOT
+  type        = string
+  default     = ""
+}
+
 variable "tags" {
   type    = map(string)
   default = {}
@@ -470,6 +485,139 @@ resource "aws_iam_role_policy" "gha_ecr_push" {
   policy = data.aws_iam_policy_document.gha_ecr_push.json
 }
 
+# --- GitHub Actions deploy role ----------------------------------------------------
+# A SEPARATE role from the ECR push role on purpose: the push job only ever
+# writes image layers; the deploy job needs the cluster API and DNS. Splitting
+# them keeps the ECR credential incapable of touching the cluster, and the
+# cluster credential incapable of writing images.
+
+resource "aws_iam_role" "gha_deploy" {
+  name               = "${local.name}-gha-deploy"
+  assume_role_policy = data.aws_iam_policy_document.gha_trust.json
+  tags               = local.tags
+}
+
+data "aws_iam_policy_document" "gha_deploy" {
+  statement {
+    sid    = "ClusterAccess"
+    effect = "Allow"
+    actions = [
+      # update-kubeconfig reads the endpoint + CA; the access entry below is
+      # what actually authorises the k8s API calls helm makes.
+      "eks:DescribeCluster",
+      "eks:ListClusters",
+    ]
+    resources = [aws_eks_cluster.central.arn]
+  }
+
+  statement {
+    sid       = "DnsDiscovery"
+    effect    = "Allow"
+    actions   = ["route53:ListHostedZonesByName"]
+    resources = ["*"] # ListHostedZonesByName cannot be resource-scoped
+  }
+
+  statement {
+    sid       = "AcmLookup"
+    effect    = "Allow"
+    actions   = ["acm:ListCertificates", "acm:DescribeCertificate"]
+    resources = ["*"] # List operations cannot be resource-scoped
+  }
+
+  dynamic "statement" {
+    for_each = var.domain_name != "" ? [1] : []
+    content {
+      sid    = "DnsUpsert"
+      effect = "Allow"
+      actions = [
+        "route53:GetHostedZone",
+        "route53:ListResourceRecordSets",
+        "route53:ChangeResourceRecordSets",
+      ]
+      resources = [aws_route53_zone.public[0].arn]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "gha_deploy" {
+  name   = "eks-deploy"
+  role   = aws_iam_role.gha_deploy.id
+  policy = data.aws_iam_policy_document.gha_deploy.json
+}
+
+# Cluster access entry for the deploy role. AmazonEKSAdminPolicy (not
+# ClusterAdmin) is sufficient: helm manages resources inside namespaces — it
+# never needs cluster-level RBAC or access-entry management.
+resource "aws_eks_access_entry" "gha_deploy" {
+  cluster_name  = aws_eks_cluster.central.name
+  principal_arn = aws_iam_role.gha_deploy.arn
+}
+
+resource "aws_eks_access_policy_association" "gha_deploy" {
+  cluster_name  = aws_eks_cluster.central.name
+  principal_arn = aws_iam_role.gha_deploy.arn
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminPolicy"
+  access_scope { type = "cluster" }
+}
+
+# --- DNS + TLS (optional, only when domain_name is set) -----------------------------
+# Route53 hosted zone for the delegated subdomain. The ONE manual step is at
+# the registrar: NS records pointing the subdomain at
+# output.hosted_zone_name_servers. After that, ACM's DNS validation completes
+# on its own — the validation CNAMEs are created HERE, inside the zone, not at
+# Namecheap.
+#
+# Deliberately NO aws_acm_certificate_validation resource: that waiter blocks
+# `terraform apply` until delegation lands (up to 75 min). The cert issues by
+# itself once NS is delegated; the deploy path only annotates services with a
+# cert whose status is already ISSUED.
+
+locals {
+  dns_enabled  = var.domain_name != ""
+  console_fqdn = "console.${var.domain_name}"
+  streams_fqdn = "streams.${var.domain_name}"
+}
+
+resource "aws_route53_zone" "public" {
+  count = local.dns_enabled ? 1 : 0
+  name  = var.domain_name
+  tags  = local.tags
+}
+
+resource "aws_acm_certificate" "public" {
+  count             = local.dns_enabled ? 1 : 0
+  domain_name       = "*.${var.domain_name}"
+  validation_method = "DNS"
+
+  # The zone apex too — costs nothing and gives the deployment a landing name.
+  subject_alternative_names = [var.domain_name]
+
+  lifecycle {
+    # A cert swap must validate before the old one dies — an in-use cert
+    # deleted first takes every TLS listener down with it.
+    create_before_destroy = true
+  }
+
+  tags = local.tags
+}
+
+resource "aws_route53_record" "acm_validation" {
+  for_each = local.dns_enabled ? {
+    for dvo in aws_acm_certificate.public[0].domain_validation_options :
+    dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  } : {}
+
+  zone_id = aws_route53_zone.public[0].zone_id
+  name    = each.value.name
+  type    = each.value.type
+  records = [each.value.record]
+  ttl     = 60
+}
+
 # --- outputs ---------------------------------------------------------------------
 
 output "cluster_name" {
@@ -499,17 +647,50 @@ output "ecr_repositories" {
 }
 
 output "github_actions_role_arn" {
-  description = "Set as the GitHub repo variable AWS_ECR_PUSH_ROLE_ARN — .github/workflows/images-ecr.yml assumes it."
+  description = "Set as the GitHub repo variable AWS_ECR_PUSH_ROLE_ARN — the push job assumes it."
   value       = aws_iam_role.gha_ecr_push.arn
+}
+
+output "github_actions_deploy_role_arn" {
+  description = "Set as the GitHub repo variable AWS_EKS_DEPLOY_ROLE_ARN — the deploy job assumes it."
+  value       = aws_iam_role.gha_deploy.arn
+}
+
+output "domain_name" {
+  description = "The delegated zone, when configured. Empty means no DNS/TLS was provisioned."
+  value       = var.domain_name
+}
+
+output "hosted_zone_name_servers" {
+  description = "THE manual DNS step: create NS records for the subdomain at your registrar pointing at these four name servers."
+  value       = local.dns_enabled ? aws_route53_zone.public[0].name_servers : []
+}
+
+output "console_fqdn" {
+  value = local.dns_enabled ? local.console_fqdn : null
+}
+
+output "streams_fqdn" {
+  value = local.dns_enabled ? local.streams_fqdn : null
+}
+
+output "acm_certificate_arn" {
+  description = "Only usable once status is ISSUED (automatic after NS delegation). The deploy path looks it up by domain rather than consuming this output directly."
+  value       = local.dns_enabled ? aws_acm_certificate.public[0].arn : null
 }
 
 output "next_steps" {
   value = <<-EOT
     1. aws eks update-kubeconfig --region ${var.region} --name ${local.name}
-    2. Push the GitHub repo variable AWS_ECR_PUSH_ROLE_ARN = ${aws_iam_role.gha_ecr_push.arn}
-       (and AWS_REGION = ${var.region}) so the images-ecr workflow can assume it.
-    3. Merge to main — CI builds and pushes all images to ECR.
-    4. make eks-secrets   # gateway + internal + bootstrap Secrets
-    5. make eks-up        # helm upgrade -f values-eks.yaml, registry injected from this output
+    2. GitHub repo variables: AWS_ECR_PUSH_ROLE_ARN = ${aws_iam_role.gha_ecr_push.arn}
+       AWS_EKS_DEPLOY_ROLE_ARN = ${aws_iam_role.gha_deploy.arn}
+       AWS_REGION = ${var.region}%{if local.dns_enabled}
+       PRAHARI_DOMAIN = ${var.domain_name}
+       — then ONE manual step at your registrar: NS records for the
+         '${split(".", var.domain_name)[0]}' subdomain → ${join(", ", aws_route53_zone.public[0].name_servers)}%{endif}
+    3. make eks-secrets   # BEFORE the first deploy — internalSecretRequired
+       # means pods refuse to start without prahari-internal, and CI cannot
+       # mint it (the Secrets are out-of-band by design).
+    4. Merge to main — CI builds, pushes to ECR, and deploys to this cluster.
   EOT
 }

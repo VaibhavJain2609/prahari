@@ -151,4 +151,30 @@ for caller in registry bff match-engine correlation; do
         || fail "eks: postgres NetworkPolicy omits $caller — it holds a database_url"
 done
 
+# --- eks + tls: the ACM path must produce real TLS listeners -------------------
+
+helm template prahari "$CHART" --values "$CHART/values-eks.yaml" \
+    --set global.imageRegistry=123456789012.dkr.ecr.ap-south-1.amazonaws.com \
+    --set tls.enabled=true \
+    --set tls.acmArn=arn:aws:acm:ap-south-1:123456789012:certificate/deadbeef \
+    --set tls.consoleHost=console.eks.example.com \
+    --set tls.streamsHost=streams.eks.example.com \
+    --set mediamtx.browserWhepBase=https://streams.eks.example.com \
+    --set services.bff.sessionCookieSecure=true \
+    >"$TMP/eks-tls.yaml"
+
+# Both public LBs must carry the cert — one without it leaves a plaintext
+# listener while the values claim TLS is on.
+[ "$(grep -c 'aws-load-balancer-ssl-cert' "$TMP/eks-tls.yaml")" -ge 2 ] \
+    || fail "eks-tls: fewer than two ssl-cert annotations — an LB lost its TLS listener"
+# web:443 and whep:443 must both exist; RTSP must NOT be TLS-terminated.
+grep -A45 'name: prahari-web' "$TMP/eks-tls.yaml" | grep -q 'port: 443' \
+    || fail "eks-tls: web service has no 443 listener"
+grep -A45 'name: prahari-mediamtx-public' "$TMP/eks-tls.yaml" | grep -q 'port: 443' \
+    || fail "eks-tls: mediamtx-public has no 443 listener"
+[ "$(env_val "$TMP/eks-tls.yaml" PRAHARI_MEDIA_WHEP_BASE_URL)" = "https://streams.eks.example.com" ] \
+    || fail "eks-tls: WHEP base did not switch to https://streams.*"
+[ "$(env_val "$TMP/eks-tls.yaml" PRAHARI_SESSION_COOKIE_SECURE)" = "true" ] \
+    || fail "eks-tls: cookies must be Secure once TLS terminates at the NLB"
+
 echo "all profiles render, and the switch switches"

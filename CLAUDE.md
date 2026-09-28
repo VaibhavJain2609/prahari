@@ -172,10 +172,11 @@ make gateway-secret   load .env into the cluster as the credential Secret
 make dev              tilt up (inner loop)
 make eks-kubeconfig   point kubectl at the EKS cluster
 make eks-secrets      create all out-of-band Secrets on EKS
-make eks-up           helm install on EKS, profile=eks, registry from tf output
+make eks-up           helm install on EKS via scripts/eks-deploy.sh (same path as CI)
+make eks-dns          upsert console/streams CNAMEs to the live LB hostnames
 make test             pytest across the workspace
 make lint             ruff + helm lint + buf lint
-make verify           render both profiles and check the switch
+make verify           render all profiles and check the switch
 make down             tear down the local cluster
 ```
 

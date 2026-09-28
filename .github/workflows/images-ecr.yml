@@ -9,9 +9,14 @@
 # this repo's main branch.
 #
 # Required GitHub repo *variables* (Settings > Variables — not secrets; the
-# role ARN and region are not credentials):
-#   AWS_ECR_PUSH_ROLE_ARN   terraform output github_actions_role_arn
-#   AWS_REGION              e.g. ap-south-1
+# role ARNs and region are not credentials):
+#   AWS_ECR_PUSH_ROLE_ARN    terraform output github_actions_role_arn
+#   AWS_EKS_DEPLOY_ROLE_ARN  terraform output github_actions_deploy_role_arn
+#   AWS_REGION               e.g. ap-south-1
+# Optional:
+#   EKS_CLUSTER_NAME         default prahari-central
+#   PRAHARI_DOMAIN           the delegated zone (e.g. eks.example.com) — enables
+#                            TLS annotations + the CNAME sync step when set
 name: images-ecr
 
 on:
@@ -79,3 +84,46 @@ jobs:
             ${{ steps.ecr.outputs.registry }}/prahari-${{ matrix.name }}:sha-${{ github.sha }}${{ matrix.suffix }}
           cache-from: type=gha,scope=${{ matrix.name }}${{ matrix.suffix }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}${{ matrix.suffix }}
+
+  deploy:
+    needs: push
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME || 'prahari-central' }}
+      PRAHARI_DOMAIN: ${{ vars.PRAHARI_DOMAIN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Assume the deploy role
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_EKS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: kubeconfig
+        run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+
+      # Deploys the sha tag THIS run built — deploying :latest would race a
+      # later push and ship an untested image behind a tested tag.
+      - name: helm upgrade on EKS
+        run: |
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          IMAGE_REGISTRY="${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com" \
+          IMAGE_TAG="sha-${{ github.sha }}" \
+            ./scripts/eks-deploy.sh
+
+      # DNS is UPSERT — cheap on every deploy, self-heals if an NLB is ever
+      # recreated and its hostname changes. Skipped silently when no
+      # PRAHARI_DOMAIN variable is configured.
+      - name: Sync console/streams CNAMEs
+        if: env.PRAHARI_DOMAIN != ''
+        run: |
+          uv run --no-project --with boto3 \
+            scripts/eks_dns_sync.py --domain "$PRAHARI_DOMAIN"
