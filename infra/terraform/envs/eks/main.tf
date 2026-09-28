@@ -419,11 +419,13 @@ resource "aws_ecr_lifecycle_policy" "services" {
 # repo secret. Trust is narrowed to this repo's main branch — a PR from a
 # fork cannot assume it.
 
-resource "aws_iam_openid_connect_provider" "github" {
-  url             = "https://token.actions.githubusercontent.com"
-  client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
-  tags            = local.tags
+# The GitHub OIDC provider is account-level and shared — it already exists
+# here, so this env references it rather than owning it. If a fresh account
+# needs it: aws iam create-open-id-connect-provider \
+#   --url https://token.actions.githubusercontent.com \
+#   --client-id-list sts.amazonaws.com
+data "aws_iam_openid_connect_provider" "github" {
+  url = "https://token.actions.githubusercontent.com"
 }
 
 data "aws_iam_policy_document" "gha_trust" {
@@ -433,7 +435,7 @@ data "aws_iam_policy_document" "gha_trust" {
 
     principals {
       type        = "Federated"
-      identifiers = [aws_iam_openid_connect_provider.github.arn]
+      identifiers = [data.aws_iam_openid_connect_provider.github.arn]
     }
 
     condition {
