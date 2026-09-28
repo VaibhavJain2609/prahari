@@ -1,0 +1,22 @@
+# Copy to terraform.tfvars (gitignored) and fill in.
+#
+# operator_cidr: your egress IP as a /32 — `curl -s ifconfig.me`/32. The public
+# EKS API endpoint accepts connections only from this range. Same posture as
+# the district module's ssh_cidr.
+operator_cidr = "203.0.113.10/32"
+
+# Defaults shown for completeness — uncomment to override.
+# region              = "ap-south-1"
+# cluster_name        = "prahari-central"
+# kubernetes_version  = "1.35"
+# node_instance_types = ["t3.large"]
+# node_desired        = 2
+# node_min            = 2
+# node_max            = 4
+# github_repo         = "VaibhavJain2609/prahari"
+# admin_principal_arns = []
+
+tags = {
+  Environment = "eks"
+  Event       = "gujarat-hackathon-2026"
+}

@@ -1,10 +1,10 @@
 # Base values. Shared by every profile.
 #
-# INVARIANT: `profile` (local | gpu) is the ONLY thing that differs between the
-# laptop and the cloud. If a cutover ever needs a code change, the switch is
-# wrong — fix the switch, not the code.
+# INVARIANT: `profile` (local | gpu | eks) is the ONLY thing that differs
+# between the laptop and the cloud. If a cutover ever needs a code change,
+# the switch is wrong — fix the switch, not the code.
 #
-# Override with values-local.yaml or values-gpu.yaml.
+# Override with values-local.yaml, values-gpu.yaml or values-eks.yaml.
 
 profile: local
 
@@ -16,6 +16,21 @@ global:
   imageRegistry: prahari-registry:5000
   imageTag: dev
   pullPolicy: IfNotPresent
+
+# --- storage -----------------------------------------------------------------
+
+storageClass:
+  # When set, EVERY chart PVC requests this StorageClass — postgres' StatefulSet
+  # volumeClaimTemplate, the bff audit PVC, and mediamtx recordings. Empty uses
+  # the cluster's default provisioner (local-path on k3d, gp2 on EKS). It is a
+  # knob rather than a per-PVC value because the right answer differs per
+  # cluster and must never diverge between claims in one release.
+  name: ""
+  # Render the class itself alongside the claims (templates/storageclass.yaml):
+  # gp3, encrypted, WaitForFirstConsumer, Retain. The eks profile sets this —
+  # it needs the aws-ebs-csi-driver addon, which infra/terraform/envs/eks
+  # installs. Local stays false (k3d's local-path provisioner already exists).
+  create: false
 
 # --- the metadata plane ------------------------------------------------------
 
@@ -107,6 +122,16 @@ mediamtx:
   # gpu profile must set this to the public ingress URL (and that ingress
   # must pass the Authorization header or the `?jwt=` query through).
   browserWhepBase: "http://localhost:8889"
+  # A SECOND, public-facing Service, rendered only when enabled: a cloud
+  # LoadBalancer exposing ONLY the media ports (rtsp/hls/whep). The main
+  # service stays ClusterIP, so the control API (9997) and metrics (9998) —
+  # which must never be internet-published — remain cluster-internal. The eks
+  # profile uses this; local instead sets serviceType: LoadBalancer on the
+  # main service because k3d's port maps want every port on one LB anyway.
+  publicLb:
+    enabled: false
+    # AWS example: {"service.beta.kubernetes.io/aws-load-balancer-type": "nlb"}
+    annotations: {}
   # Evidence recording. OFF by default: recording multiplies MediaMTX disk by
   # every camera's bitrate — on the 80k estate this is an edge/DVR concern,
   # not a central one. Enable it for the footage-backed evidence path
@@ -227,6 +252,12 @@ services:
     # The hash-chained audit log is append-only and must outlive the pod —
     # the one piece of first-party state outside Postgres, on its own PVC.
     auditStorage: 1Gi
+    # PRAHARI_SESSION_COOKIE_SECURE override. Empty derives from profile
+    # (false only under `local`): Secure cookies require TLS in front. Set
+    # "false" explicitly ONLY for a profile that serves plain HTTP — the eks
+    # profile today, where LBs terminate nothing. A profile that sets this
+    # false while claiming TLS is lying to the browser either way.
+    sessionCookieSecure: ""
     volumeMounts:
       - name: audit
         mountPath: /var/lib/prahari/audit

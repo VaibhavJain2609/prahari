@@ -100,6 +100,9 @@ spec:
         name: data
       spec:
         accessModes: ["ReadWriteOnce"]
+        {{- if .Values.storageClass.name }}
+        storageClassName: {{ .Values.storageClass.name | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ .Values.postgres.storage }}
@@ -319,6 +322,9 @@ metadata:
     {{- include "prahari.labels" . | nindent 4 }}
 spec:
   accessModes: [ReadWriteOnce]
+  {{- if .Values.storageClass.name }}
+  storageClassName: {{ .Values.storageClass.name | quote }}
+  {{- end }}
   resources:
     requests:
       storage: {{ .Values.mediamtx.record.storageSize }}
@@ -333,6 +339,9 @@ metadata:
 spec:
   # LoadBalancer in the local profile so k3d's host port maps (8554/8888/8889)
   # actually reach it — a ClusterIP binds no node port for the loadbalancer.
+  # On a real cloud this stays ClusterIP and prahari-mediamtx-public (below)
+  # is the LB: exposing ALL five ports on one LB would publish the control
+  # API and metrics to the internet.
   type: {{ .Values.mediamtx.serviceType | default "ClusterIP" }}
   selector:
     {{- include "prahari.selectorLabels" . | nindent 4 }}
@@ -351,4 +360,37 @@ spec:
       port: {{ .Values.mediamtx.apiPort }}
     - name: metrics
       port: {{ .Values.mediamtx.metricsPort }}
+{{- if .Values.mediamtx.publicLb.enabled }}
+---
+# The public media surface: rtsp/hls/whep ONLY. The control API (which can
+# rewrite every upstream path) and metrics deliberately stay on the ClusterIP
+# service above — a LoadBalancer publishing 9997 would hand the internet the
+# restreamer's configuration and its credentialed source URLs.
+apiVersion: v1
+kind: Service
+metadata:
+  name: prahari-mediamtx-public
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+    app.kubernetes.io/name: mediamtx
+  {{- if .Values.mediamtx.publicLb.annotations }}
+  annotations:
+    {{- toYaml .Values.mediamtx.publicLb.annotations | nindent 4 }}
+  {{- end }}
+spec:
+  type: LoadBalancer
+  selector:
+    {{- include "prahari.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/name: mediamtx
+  ports:
+    - name: rtsp
+      port: {{ .Values.mediamtx.rtspPort }}
+      targetPort: {{ .Values.mediamtx.rtspPort }}
+    - name: hls
+      port: {{ .Values.mediamtx.hlsPort }}
+      targetPort: {{ .Values.mediamtx.hlsPort }}
+    - name: whep
+      port: {{ .Values.mediamtx.whepPort }}
+      targetPort: {{ .Values.mediamtx.whepPort }}
+{{- end }}
 {{- end }}

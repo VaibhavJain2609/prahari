@@ -109,7 +109,7 @@ These come from the portal's own Integrator's Guide. Violating them costs hours 
   it does not exist. Anything in the demo must survive a clean `terraform apply`.
 - Every service must tolerate being killed and rescheduled at any moment.
   No local disk state outside a PVC.
-- The `profile` Helm value (`local` | `gpu`) is the **only** thing that differs between the
+- The `profile` Helm value (`local` | `gpu` | `eks`) is the **only** thing that differs between the
   laptop and the cloud. If a cutover needs a code change, the switch is wrong — fix the switch.
 - **Every `PRAHARI_*` env the chart sets must exist as a settings field**, asserted by a
   test that parses the template. A knob the chart writes and the code never reads is a
@@ -147,8 +147,9 @@ services/
   bff/                auth · RBAC · hash-chained audit · SSE to the browser
 web/                  Next.js · MapLibre · WHEP live preview · alert console
 infra/
-  terraform/modules/district/   reusable per-district unit (statewide rollout artifact)
-  helm/prahari/                 one chart, profile-switched
+  terraform/modules/district/   reusable per-district edge unit (statewide rollout artifact)
+  terraform/envs/eks/           the central plane: EKS + ECR + GitHub OIDC (docs/EKS.md)
+  helm/prahari/                 one chart, profile-switched (local | gpu | eks)
   k3d/                          local cluster
 docs/                 HLD · SCALE-80K · SECURITY · COST-MODEL · DEMO-SCRIPT
 data/catalogue/       captured /api/ingest snapshots
@@ -159,7 +160,7 @@ data/watchlist/       representative stolen / wanted / missing dataset
 
 Python **3.12** (pinned — 3.14 has no PyTorch/Ultralytics wheels) · FastAPI · grpcio ·
 Ultralytics YOLO · PaddleOCR · Postgres 16 + PostGIS + TimescaleDB · Redis ·
-Redpanda (scale test) · Next.js 15 + MapLibre GL · k3s/k3d + Helm + Terraform + KEDA.
+Redpanda (scale test) · Next.js 15 + MapLibre GL · k3s/k3d + EKS + Helm + Terraform + KEDA.
 
 ## Commands
 
@@ -169,6 +170,9 @@ make images           build service images into the k3d registry
 make up               k3d cluster + helm install, profile=local
 make gateway-secret   load .env into the cluster as the credential Secret
 make dev              tilt up (inner loop)
+make eks-kubeconfig   point kubectl at the EKS cluster
+make eks-secrets      create all out-of-band Secrets on EKS
+make eks-up           helm install on EKS, profile=eks, registry from tf output
 make test             pytest across the workspace
 make lint             ruff + helm lint + buf lint
 make verify           render both profiles and check the switch

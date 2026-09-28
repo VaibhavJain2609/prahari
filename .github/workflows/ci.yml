@@ -63,18 +63,24 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v5
 
-      # The profile switch is the repo's central deployment claim: both
-      # profiles must lint AND render, or `profile` is not the only thing that
-      # differs between the laptop and the cloud.
-      - name: Lint both profiles
+      # The profile switch is the repo's central deployment claim: every
+      # profile must lint AND render, or `profile` is not the only thing that
+      # differs between the laptop and the cloud. values-eks renders with a
+      # fake registry injected — its values file carries a placeholder that
+      # `make eks-up` replaces from terraform output.
+      - name: Lint all profiles
         run: |
           helm lint infra/helm/prahari --values infra/helm/prahari/values-local.yaml
           helm lint infra/helm/prahari --values infra/helm/prahari/values-gpu.yaml
+          helm lint infra/helm/prahari --values infra/helm/prahari/values-eks.yaml
 
-      - name: Render both profiles
+      - name: Render all profiles
         run: |
           helm template prahari infra/helm/prahari --values infra/helm/prahari/values-local.yaml >/dev/null
           helm template prahari infra/helm/prahari --values infra/helm/prahari/values-gpu.yaml >/dev/null
+          helm template prahari infra/helm/prahari --values infra/helm/prahari/values-eks.yaml \
+            --set global.imageRegistry=123456789012.dkr.ecr.ap-south-1.amazonaws.com \
+            --set mediamtx.browserWhepBase=http://example.elb.amazonaws.com:8889 >/dev/null
 
   web:
     runs-on: ubuntu-latest
@@ -142,14 +148,16 @@ jobs:
         uses: hashicorp/setup-terraform@v4
 
       - name: fmt
-        run: terraform -chdir=infra/terraform/envs/demo fmt -check -recursive
+        run: terraform -chdir=infra/terraform fmt -check -recursive
 
       - name: init + validate
-        # -backend=false: this config's backend is not configured in CI and
+        # -backend=false: neither env's backend is configured in CI and
         # validate does not need remote state.
         run: |
           terraform -chdir=infra/terraform/envs/demo init -backend=false
           terraform -chdir=infra/terraform/envs/demo validate
+          terraform -chdir=infra/terraform/envs/eks init -backend=false
+          terraform -chdir=infra/terraform/envs/eks validate
 
   secrets:
     runs-on: ubuntu-latest

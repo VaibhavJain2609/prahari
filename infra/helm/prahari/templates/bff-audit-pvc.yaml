@@ -14,6 +14,9 @@ metadata:
     app.kubernetes.io/name: bff
 spec:
   accessModes: ["ReadWriteOnce"]
+  {{- if .Values.storageClass.name }}
+  storageClassName: {{ .Values.storageClass.name | quote }}
+  {{- end }}
   resources:
     requests:
       storage: {{ .Values.services.bff.auditStorage }}

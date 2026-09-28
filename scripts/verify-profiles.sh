@@ -8,7 +8,7 @@
 # looks applied, is not, and the number it was meant to change ends up on a
 # slide.
 #
-# So this renders both profiles and asserts, in BOTH directions:
+# So this renders all profiles and asserts, in BOTH directions:
 #   * the gpu-only machinery appears under profile=gpu (cuda device, nvidia
 #     runtime + resource, ScaledObject, secure cookies, mandatory internal
 #     Secret), and is absent under profile=local — a leaked GPU setting on the
@@ -27,6 +27,13 @@ trap 'rm -rf "$TMP"' EXIT
 
 helm template prahari "$CHART" --values "$CHART/values-local.yaml" >"$TMP/local.yaml"
 helm template prahari "$CHART" --values "$CHART/values-gpu.yaml" >"$TMP/gpu.yaml"
+# eks renders with the registry injected — the same way `make eks-up` supplies
+# it from terraform output — so assertions see real image refs, not the
+# values-file placeholder.
+helm template prahari "$CHART" --values "$CHART/values-eks.yaml" \
+    --set global.imageRegistry=123456789012.dkr.ecr.ap-south-1.amazonaws.com \
+    --set mediamtx.browserWhepBase=http://example.elb.amazonaws.com:8889 \
+    >"$TMP/eks.yaml"
 
 fail() { echo "verify: $*" >&2; exit 1; }
 
@@ -105,4 +112,43 @@ hasnt "$TMP/gpu.yaml" 'image: localhost:' \
 cmp -s "$TMP/local.yaml" "$TMP/gpu.yaml" \
     && fail "local and gpu render identically — the profile switch does nothing"
 
-echo "both profiles render, and the switch switches"
+# --- eks: the cloud baseline must be a real, pullable deployment --------------
+
+[ "$(env_val "$TMP/eks.yaml" PRAHARI_DETECT_DEVICE)" = "cpu" ] \
+    || fail "eks: PRAHARI_DETECT_DEVICE is not cpu — the CPU node group can't run it"
+[ "$(env_val "$TMP/eks.yaml" PRAHARI_DETECT_DECODE_BACKEND)" = "cpu" ] \
+    || fail "eks: PRAHARI_DETECT_DECODE_BACKEND is not cpu — videotoolbox is macOS-only"
+[ "$(env_val "$TMP/eks.yaml" PRAHARI_SESSION_COOKIE_SECURE)" = "false" ] \
+    || fail "eks: Secure cookies over a plain-HTTP NLB break login — the override is lost"
+has "$TMP/eks.yaml" 'provisioner: ebs.csi.aws.com' \
+    "eks: gp3 StorageClass not rendered — PVCs would pend on the default class"
+has "$TMP/eks.yaml" 'storageClassName: "gp3"' \
+    "eks: claims not bound to gp3 — the storageClass knob is disconnected"
+has "$TMP/eks.yaml" 'image: 123456789012.dkr.ecr.ap-south-1.amazonaws.com/prahari-registry:latest' \
+    "eks: image refs are not composed from the injected ECR registry"
+has "$TMP/eks.yaml" 'name: prahari-mediamtx-public' \
+    "eks: the public media LB is missing"
+hasnt "$TMP/eks.yaml" 'nvidia.com/gpu' \
+    "eks: a GPU request leaked into the CPU-only profile"
+hasnt "$TMP/eks.yaml" 'image: localhost:' \
+    "eks: an image ref uses the host-side registry view — pods can't pull it"
+hasnt "$TMP/eks.yaml" 'REPLACE_WITH' \
+    "eks: the registry placeholder survived — global.imageRegistry was not injected"
+
+# The public LB must expose ONLY the media ports — the control API on the
+# internet is a reconfigure-the-restreamer button for anyone who finds it.
+grep -A45 'name: prahari-mediamtx-public' "$TMP/eks.yaml" >"$TMP/mtx-public.yaml"
+has "$TMP/mtx-public.yaml" 'port: 8554' "eks: public media LB missing rtsp"
+has "$TMP/mtx-public.yaml" 'port: 8889' "eks: public media LB missing whep"
+hasnt "$TMP/mtx-public.yaml" '9997' "eks: public media LB exposes the control API"
+hasnt "$TMP/mtx-public.yaml" '9998' "eks: public media LB exposes metrics"
+
+# The postgres NetworkPolicy must name every *_DATABASE_URL holder — under an
+# enforcing CNI an omission here is a database outage that still looks green.
+for caller in registry bff match-engine correlation; do
+    grep -A25 'name: prahari-postgres-ingress' "$TMP/eks.yaml" \
+        | grep -q "app.kubernetes.io/name: $caller" \
+        || fail "eks: postgres NetworkPolicy omits $caller — it holds a database_url"
+done
+
+echo "all profiles render, and the switch switches"

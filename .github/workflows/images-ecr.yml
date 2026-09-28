@@ -1,0 +1,81 @@
+# Builds every first-party image and pushes it to ECR on merge to main.
+#
+# This workflow is what keeps the laptop disk free: image builds (the
+# multi-GB torch/CUDA layers) happen on the runner, never locally.
+# `make eks-up` then pulls :latest onto the cluster.
+#
+# Auth is OIDC, not a stored AWS key: the role lives in
+# infra/terraform/envs/eks (github_actions_role_arn output) and trusts only
+# this repo's main branch.
+#
+# Required GitHub repo *variables* (Settings > Variables — not secrets; the
+# role ARN and region are not credentials):
+#   AWS_ECR_PUSH_ROLE_ARN   terraform output github_actions_role_arn
+#   AWS_REGION              e.g. ap-south-1
+name: images-ecr
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write # OIDC assume-role
+  contents: read
+
+concurrency:
+  group: images-ecr
+  cancel-in-progress: false # an interrupted push leaves a half-pushed image set
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: registry,     dockerfile: services/registry/Dockerfile,     suffix: "" }
+          - { name: inference,    dockerfile: services/inference/Dockerfile,    suffix: "" }
+          - { name: match-engine, dockerfile: services/match-engine/Dockerfile, suffix: "" }
+          - { name: correlation,  dockerfile: services/correlation/Dockerfile,  suffix: "" }
+          - { name: bff,          dockerfile: services/bff/Dockerfile,          suffix: "" }
+          - { name: web,          dockerfile: web/Dockerfile,                   suffix: "" }
+          # The CUDA variant — the values-gpu.yaml layering expects
+          # prahari-inference:<tag>-cuda. Built every run, same reasoning as
+          # ci.yml: a Dockerfile only built on demand rots before demo day.
+          - { name: inference,    dockerfile: services/inference/Dockerfile.gpu, suffix: "-cuda" }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Assume the ECR push role
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ECR_PUSH_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # The stubs are gitignored — a build without them produces images that
+      # ImportError on prahari.v1 at container start, green at build time.
+      - name: Install buf
+        uses: bufbuild/buf-setup-action@v1
+
+      - name: Generate protobuf stubs
+        run: make proto
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push prahari-${{ matrix.name }}${{ matrix.suffix }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/prahari-${{ matrix.name }}:latest${{ matrix.suffix }}
+            ${{ steps.ecr.outputs.registry }}/prahari-${{ matrix.name }}:sha-${{ github.sha }}${{ matrix.suffix }}
+          cache-from: type=gha,scope=${{ matrix.name }}${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}${{ matrix.suffix }}

@@ -1,0 +1,25 @@
+{{- if and .Values.storageClass.create .Values.storageClass.name }}
+{{/*
+The EBS class the eks profile's claims bind to. Rendered by the chart rather
+than Terraform for the same reason the PVCs themselves live here: storage is
+part of the release's contract, and `helm install` must be the whole story.
+
+reclaimPolicy: Retain is deliberate. Postgres' PGDATA and the bff's
+hash-chained audit log are the two pieces of first-party state a
+`helm uninstall` must NOT take with it — the same posture as the
+helm.sh/resource-policy: keep annotations on the generated Secrets.
+*/}}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.storageClass.name }}
+  labels:
+    {{- include "prahari.labels" . | nindent 4 }}
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+parameters:
+  type: gp3
+  encrypted: "true"
+{{- end }}

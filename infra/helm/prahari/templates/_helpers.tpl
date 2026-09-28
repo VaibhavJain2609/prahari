@@ -522,8 +522,11 @@ registry, relays alerts off Redis Streams, and owns the hash-chained audit log
   value: {{ .Values.mediamtx.browserWhepBase | quote }}
 # Secure cookies only where TLS terminates. Local k3d serves plain HTTP; every
 # other profile must have TLS in front or sessions ship in the clear.
+# services.bff.sessionCookieSecure overrides the derivation for a profile that
+# genuinely serves plain HTTP (eks behind a raw TCP LB today) — setting
+# "false" while TLS terminates is equally wrong, so the default stays derived.
 - name: PRAHARI_SESSION_COOKIE_SECURE
-  value: {{ eq .Values.profile "local" | ternary "false" "true" | quote }}
+  value: {{ .Values.services.bff.sessionCookieSecure | default (ternary "false" "true" (eq .Values.profile "local")) | quote }}
 # First-user seeding: created only when the users table is empty. Out of band,
 # never in values:
 #   kubectl create secret generic prahari-bff-bootstrap \

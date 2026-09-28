@@ -1,0 +1,109 @@
+# EKS profile — the central plane in the cloud (infra/terraform/envs/eks).
+#
+# CPU nodes for now: this is where the whole platform lives day-to-day, so the
+# laptop only needs a browser. The GPU inference pool is a follow-up node group
+# — when it lands, `helm upgrade -f values-eks.yaml -f values-gpu.yaml` layers
+# the GPU inference settings over this baseline.
+#
+# Exposure is plain AWS LoadBalancers, NOT an ingress: web (the console) and
+# mediamtx-public (rtsp/hls/whep) get their own NLBs; everything else is
+# ClusterIP. That means HTTP only — auth cookies are insecure (explicit
+# override below), and TLS/ACM + a real domain is the documented follow-up.
+
+profile: eks
+
+global:
+  # `make eks-up` injects the real registry from `terraform output ecr_registry`
+  # — this placeholder exists only so a bare `helm template` still renders.
+  # The same value serves both views: CI pushes to it from outside, nodes pull
+  # from it inside (node role carries AmazonEC2ContainerRegistryReadOnly — no
+  # imagePullSecrets).
+  imageRegistry: REPLACE_WITH_ECR_REGISTRY.dkr.ecr.ap-south-1.amazonaws.com
+  # CI (images-ecr.yml) pushes :latest plus :sha-<commit>. `latest` + Always is
+  # the demo posture; for a measurement run, pin with
+  # `--set global.imageTag=sha-<commit>` so the number traces to a commit.
+  imageTag: latest
+  pullPolicy: Always
+
+storageClass:
+  # gp3 on the EBS CSI addon — Terraform installs the driver, the chart renders
+  # the class (templates/storageclass.yaml) and points every PVC at it.
+  # EKS's gp2 default would work; gp3 is cheaper per GB with a better baseline.
+  name: gp3
+  create: true
+
+# auth.kind stays builtin: no real IdP exists yet and the in-chart Keycloak is
+# a start-dev laptop IdP. redirectBase is unused under builtin.
+auth:
+  kind: builtin
+
+postgres:
+  storage: 20Gi
+
+services:
+  correlation:
+    enabled: true
+  bff:
+    enabled: true
+    # ClusterIP, deliberately NOT a LoadBalancer: the browser only ever talks
+    # to the console, whose Next.js route handlers proxy /api/bff/* to the BFF
+    # in-cluster (PRAHARI_BFF_URL). One less NLB, and the token-gated admin
+    # surface is unreachable from the internet.
+    sessionCookieSecure: "false" # plain-HTTP NLB — no TLS terminator exists yet
+  web:
+    enabled: true
+    serviceType: LoadBalancer
+    serviceAnnotations:
+      # NLB, not CLB: TCP forwarding is all we need today, and NLB carries UDP
+      # later if WHEP media moves off TCP.
+      service.beta.kubernetes.io/aws-load-balancer-type: nlb
+
+mediamtx:
+  # Main service stays ClusterIP — api (9997) and metrics (9998) must never be
+  # internet-published. The public surface is the separate media-only LB.
+  publicLb:
+    enabled: true
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: nlb
+  # Populated by `make eks-up` from the provisioned LB hostname
+  # (http://<nlbs-hostname>:8889). Empty until the LB exists — preview tickets
+  # then mint a URL that resolves nowhere, which is loud, not silent.
+  browserWhepBase: ""
+
+inference:
+  replicas: 1
+  model: yolov8n.pt
+  decodeBackend: cpu # Linux nodes — videotoolbox is a macOS-only path
+  device: cpu
+  samplingFps: 2
+  maxStreamsPerWorker: 10
+  batchSize: 4
+  motionGate: true
+  gpu: false
+
+  resources:
+    requests: { cpu: "1", memory: 2Gi }
+    limits:   { cpu: "4", memory: 4Gi }
+
+  keda:
+    enabled: false
+
+# A real deployment posture: pods refuse to start if prahari-internal is
+# absent rather than booting with enforcement-off empty tokens.
+# `make eks-secrets` creates the Secret (plus gateway + bootstrap) first.
+security:
+  internalSecretRequired: true
+
+networkPolicies:
+  # Rendered and correct — the postgres rule now covers match-engine +
+  # correlation too. vpc-cni does NOT enforce these until its network-policy
+  # agent is enabled (addon configuration + probe-source verification is a
+  # follow-up; see docs/EKS.md). Documentation until then, same as k3d.
+  enabled: true
+
+observability:
+  enabled: true
+  # kube-prometheus-stack into `monitoring` is a follow-up — the
+  # prometheus.io/* annotations render now and work with any pod-role scraper.
+  serviceMonitor:
+    enabled: false

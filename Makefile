@@ -193,6 +193,68 @@ backup: ## Dump Postgres + the audit log into $(BACKUP_DIR)
 down: ## Uninstall the platform
 	helm uninstall prahari --namespace $(NAMESPACE)
 
+# --- EKS (central plane, infra/terraform/envs/eks) -----------------------------
+
+TF_EKS  := infra/terraform/envs/eks
+EKS_REGION   ?= ap-south-1
+EKS_CLUSTER  ?= prahari-central
+# The cluster's view of the registry — sourced from Terraform output so the
+# chart, CI and the node pull policy can never disagree on it. Empty falls
+# through to the values-eks.yaml placeholder, which loudly ImagePullBackOffs.
+EKS_ECR  := $(shell terraform -chdir=$(TF_EKS) output -raw ecr_registry 2>/dev/null)
+
+.PHONY: eks-kubeconfig
+eks-kubeconfig: ## Point kubectl at the EKS cluster
+	aws eks update-kubeconfig --region $(EKS_REGION) --name $(EKS_CLUSTER)
+
+.PHONY: eks-secrets
+eks-secrets: ## Create all out-of-band Secrets on EKS (gateway + internal + bootstrap)
+	$(MAKE) gateway-secret
+	$(MAKE) internal-secret
+	$(MAKE) bff-bootstrap
+
+.PHONY: eks-up
+eks-up: ## Install/upgrade the platform on EKS (profile=eks)
+	@test -n "$(EKS_ECR)" || { echo "no ecr_registry output — run terraform apply in $(TF_EKS) first"; exit 1; }
+	# browserWhepBase is the BROWSER's view of WHEP — the mediamtx-public LB
+	# hostname, which only exists after the first install. Looked up live and
+	# injected when present: first run brings the stack up with previews
+	# broken-but-loud, re-running this target once the LB lands repairs them.
+	@WHEP_HOST=$$(kubectl -n $(NAMESPACE) get svc prahari-mediamtx-public \
+	  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null); \
+	SETS="--set profile=eks --set global.imageRegistry=$(EKS_ECR)"; \
+	if [ -n "$$WHEP_HOST" ]; then \
+	  SETS="$$SETS --set mediamtx.browserWhepBase=http://$$WHEP_HOST:8889"; \
+	else echo "note: prahari-mediamtx-public has no hostname yet — WHEP base not set this run"; fi; \
+	helm upgrade --install prahari $(CHART) \
+	  --namespace $(NAMESPACE) --create-namespace \
+	  --values $(CHART)/values-eks.yaml \
+	  $$SETS \
+	  --wait --timeout 5m
+	@echo "--- public endpoints ---"
+	@kubectl -n $(NAMESPACE) get svc prahari-web prahari-mediamtx-public \
+	  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.loadBalancer.ingress[0].hostname}{"\n"}{end}'
+	@echo "Re-run 'make eks-up' once prahari-mediamtx-public has a hostname so browserWhepBase lands."
+
+.PHONY: eks-down
+eks-down: ## Uninstall the platform from EKS (leaves the cluster + ECR intact)
+	helm uninstall prahari --namespace $(NAMESPACE)
+
+.PHONY: eks-images
+eks-images: proto ## Escape hatch: build images locally and push to ECR (CI does this on main)
+	# The normal path is .github/workflows/images-ecr.yml — GHA builds and
+	# pushes on merge to main so the laptop never stores an image layer. This
+	# target exists for when CI is broken and a build must ship anyway.
+	@test -n "$(EKS_ECR)" || { echo "no ecr_registry output — terraform apply first"; exit 1; }
+	aws ecr get-login-password --region $(EKS_REGION) | \
+	  docker login --username AWS --password-stdin $(EKS_ECR)
+	for img in registry inference match-engine correlation bff; do \
+	  docker build -f services/$$img/Dockerfile -t $(EKS_ECR)/prahari-$$img:latest . && \
+	  docker push $(EKS_ECR)/prahari-$$img:latest; \
+	done
+	docker build -f web/Dockerfile -t $(EKS_ECR)/prahari-web:latest .
+	docker push $(EKS_ECR)/prahari-web:latest
+
 .PHONY: loadtest
 loadtest: ## Run the load-test harness (infra/loadtest; args via LTARGS, e.g. LTARGS="run --cameras 5,50 --duration-s 60"; default: selftest)
 	cd infra/loadtest && ./run.sh $(LTARGS)
@@ -209,10 +271,11 @@ lint: ## Lint everything that can be linted without a cluster
 	uv run ruff format --check .
 	helm lint $(CHART) --values $(CHART)/values-local.yaml
 	helm lint $(CHART) --values $(CHART)/values-gpu.yaml
+	helm lint $(CHART) --values $(CHART)/values-eks.yaml
 	# Guarded by command -v, not `|| true`: when terraform exists, fmt -check
 	# is a real gate and must be allowed to fail the target.
 	@if command -v terraform >/dev/null 2>&1; then \
-	  terraform -chdir=infra/terraform/envs/demo fmt -check -recursive; \
+	  terraform -chdir=infra/terraform fmt -check -recursive; \
 	else \
 	  echo "terraform not installed — skipping fmt check"; \
 	fi
@@ -234,7 +297,7 @@ test: proto ## Run the test suite across the workspace
 	uv run pytest -q
 
 .PHONY: verify
-verify: ## Render the chart under both profiles and assert the switch switches
+verify: ## Render the chart under all profiles and assert the switch switches
 	# Render-only proves the templates parse, not that `profile` changes
 	# anything. scripts/verify-profiles.sh asserts the gpu machinery appears
 	# under profile=gpu, stays out of profile=local, and that the shared

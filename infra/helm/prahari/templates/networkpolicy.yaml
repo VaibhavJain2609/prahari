@@ -176,7 +176,11 @@ spec:
       ports:
         - port: 6379
 ---
-# Postgres. Only the two services with a database_url touch it.
+# Postgres. Every service carrying a *_DATABASE_URL env: registry + bff, and
+# match-engine (PRAHARI_MATCH_DATABASE_URL, alert persistence) + correlation
+# (PRAHARI_CORRELATION_DATABASE_URL, sighting persistence). Under an enforcing
+# CNI an omitted caller here is a database outage that looks healthy — pods
+# Running, writes silently refused.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -196,6 +200,12 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: bff
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: match-engine
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: correlation
       ports:
         - port: 5432
 ---

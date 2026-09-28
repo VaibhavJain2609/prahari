@@ -131,6 +131,11 @@ metadata:
   labels:
     {{- include "prahari.labels" $ | nindent 4 }}
     app.kubernetes.io/name: {{ $name }}
+  {{- if $cfg.serviceAnnotations }}
+  # e.g. AWS LB flavour: {"service.beta.kubernetes.io/aws-load-balancer-type": "nlb"}
+  annotations:
+    {{- toYaml $cfg.serviceAnnotations | nindent 4 }}
+  {{- end }}
 spec:
   # ClusterIP everywhere except where a profile asks for LoadBalancer — the
   # k3d cluster maps host ports to the loadbalancer (infra/k3d/cluster.yaml),

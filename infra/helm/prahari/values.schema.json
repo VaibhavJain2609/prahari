@@ -5,7 +5,7 @@
   "properties": {
     "profile": {
       "type": "string",
-      "enum": ["local", "gpu"],
+      "enum": ["local", "gpu", "eks"],
       "description": "The ONLY thing that differs between the laptop and the cloud."
     },
     "services": {
