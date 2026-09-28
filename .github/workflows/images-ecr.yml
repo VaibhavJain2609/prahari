@@ -66,6 +66,10 @@ jobs:
       # ImportError on prahari.v1 at container start, green at build time.
       - name: Install buf
         uses: bufbuild/buf-setup-action@v1
+        with:
+          # Without a token the release download hits the anonymous API rate
+          # limit — 7 parallel matrix legs make that a coin flip.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate protobuf stubs
         run: make proto
