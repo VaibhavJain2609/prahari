@@ -9,6 +9,8 @@
 #   IMAGE_TAG        default "latest" — CI passes sha-<commit>
 #   NAMESPACE        default "prahari"
 #   CHART            default infra/helm/prahari
+#   PRAHARI_WHEP_BASE  browser-facing WHEP base (e.g. http://streams.example.com:8889).
+#                    Overrides the mediamtx-public LB hostname for preview tickets.
 #   PRAHARI_DOMAIN   the delegated zone (e.g. eks.example.com). When set AND an
 #                    ISSUED ACM cert exists for *.$PRAHARI_DOMAIN, the NLBs get
 #                    TLS listeners and cookies go Secure. When the cert is not
@@ -52,14 +54,19 @@ if [ -n "$ACM_ARN" ]; then
   echo "tls: enabled — ACM cert ${ACM_ARN##*/}, console=${CONSOLE_HOST} streams=${STREAMS_HOST}"
 else
   [ -n "${PRAHARI_DOMAIN:-}" ] && echo "tls: PRAHARI_DOMAIN set but no ISSUED cert for *.${PRAHARI_DOMAIN} — plain HTTP this deploy (delegate the NS records?)"
-  # browserWhepBase is the BROWSER's view of WHEP — the mediamtx-public LB
-  # hostname, which only exists after the first install. Looked up live and
-  # injected when present: first run brings the stack up with previews
-  # broken-but-loud, re-running repairs them once the LB lands.
-  WHEP_HOST="$(kubectl -n "$NAMESPACE" get svc prahari-mediamtx-public \
-    -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
-  if [ -n "$WHEP_HOST" ]; then
-    SETS+=(--set "mediamtx.browserWhepBase=http://${WHEP_HOST}:8889")
+  # browserWhepBase is the BROWSER's view of WHEP. PRAHARI_WHEP_BASE wins when
+  # set (a friendly CNAME, e.g. http://streams.example.com:8889); otherwise the
+  # mediamtx-public LB hostname is looked up live — it only exists after the
+  # first install, so the first run comes up with previews broken-but-loud and
+  # a re-run repairs them once the LB lands.
+  WHEP_BASE="${PRAHARI_WHEP_BASE:-}"
+  if [ -z "$WHEP_BASE" ]; then
+    WHEP_HOST="$(kubectl -n "$NAMESPACE" get svc prahari-mediamtx-public \
+      -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+    [ -n "$WHEP_HOST" ] && WHEP_BASE="http://${WHEP_HOST}:8889"
+  fi
+  if [ -n "$WHEP_BASE" ]; then
+    SETS+=(--set "mediamtx.browserWhepBase=${WHEP_BASE}")
   else
     echo "note: prahari-mediamtx-public has no hostname yet — WHEP base not set this run"
   fi

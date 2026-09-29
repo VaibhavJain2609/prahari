@@ -96,6 +96,7 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION }}
       CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME || 'prahari-central' }}
       PRAHARI_DOMAIN: ${{ vars.PRAHARI_DOMAIN }}
+      PRAHARI_WHEP_BASE: ${{ vars.PRAHARI_WHEP_BASE }}
     steps:
       - uses: actions/checkout@v6
 
