@@ -78,12 +78,17 @@ mediamtx:
 
 inference:
   replicas: 1
-  # Recreate, not RollingUpdate: two m7i-flex.large nodes have ~4 vCPU total
-  # and a cpu:1 request, so a surge replica can never schedule — the rollout
-  # would deadlock on Insufficient cpu. Brief ingest gap per deploy instead;
-  # workers reconnect streams with backoff on the new pod anyway.
+  # maxSurge 0: two m7i-flex.large nodes have ~4 vCPU total and a cpu:1
+  # request, so a surge replica can never schedule — the rollout would
+  # deadlock on Insufficient cpu. maxUnavailable 1 trades a brief ingest gap
+  # per deploy for a rollout that always converges; workers reconnect streams
+  # with backoff anyway. (type: Recreate would do the same but switching the
+  # type on an existing Deployment trips a server-side-apply conflict on the
+  # stranded rollingUpdate field.)
   strategy:
-    type: Recreate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   model: yolov8n.pt
   decodeBackend: cpu # Linux nodes — videotoolbox is a macOS-only path
   device: cpu
