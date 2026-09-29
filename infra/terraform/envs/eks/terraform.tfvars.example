@@ -1,9 +1,11 @@
 # Copy to terraform.tfvars (gitignored) and fill in.
 #
-# operator_cidr: your egress IP as a /32 — `curl -s ifconfig.me`/32. The public
-# EKS API endpoint accepts connections only from this range. Same posture as
-# the district module's ssh_cidr.
-operator_cidr = "203.0.113.10/32"
+# cluster_public_access_cidrs: who may reach the public EKS API endpoint.
+# Defaults to 0.0.0.0/0 — REQUIRED while GitHub-hosted runners deploy (their
+# egress set exceeds the 40-CIDR cap). The endpoint is still TLS + IAM/OIDC
+# authenticated. Narrow to your /32 only if you accept deploys running from
+# your laptop (`make eks-up`) instead of CI.
+# cluster_public_access_cidrs = ["0.0.0.0/0"]
 
 # DNS/TLS — set to a SUBDOMAIN you control (e.g. "eks.yourdomain.com"). A
 # Route53 zone + wildcard ACM cert get created; then create ONE set of NS

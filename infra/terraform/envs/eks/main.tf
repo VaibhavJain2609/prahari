@@ -56,18 +56,16 @@ variable "vpc_cidr" {
   default     = "10.255.0.0/16"
 }
 
-variable "operator_cidr" {
+variable "cluster_public_access_cidrs" {
   description = <<-EOT
-    Operator CIDR allowed to reach the public EKS API endpoint (443) — your
-    egress IP as a /32. Required with no default, same posture as the district
-    module's ssh_cidr: an open control plane is a decision, not a default.
+    CIDRs allowed to reach the public EKS API endpoint (443). Defaults open:
+    GitHub-hosted runners deploy to this cluster and their egress set (1000+
+    ranges, published via the meta API) exceeds the 40-CIDR cap on this field.
+    The endpoint is TLS + IAM/OIDC authenticated, so reachability is belt, not
+    the buckle. Narrow to a /32 if deploys move to self-hosted runners.
   EOT
-  type        = string
-
-  validation {
-    condition     = can(cidrhost(var.operator_cidr, 0)) && var.operator_cidr != "0.0.0.0/0"
-    error_message = "operator_cidr must be a narrow IPv4 CIDR (e.g. \"203.0.113.10/32\"). 0.0.0.0/0 is rejected — use your own egress IP."
-  }
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
 }
 
 variable "node_instance_types" {
@@ -273,7 +271,7 @@ resource "aws_eks_cluster" "central" {
     subnet_ids              = aws_subnet.public[*].id
     endpoint_private_access = true
     endpoint_public_access  = true
-    public_access_cidrs     = [var.operator_cidr]
+    public_access_cidrs     = var.cluster_public_access_cidrs
   }
 
   access_config {

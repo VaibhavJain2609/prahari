@@ -27,9 +27,10 @@ is a tfvars line, not new code.
 
 ## Bring-up
 
-1. `aws login` (SSO) — the API endpoint is scoped to `operator_cidr`, set it
-   in `infra/terraform/envs/eks/terraform.tfvars`. Optionally set
-   `domain_name` to a subdomain you control (see DNS below).
+1. `aws login` (SSO). The API endpoint is public (`cluster_public_access_cidrs`
+   defaults to `0.0.0.0/0`) because GitHub-hosted runners deploy here — it's
+   TLS + IAM/OIDC authenticated. Optionally set `domain_name` to a subdomain
+   you control (see DNS below).
 2. `terraform -chdir=infra/terraform/envs/eks init && apply` — ~15 min for EKS.
 3. Set GitHub repo variables from terraform outputs:
    `AWS_ECR_PUSH_ROLE_ARN`, `AWS_EKS_DEPLOY_ROLE_ARN`, `AWS_REGION` —
