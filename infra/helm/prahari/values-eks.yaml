@@ -63,8 +63,14 @@ mediamtx:
   # internet-published. The public surface is the separate media-only LB.
   publicLb:
     enabled: true
-    annotations:
-      service.beta.kubernetes.io/aws-load-balancer-type: nlb
+    # No aws-load-balancer-type annotation => in-tree controller provisions a
+    # Classic ELB (TCP passthrough; rtsp/hls/whep are all TCP so nothing is
+    # lost). This account is on the AWS Free plan and elbv2 CreateLoadBalancer
+    # returns OperationNotPermitted — NLBs cannot be created today. web's NLB
+    # provisioned before the block and still serves; if AWS Support lifts the
+    # restriction, restore `service.beta.kubernetes.io/aws-load-balancer-type:
+    # nlb` here (and keep it on web).
+    annotations: {}
   # Populated by `make eks-up` from the provisioned LB hostname
   # (http://<nlbs-hostname>:8889). Empty until the LB exists — preview tickets
   # then mint a URL that resolves nowhere, which is loud, not silent.
@@ -72,6 +78,12 @@ mediamtx:
 
 inference:
   replicas: 1
+  # Recreate, not RollingUpdate: two m7i-flex.large nodes have ~4 vCPU total
+  # and a cpu:1 request, so a surge replica can never schedule — the rollout
+  # would deadlock on Insufficient cpu. Brief ingest gap per deploy instead;
+  # workers reconnect streams with backoff on the new pod anyway.
+  strategy:
+    type: Recreate
   model: yolov8n.pt
   decodeBackend: cpu # Linux nodes — videotoolbox is a macOS-only path
   device: cpu

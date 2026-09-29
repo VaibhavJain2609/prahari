@@ -17,6 +17,10 @@ spec:
   {{- if not .Values.inference.keda.enabled }}
   replicas: {{ .Values.inference.replicas }}
   {{- end }}
+  {{- with .Values.inference.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "prahari.selectorLabels" . | nindent 6 }}

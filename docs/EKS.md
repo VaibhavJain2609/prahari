@@ -70,6 +70,16 @@ but then ACM validation records must also be created by hand, every renew.
 Console without DNS: `http://<prahari-web NLB hostname>:3000`. WHEP previews:
 `http://<prahari-mediamtx-public hostname>:8889`.
 
+**Load balancer type — Free-plan caveat.** If the account is on the AWS *Free
+plan*, `elbv2:CreateLoadBalancer` returns `OperationNotPermitted: This AWS
+account currently does not support creating load balancers` and NLB-backed
+Services stay `<pending>` forever (verified by direct API call, not a quota —
+NLB quota is 50). Classic ELBs (`elb` v1 API) still provision. If mediamtx's
+LB is stuck, drop the `aws-load-balancer-type: nlb` annotation on
+`prahari-mediamtx-public` (values-eks ships it off for this reason) — all three
+media ports are TCP so a CLB loses nothing. To get NLBs back, contact AWS
+Support / move the account off the Free plan.
+
 ## Cost shape (ap-south-1, on-demand)
 
 - EKS control plane: ~$73/mo, always on.

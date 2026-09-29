@@ -317,6 +317,11 @@ matchEngine:
 inference:
   replicas: 1
 
+  # Deployment update strategy. Empty = the platform default RollingUpdate.
+  # Profiles on small clusters should pin this (see values-eks.yaml): a surge
+  # pod that cannot schedule deadlocks the rollout forever.
+  strategy: {}
+
   # Overridden per profile. See values-local.yaml / values-gpu.yaml.
   model: yolov8n.pt
   decodeBackend: cpu          # cpu | videotoolbox | nvdec

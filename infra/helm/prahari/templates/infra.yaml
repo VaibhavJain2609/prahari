@@ -13,6 +13,7 @@ applied to every pod; first-party services get the full uid-10001 non-root
 context in services.yaml/inference.yaml.
 */}}
 {{- if and .Values.postgres.enabled (not .Values.postgres.existingSecret) }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace "prahari-postgres" }}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -20,18 +21,21 @@ metadata:
   labels:
     {{- include "prahari.labels" . | nindent 4 }}
   annotations:
-    # Keep the generated password across upgrades. Without this, every
-    # `helm upgrade` re-rolls randAlphaNum while Postgres auth lives in the
-    # PVC's PGDATA — the StatefulSet then restarts with a password that does
-    # not match and every client is broken permanently. The escape hatch for a
-    # managed credential is `postgres.existingSecret` (see values.yaml).
+    # Only deletion is skipped — `keep` does NOT stop helm upgrade from
+    # patching this Secret. The generated password is instead preserved by
+    # `lookup` below: re-rolling randAlphaNum while Postgres auth lives in the
+    # PVC's PGDATA would leave every client with a credential Postgres never
+    # learned. The escape hatch for a managed credential is
+    # `postgres.existingSecret` (see values.yaml).
     "helm.sh/resource-policy": keep
 type: Opaque
-stringData:
-  # Dev-only credential, generated per install. Real deployments source this
-  # from the cloud secret store via Terraform — never from values.yaml, and
-  # never committed.
-  password: {{ randAlphaNum 24 | quote }}
+data:
+  # Dev-only credential, generated per install and held stable across upgrades
+  # by `lookup` (empty under `helm template`/`--dry-run`, so first render
+  # generates; that render is never applied anyway). Real deployments source
+  # this from the cloud secret store via Terraform — never from values.yaml,
+  # and never committed.
+  password: {{ if and $existing $existing.data $existing.data.password }}{{ $existing.data.password | quote }}{{ else }}{{ randAlphaNum 24 | b64enc | quote }}{{ end }}
 {{- end }}
 {{- if .Values.postgres.enabled }}
 ---
@@ -122,6 +126,7 @@ spec:
       targetPort: 5432
 {{- end }}
 {{- if and .Values.redis.enabled (not .Values.redis.existingSecret) }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace "prahari-redis-auth" }}
 ---
 apiVersion: v1
 kind: Secret
@@ -130,14 +135,15 @@ metadata:
   labels:
     {{- include "prahari.labels" . | nindent 4 }}
   annotations:
-    # Same keep-across-upgrades contract as the postgres Secret above: Redis
-    # holds the bus in memory, so a re-rolled password would not strand data —
-    # but it WOULD split the estate in two, with restarted consumers
-    # authenticating against a secret their still-running peers never saw.
+    # Same contract as the postgres Secret above: `keep` alone does not stop
+    # upgrades re-rolling randAlphaNum, so `lookup` pins the value. Redis holds
+    # the bus in memory, so a re-rolled password would not strand data — but it
+    # WOULD split the estate in two, with restarted consumers authenticating
+    # against a secret their still-running peers never saw.
     "helm.sh/resource-policy": keep
 type: Opaque
-stringData:
-  password: {{ randAlphaNum 24 | quote }}
+data:
+  password: {{ if and $existing $existing.data $existing.data.password }}{{ $existing.data.password | quote }}{{ else }}{{ randAlphaNum 24 | b64enc | quote }}{{ end }}
 {{- end }}
 {{- if .Values.redis.enabled }}
 ---
