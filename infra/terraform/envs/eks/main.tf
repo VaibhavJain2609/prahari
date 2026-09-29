@@ -552,9 +552,10 @@ resource "aws_iam_role_policy" "gha_deploy" {
   policy = data.aws_iam_policy_document.gha_deploy.json
 }
 
-# Cluster access entry for the deploy role. AmazonEKSAdminPolicy (not
-# ClusterAdmin) is sufficient: helm manages resources inside namespaces — it
-# never needs cluster-level RBAC or access-entry management.
+# Cluster access entry for the deploy role. ClusterAdmin, not Admin:
+# AmazonEKSAdminPolicy is namespace-scoped and CANNOT touch cluster-scoped
+# objects — the chart renders a gp3 StorageClass and the release Namespace,
+# so helm install fails RBAC with Admin. (Learned the hard way in CI.)
 resource "aws_eks_access_entry" "gha_deploy" {
   cluster_name  = aws_eks_cluster.central.name
   principal_arn = aws_iam_role.gha_deploy.arn
@@ -563,7 +564,7 @@ resource "aws_eks_access_entry" "gha_deploy" {
 resource "aws_eks_access_policy_association" "gha_deploy" {
   cluster_name  = aws_eks_cluster.central.name
   principal_arn = aws_iam_role.gha_deploy.arn
-  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminPolicy"
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
   access_scope { type = "cluster" }
 }
 
